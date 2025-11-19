@@ -1,0 +1,435 @@
+# MA-ICL Configuration
+# This file contains all prompts and templates used by the MA-ICL system
+
+prompts:
+  # =========================
+  # ATTENTION PROMPTS
+  # =========================
+  attention:
+    compute_weights: |
+      Compute attention weights for mechanism aggregation.
+      Consider: prediction confidence, mechanism relevance to input, consistency with other predictions.
+
+  # =========================
+  # PREDICTION PROMPTS
+  # =========================
+  prediction:
+    single_mechanism: |
+      You are applying a SCIENTIFIC MECHANISM to make a prediction.
+
+      MECHANISM (this describes a causal process):
+      {mechanism}
+
+      Your task: INTERPRET and EXECUTE this mechanism for the given input.
+
+      CRITICAL APPROACH:
+
+      1. UNDERSTAND the mechanism:
+
+         - What causal process does it describe?
+
+         - Which features play which roles (substrate, catalyst, inhibitor)?
+
+         - What are the key interactions?
+
+      2. APPLY to input values:
+
+         - Substitute actual feature values into the mechanism
+
+         - Follow the causal logic step-by-step
+
+         - Show your mechanistic reasoning
+
+      3. SANITY CHECK:
+
+         - Does the prediction make mechanistic sense?
+
+         - Are feature values in reasonable ranges?
+
+         - Does the causal chain hold?{few_shot_section}
+
+      Input features:
+
+      {input_features}
+
+      {task_instruction}
+
+      {agent_format}
+
+      EXECUTION EXAMPLE:
+
+      Mechanism: "NAD provides energy via saturation kinetics. tRNA enhances via synergy."
+
+      Formula: ŷ = 0.6 * nad/(0.3+nad) * (1+0.5*trna)
+
+      Input: {{"nad": 0.7, "trna": 0.4}}
+
+      Reasoning:
+
+      - NAD saturation term: 0.6 * 0.7/(0.3+0.7) = 0.6 * 0.7 = 0.42
+
+      - tRNA enhancement: 1 + 0.5*0.4 = 1.2
+
+      - Combined: 0.42 * 1.2 = 0.504
+
+      - Interpretation: Moderate NAD (70% saturation) with moderate tRNA gives ~50% yield
+
+      YOUR EXECUTION:
+
+      First show reasoning (1-2 sentences), then JSON result.
+
+    batch_mechanisms: |
+      You are applying SCIENTIFIC MECHANISMS to make predictions.
+
+      MECHANISMS (M={num_mechanisms}) - These describe causal processes:
+      {mechanisms_block}
+
+      Your task: INTERPRET and EXECUTE each mechanism for the given inputs.
+
+      CRITICAL APPROACH:
+
+      1. UNDERSTAND each mechanism:
+
+         - What causal process does it describe?
+
+         - Which features play which roles (substrate, catalyst, inhibitor)?
+
+         - What are the key interactions?
+
+      2. APPLY to input values:
+
+         - Substitute actual feature values into each mechanism
+
+         - Follow the causal logic step-by-step
+
+         - Show your mechanistic reasoning
+
+      3. SANITY CHECK:
+
+         - Do the predictions make mechanistic sense?
+
+         - Are feature values in reasonable ranges?
+
+         - Does the causal chain hold?{few_shot_section}
+
+      Inputs (N={num_inputs}):
+      {inputs_payload}
+
+      {task_instruction}
+
+      EXECUTION EXAMPLE:
+
+      Mechanism: "NAD provides energy via saturation kinetics. tRNA enhances via synergy."
+
+      Formula: ŷ = 0.6 * nad/(0.3+nad) * (1+0.5*trna)
+
+      Input: {{"nad": 0.7, "trna": 0.4}}
+
+      Reasoning:
+
+      - NAD saturation term: 0.6 * 0.7/(0.3+0.7) = 0.6 * 0.7 = 0.42
+
+      - tRNA enhancement: 1 + 0.5*0.4 = 1.2
+
+      - Combined: 0.42 * 1.2 = 0.504
+
+      - Interpretation: Moderate NAD (70% saturation) with moderate tRNA gives ~50% yield
+
+      YOUR EXECUTION:
+
+      For each input, apply EACH mechanism independently to get M predictions.
+
+      Return JSON with key "results" as a 2D array of size N x M.
+      Each entry is an object with keys "y_hat" and "confidence".
+      Example: {{"results": [[{{"y_hat": 0.7, "confidence": 7.5}}, {{"y_hat": 0.6, "confidence": 7.0}}], ...]}}
+
+    batch_single_mechanism: |
+      You are applying a SCIENTIFIC MECHANISM to make predictions.
+
+      MECHANISM (this describes a causal process):
+      {mechanism}
+
+      Your task: INTERPRET and EXECUTE this mechanism for the given inputs.
+
+      CRITICAL APPROACH:
+
+      1. UNDERSTAND the mechanism:
+
+         - What causal process does it describe?
+
+         - Which features play which roles (substrate, catalyst, inhibitor)?
+
+         - What are the key interactions?
+
+      2. APPLY to input values:
+
+         - Substitute actual feature values into the mechanism
+
+         - Follow the causal logic step-by-step
+
+         - Show your mechanistic reasoning
+
+      3. SANITY CHECK:
+
+         - Do the predictions make mechanistic sense?
+
+         - Are feature values in reasonable ranges?
+
+         - Does the causal chain hold?{few_shot_section}
+
+      Inputs (N={num_inputs}):
+      {inputs_payload}
+
+      {task_instruction}
+
+      {agent_format}
+
+      EXECUTION EXAMPLE:
+
+      Mechanism: "NAD provides energy via saturation kinetics. tRNA enhances via synergy."
+
+      Formula: ŷ = 0.6 * nad/(0.3+nad) * (1+0.5*trna)
+
+      Input: {{"nad": 0.7, "trna": 0.4}}
+
+      Reasoning:
+
+      - NAD saturation term: 0.6 * 0.7/(0.3+0.7) = 0.6 * 0.7 = 0.42
+
+      - tRNA enhancement: 1 + 0.5*0.4 = 1.2
+
+      - Combined: 0.42 * 1.2 = 0.504
+
+      - Interpretation: Moderate NAD (70% saturation) with moderate tRNA gives ~50% yield
+
+      YOUR EXECUTION:
+
+      Apply the mechanism to EACH input independently.
+
+      First show reasoning (1-2 sentences per input), then JSON result.
+
+    # Task-specific instructions
+    task_instructions:
+      classification_with_threshold: |
+        Classification Task: Execute the mechanism formula and apply threshold mapping to get class index.
+
+        CRITICAL EXECUTION STEPS:
+        1. First, compute the continuous score using the formula in the mechanism
+        2. Then, apply the threshold mapping logic (e.g., "if score < X then class 0, else if score < Y then class 1, etc.")
+        3. Finally, return the class NAME (string) corresponding to the mapped class index
+
+        Class mapping: {class_mapping}
+        Allowed classes: {allowed_classes}
+
+        IMPORTANT: 
+        - The mechanism formula may output a continuous score that needs threshold mapping
+        - You MUST apply the threshold logic to convert the score to a class index
+        - Then return the class NAME (string) that matches the class index
+        - Return confidence as a number from 0-10
+
+        Format: {{"y_hat": "<class_name>", "confidence": <number>}}
+
+      classification_direct: |
+        Classification Task: Execute the mechanism formula to get class index, then return class name.
+
+        CRITICAL EXECUTION STEPS:
+        1. Execute the mechanism formula (it should output a class index directly: 0, 1, 2, ...)
+        2. Map the class index to the corresponding class NAME (string)
+        3. Return the class NAME in y_hat field
+
+        Class mapping: {class_mapping}
+        Allowed classes: {allowed_classes}
+
+        IMPORTANT: 
+        - The mechanism formula outputs a CLASS INDEX (integer: 0, 1, 2, ...)
+        - You must return the corresponding class NAME (string) that exactly matches one of the allowed classes
+        - Return confidence as a number from 0-10
+
+        Format: {{"y_hat": "<class_name>", "confidence": <number>}}
+
+      classification_batch: |
+        Classification Task: Predict the **class NAME** (string) exactly as listed.
+
+        Allowed classes: {allowed_classes}
+
+        IMPORTANT: Return the class NAME as a string in y_hat field. It must exactly match one of the allowed class names above.
+
+        Format: {{"y_hat": "<class_name>", "confidence": <number>}}
+
+      regression_single: |
+        Regression Task: Predict a numeric scalar in [{ymin}, {ymax}].
+
+        IMPORTANT: All target values are scaled to [{ymin}, {ymax}]. Your prediction MUST be between {ymin} and {ymax}.
+        Apply the mechanism as math; do not output text.
+        Return confidence (0-10).
+
+        Format: {{"y_hat": <float between {ymin} and {ymax}>, "confidence": <number>}}
+
+      regression_batch: |
+        Regression Task: Predict a numeric scalar in [{ymin}, {ymax}].
+
+        IMPORTANT: All target values are scaled to [{ymin}, {ymax}]. Your prediction MUST be between {ymin} and {ymax}.
+        Apply the mechanism's mathematical description to compute the output value from the input features.
+
+    # Format instructions for JSON responses
+    format_instructions:
+      classification: |
+        Return results as JSON. For a single input, return an object with keys "y_hat" and "confidence". 
+        For multiple inputs, return a JSON array of such objects in the SAME ORDER as inputs. 
+        y_hat: {y_hat_desc}. confidence: number from 0 to 10. 
+        Example (single): {{"y_hat": "{example_class}", "confidence": 7.5}} 
+        Example (array): [{{"y_hat": "{example_class_1}", "confidence": 7.5}}, {{"y_hat": "{example_class_2}", "confidence": 6.0}}]
+
+      regression: |
+        Return results as JSON. For a single input, return an object with keys "y_hat" and "confidence". 
+        For multiple inputs, return a JSON array of such objects in the SAME ORDER as inputs. 
+        y_hat: {y_hat_desc}. confidence: number from 0 to 10. 
+        Example (single): {{"y_hat": 0.7, "confidence": 7.5}} 
+        Example (array): [{{"y_hat": 0.7, "confidence": 7.5}}, {{"y_hat": 0.4, "confidence": 6.0}}]
+
+  # =========================
+  # MECHANISM GENERATION PROMPTS
+  # =========================
+  mechanism_generation:
+    encoder:
+      classification: |
+        You are a mechanism encoder that discovers latent patterns in {dataset_name} classification data.
+        Given dataset statistics and sample predictions, infer what underlying mechanisms might be present.
+        Focus on:
+        - Feature interactions and correlations specific to {dataset_name}
+        - Non-linear decision boundaries between classes
+        - Domain-specific patterns and structural relationships
+        - Patterns that complement machine learning models
+
+      regression: |
+        You are a mechanism encoder that discovers latent patterns in data.
+        Given dataset statistics and sample predictions, infer what underlying mechanisms might be present.
+
+    encoder_with_data: |
+      {encoder_prompt}
+
+      {data_summary}
+
+      {task_description}
+      Describe it in 2-3 sentences.
+
+      Latent mechanism z:
+
+    decoder: |
+      {decoder_prompt}
+
+      Latent mechanism z: {latent_z}
+
+      Generate an executable mechanism formula.
+
+    # Note: decoder_prompt is referenced but not explicitly defined in the code
+    # This should be set based on the task type and dataset
+    decoder_default: |
+      You are a mechanism decoder that converts latent representations into executable mechanism formulas.
+      Generate a clear, interpretable mechanism that can be applied to make predictions.
+
+  # =========================
+  # FEW-SHOT EXAMPLES
+  # =========================
+  few_shot:
+    section_header: |
+      
+      FEW-SHOT EXAMPLES (learn from these input-output patterns):
+      {few_shot_text}
+      
+
+# =========================
+# TRAINING & ACCEPTANCE CONFIGURATION
+# =========================
+training:
+  # Metric improvement thresholds for accepting updates
+  metric_improvement:
+    # Primary thresholds (strict) - used in PRIMARY acceptance check
+    primary:
+      regression:
+        r2: 0.005  # Require at least 0.005 improvement in R2 for primary acceptance
+        mae: 0.005  # Require at least 0.005 improvement in MAE for primary acceptance
+      classification:
+        acc: 0.005  # Require at least 0.5% improvement in accuracy for primary acceptance
+        f1: 0.005  # Require at least 0.5% improvement in F1 for primary acceptance
+    
+    # Secondary thresholds (lenient) - used in fallback acceptance checks
+    secondary:
+      regression:
+        r2: 0.01  # Require at least 0.01 improvement in R2 for secondary acceptance
+        mae: 0.01  # Require at least 0.01 improvement in MAE for secondary acceptance
+        r2_vs_current_multiplier: 2.0  # Multiply threshold when comparing vs current (2x = 0.02)
+        mae_vs_current_multiplier: 2.0  # Multiply threshold when comparing vs current (2x = 0.02)
+      classification:
+        acc: 0.01  # Require at least 1% improvement in accuracy for secondary acceptance
+        f1: 0.01  # Require at least 1% improvement in F1 for secondary acceptance
+        acc_vs_current_multiplier: 2.0  # Multiply threshold when comparing vs current (2x = 0.02)
+        f1_vs_current_multiplier: 2.0  # Multiply threshold when comparing vs current (2x = 0.02)
+    
+    # Very significant improvement thresholds (for allowing loss degradation)
+    very_significant:
+      regression:
+        r2: 0.05  # Very significant R2 improvement to justify loss degradation
+        mae: 0.05  # Very significant MAE improvement to justify loss degradation
+        r2_significant: 0.02  # Significant R2 improvement to justify loss degradation vs best
+        mae_significant: 0.02  # Significant MAE improvement to justify loss degradation vs best
+  
+  # Loss degradation thresholds
+  loss_degradation:
+    vs_current: 0.01  # Reject if loss is more than 0.01 worse than current state
+    vs_best: 0.05  # Reject if loss is more than 0.05 worse than best-seen state
+    tiny_degradation: 0.01  # Allow tiny degradation (0.01) if metrics improved
+  
+  # Metric degradation thresholds (for rejection)
+  metric_degradation:
+    regression:
+      max_r2_degradation: 0.02  # Reject if R2 drops by more than 0.02 vs best
+      max_mae_degradation: 0.05  # Reject if MAE increases by more than 0.05 vs best
+    classification:
+      max_acc_degradation: 0.05  # Reject if accuracy drops by more than 5% vs best
+      max_f1_degradation: 0.05  # Reject if F1 drops by more than 5% vs best
+      max_acc_degradation_current: 0.10  # Allow more degradation vs current (10%) for exploration
+      max_f1_degradation_current: 0.10  # Allow more degradation vs current (10%) for exploration
+  
+  # Adaptive threshold configuration
+  adaptive_threshold:
+    base_regression: 0.005  # Base threshold for regression (loss improvement)
+    base_classification: 0.005  # Base threshold for classification (from IMPROVEMENT_THRESHOLD_CLASSIFICATION)
+    iteration_decay: 0.1  # Multiplier for threshold decay per iteration (1.0 - 0.1 * i)
+    max_degradation_early: 0.01  # Maximum allowed degradation in early iterations (first 3)
+    early_iteration_limit: 3  # Number of early iterations with relaxed thresholds
+  
+  # Best snapshot update thresholds
+  best_snapshot:
+    # Thresholds for updating best_snapshot when metrics improve
+    regression:
+      r2_improvement: 0.01  # Update best snapshot if R2 improves by at least 0.01
+      mae_improvement: 0.01  # Update best snapshot if MAE improves by at least 0.01
+    classification:
+      acc_improvement: 0.01  # Update best snapshot if accuracy improves by at least 1%
+      f1_improvement: 0.01  # Update best snapshot if F1 improves by at least 1%
+      acc_improvement_with_loss: 0.01  # Update if acc improves and loss within 0.01 of best
+  
+  # Restoration configuration
+  restoration:
+    max_allowed_degradation_regression: 0.2  # Max loss degradation to keep LLM mechanisms (regression)
+    max_allowed_degradation_classification: 0.05  # Max loss degradation to keep LLM mechanisms (classification)
+  
+  # Performance score configuration
+  performance_scores:
+    min_performance: 0.01  # Minimum performance score (for LLM mechanisms)
+    min_performance_ml_dominant: 0.05  # Minimum performance when ML is clearly better
+    min_performance_similar: 0.1  # Minimum performance when mechanisms are similar
+    max_performance: 1.0  # Maximum performance score
+    mae_epsilon: 0.01  # Epsilon for MAE-based performance calculation (1/(epsilon + MAE))
+  
+  # Confidence defaults
+  confidence:
+    default: 0.1  # Default confidence when LLM fails to provide confidence
+    min: 0.1  # Minimum confidence value
+    max: 10.0  # Maximum confidence value
+  
+  # Scaling verification tolerance
+  scaling:
+    tolerance: 0.01  # Tolerance for checking if values are within scale range
+
