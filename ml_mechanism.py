@@ -501,7 +501,7 @@ class MLModelMechanism:
                         details.append(f"uses ECFP fingerprints ({len(self.feature_cols)} bits) - LLM should work with SMILES strings, not ECFP bits")
                     else:
                         sorted_imp = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:MAX_TOP_FEATURES]
-                        imp_strs = [f"{k}={v:.2f}" for k, v in sorted_imp]
+                        imp_strs = [f"{k}={v:.4f}" for k, v in sorted_imp]
                         details.append(f"top importance: {', '.join(imp_strs)}")
                 elif isinstance(importance, (list, np.ndarray)):
                     # Array format

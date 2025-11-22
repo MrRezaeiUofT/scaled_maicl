@@ -145,59 +145,104 @@ def generate_ml_guided_mechanism(ml_knowledge: Dict[str, Any],
     # Get scaling range
     scale_min, scale_max = SCALE_MIN, SCALE_MAX
     
-    # Build mechanism based on variant
+    # Build mechanism - ALL variants focus on learning data patterns and non-linearities
+    # NO LINEAR MECHANISMS - only pattern-based, descriptive, non-linear mechanisms
     if variant == 0:
-        # Variant 0: Linear combination (like ML baseline)
+        # Variant 0: Pattern-based mechanism with basic non-linearities
         if is_deepchem:
             # For DeepChem: use molecular properties, not ECFP features
-            mechanism = f"""[ML-GUIDED LINEAR] This mechanism uses molecular properties derived from SMILES strings.
+            mechanism = f"""[PATTERN-BASED] This mechanism learns structural patterns from molecular properties.
 
-MECHANISM: The output is a weighted combination of molecular properties that can be computed from SMILES strings.
+================================================================================
+DATA-DRIVEN PATTERN RECOGNITION
+================================================================================
 
-KEY MOLECULAR PROPERTIES:
+This mechanism identifies structural patterns in molecules by analyzing key molecular
+properties and their non-linear relationships.
+
+MOLECULAR FEATURE SPACE:
 
 """
-            mechanism += "  1. molecular_weight(SMILES) - overall molecular size\n"
-            mechanism += "  2. num_rings(SMILES) - ring count\n"
-            mechanism += "  3. num_hydroxyl_groups(SMILES) - hydrogen bonding capacity\n"
+            mechanism += "  • molecular_weight(SMILES): Overall molecular size - heavier molecules often have different properties\n"
+            mechanism += "  • num_rings(SMILES): Aromatic/cyclic structure count - affects rigidity and binding\n"
+            mechanism += "  • num_hydroxyl_groups(SMILES): Hydrogen bonding capacity - impacts solubility\n"
             
-            mechanism += f"\nFORMULA: ŷ = clip((molecular_weight(SMILES) + num_rings(SMILES) + num_hydroxyl_groups(SMILES)) / 3, 0, 10)"
+            mechanism += f"\n\nPATTERN DISCOVERY APPROACH:\n"
+            mechanism += f"The mechanism looks for SATURATION effects (diminishing returns with increasing values),\n"
+            mechanism += f"INTERACTION patterns (synergies between features), and THRESHOLD behaviors (step changes).\n\n"
+            
+            mechanism += f"FORMULA: ŷ = clip(molecular_weight(SMILES) / (100 + molecular_weight(SMILES)) + 0.3 * num_rings(SMILES) / (1 + num_rings(SMILES)) + 0.2 * num_hydroxyl_groups(SMILES), 0, 10)"
         else:
-            # For non-DeepChem: use actual features
-            # IMPORTANT: Don't use feature importance as coefficients - they're not mathematically equivalent
-            # Instead, use normalized weights as a starting point, and let TextGrad optimize them
-            mechanism = f"""[ML-GUIDED LINEAR] This mechanism uses the most important features identified by the ML model.
-
-MECHANISM: The output is a weighted combination of the top features. The ML model indicates these features are most important, but you must learn proper coefficients from the data through optimization.
-
-KEY FEATURES (by ML relative importance - use as guide, NOT as coefficients):
-
-"""
-            for i, feat in enumerate(top_features[:MAX_TOP_FEATURES_DISPLAY]):
-                imp = feature_importance.get(feat, 0.5)
-                mechanism += f"  {i+1}. {feat} (relative importance: {imp:.3f} - this is NOT a coefficient!)\n"
-            
-            # Use normalized weights based on relative importance, not raw importance values
-            # Normalize so weights sum to a reasonable range
+            # For non-DeepChem: Generate HIGHLY DESCRIPTIVE pattern-based mechanisms
             total_importance = sum(feature_importance.get(feat, 0.5) for feat in top_features[:MAX_TOP_FEATURES])
             if total_importance > 0:
-                # Normalize to sum to 1.0, then scale to reasonable coefficient range
                 normalized_weights = [feature_importance.get(feat, 0.5) / total_importance for feat in top_features[:MAX_TOP_FEATURES]]
-                # Scale to reasonable range (0.1 to 1.0) for initial coefficients
                 scaled_weights = [max(0.1, min(1.0, w * 2.0)) for w in normalized_weights]
             else:
-                # Fallback: equal weights
                 scaled_weights = [0.5] * len(top_features[:MAX_TOP_FEATURES])
             
-            mechanism += f"\nINITIAL FORMULA (starting point - optimize coefficients based on performance metrics R² and MAE):\n"
-            mechanism += f"ŷ = ("
-            terms = []
-            for i, feat in enumerate(top_features[:MAX_TOP_FEATURES]):
-                weight = scaled_weights[i] if i < len(scaled_weights) else 0.5
-                terms.append(f"{weight:.3f}*{feat}")
-            mechanism += " + ".join(terms)
-            mechanism += f") / {len(top_features[:MAX_TOP_FEATURES])}"
-            mechanism += f"\n\nCRITICAL: The coefficients above (e.g., {scaled_weights[0]:.3f}, {scaled_weights[1] if len(scaled_weights) > 1 else 0.5:.3f}) are normalized starting values, NOT feature importance values. Feature importance values (like 0.392, 0.150) are NOT coefficients - they only indicate which features are important. You MUST learn proper coefficients (typically 0.1-2.0 range) by optimizing based on R² and MAE performance metrics, not by copying importance values."
+            mechanism = f"""[PATTERN-BASED] This mechanism learns data patterns through non-linear feature relationships.
+
+================================================================================
+DATA-DRIVEN PATTERN RECOGNITION
+================================================================================
+
+This mechanism discovers underlying patterns in the data by analyzing feature interactions,
+non-linear transformations, and class-specific signatures.
+
+FEATURE LANDSCAPE & PATTERNS:
+
+"""
+            for i, feat in enumerate(top_features[:min(6, len(top_features))]):
+                imp = feature_importance.get(feat, 0.5)
+                mechanism += f"  • {feat} (importance: {imp:.3f})\n"
+                if "VARIANCE" in feat or "SCATTER" in feat:
+                    mechanism += f"    Pattern: Likely exhibits SPREAD patterns - high values may indicate dispersed/variable shapes\n"
+                elif "ASPECT_RATIO" in feat or "LENGTH" in feat:
+                    mechanism += f"    Pattern: Captures ELONGATION - ratio effects may create thresholds between classes\n"
+                elif "CIRCULARITY" in feat or "COMPACTNESS" in feat:
+                    mechanism += f"    Pattern: Measures ROUNDNESS - interaction with other shape features reveals class boundaries\n"
+                elif "RADIUS" in feat:
+                    mechanism += f"    Pattern: Describes SIZE/EXTENT - may have saturation effects at extreme values\n"
+                else:
+                    mechanism += f"    Pattern: Contributes to multi-dimensional feature space partitioning\n"
+            
+            mechanism += f"\n\nNON-LINEAR PATTERN TYPES TO DISCOVER:\n"
+            mechanism += f"  1. SATURATION: Features that plateau (x/(k+x)) - effectiveness diminishes at high values\n"
+            mechanism += f"  2. SYNERGIES: Multiplicative interactions (x*y) - features amplify each other\n"
+            mechanism += f"  3. THRESHOLDS: Step-function behaviors - sharp transitions at specific values\n"
+            mechanism += f"  4. RATIOS: Relative relationships (x/y) - balance between features matters\n"
+            mechanism += f"  5. TRANSFORMATIONS: Non-linear mappings (sqrt, square, exp) - reshape feature space\n\n"
+            
+            if task_type == "classification" and class_names and len(class_names) > 0:
+                mechanism += f"CLASS-SPECIFIC PATTERN HYPOTHESIS:\n"
+                mechanism += f"Each class likely has a unique signature in the feature space.\n"
+                mechanism += f"The mechanism will learn distinct patterns for: {', '.join(class_names)}\n\n"
+            
+            mechanism += f"INITIAL PATTERN FORMULA (discover and refine through optimization):\n"
+            mechanism += f"This formula encodes initial pattern hypotheses using saturation and interactions.\n"
+            mechanism += f"TextGrad will refine these patterns based on observed data.\n\n"
+            
+            # Generate pattern-based formula with saturations and interactions
+            mechanism += f"ŷ = "
+            if len(top_features) >= 2:
+                f1, f2 = top_features[0], top_features[1]
+                w1 = scaled_weights[0] if len(scaled_weights) > 0 else 0.5
+                w2 = scaled_weights[1] if len(scaled_weights) > 1 else 0.5
+                mechanism += f"{w1:.3f} * {f1} / (0.3 + {f1})  # saturation pattern\n"
+                mechanism += f"    + {w2:.3f} * {f2} * {f1}  # synergy pattern\n"
+                
+                if len(top_features) >= 3:
+                    f3 = top_features[2]
+                    w3 = scaled_weights[2] if len(scaled_weights) > 2 else 0.5
+                    mechanism += f"    + {w3*0.6:.3f} * sqrt({f3})  # transformation pattern\n"
+                    
+                if len(top_features) >= 4:
+                    f4 = top_features[3]
+                    w4 = scaled_weights[3] if len(scaled_weights) > 3 else 0.5
+                    mechanism += f"    + {w4*0.4:.3f} * {f4} / (0.5 + {f4})  # ratio pattern\n"
+            else:
+                mechanism += f"{top_features[0]} / (0.5 + {top_features[0]})"
         
         if task_type == "classification":
             if class_names and len(class_names) > 0:
@@ -225,39 +270,58 @@ KEY FEATURES (by ML relative importance - use as guide, NOT as coefficients):
             mechanism += f"\nClipped to [{scale_min}, {scale_max}]"
     
     elif variant == 1:
-        # Variant 1: Add feature interactions
+        # Variant 1: Pattern-based with rich feature interactions
         if is_deepchem:
-            # For DeepChem: use molecular properties with interactions
-            mechanism = f"""[ML-GUIDED WITH INTERACTIONS] This mechanism uses molecular properties with interactions.
+            # For DeepChem: discover molecular interaction patterns
+            mechanism = f"""[INTERACTION PATTERN DISCOVERY] This mechanism learns molecular interaction patterns.
 
-MECHANISM: Uses molecular properties derived from SMILES strings with multiplicative interactions.
+================================================================================
+MOLECULAR INTERACTION PATTERN LEARNING
+================================================================================
 
-KEY MOLECULAR PROPERTIES:
+This mechanism discovers how molecular properties interact and combine to produce outcomes.
+It focuses on SYNERGISTIC effects where properties amplify or dampen each other.
+
+MOLECULAR PROPERTY INTERACTIONS:
 
 """
-            mechanism += "  1. molecular_weight(SMILES) - overall molecular size\n"
-            mechanism += "  2. num_rings(SMILES) - ring count\n"
-            mechanism += "  3. num_hydroxyl_groups(SMILES) - hydrogen bonding capacity\n"
-            mechanism += "  4. num_halogen(SMILES) - halogen atom count\n"
+            mechanism += "  • molecular_weight(SMILES) × num_rings(SMILES): Size-structure synergy\n"
+            mechanism += "    Hypothesis: Larger molecules with more rings may have distinct behavior\n\n"
+            mechanism += "  • num_hydroxyl_groups(SMILES) / molecular_weight(SMILES): Polarity density\n"
+            mechanism += "    Hypothesis: Concentration of polar groups matters more than absolute count\n\n"
+            mechanism += "  • num_halogen(SMILES): Halogenation effect\n"
+            mechanism += "    Hypothesis: Halogens may inhibit or enhance activity non-linearly\n\n"
             
-            mechanism += f"\nFORMULA: ŷ = clip((molecular_weight(SMILES) + num_rings(SMILES) + num_hydroxyl_groups(SMILES) - 0.1 * num_halogen(SMILES) + 0.05 * molecular_weight(SMILES) * num_rings(SMILES)) / 3, 0, 10)"
+            mechanism += f"INTERACTION PATTERN FORMULA:\n"
+            mechanism += f"ŷ = clip(\n"
+            mechanism += f"    molecular_weight(SMILES) / (100 + molecular_weight(SMILES))  # saturation\n"
+            mechanism += f"    + 0.3 * num_rings(SMILES) * (1 - exp(-molecular_weight(SMILES)/200))  # synergy\n"
+            mechanism += f"    + 0.2 * num_hydroxyl_groups(SMILES) / (1 + molecular_weight(SMILES)/100)  # ratio\n"
+            mechanism += f"    - 0.1 * num_halogen(SMILES) / (1 + num_halogen(SMILES))  # dampening\n"
+            mechanism += f", 0, 10)"
         else:
-            # For non-DeepChem: use actual features
-            mechanism = f"""[ML-GUIDED WITH INTERACTIONS] This mechanism uses the ML model's top features with interactions.
+            # For non-DeepChem: discover feature interaction patterns
+            mechanism = f"""[INTERACTION PATTERN DISCOVERY] This mechanism learns feature interaction patterns from data.
 
-MECHANISM: Uses the most important features from the ML model and adds multiplicative interactions between them. Coefficients are normalized based on relative importance.
+================================================================================
+FEATURE INTERACTION PATTERN LEARNING
+================================================================================
 
-KEY FEATURES:
+This mechanism discovers how features interact, combining effects through multiplication,
+division, and conditional logic to reveal hidden patterns.
+
+KEY FEATURE INTERACTIONS TO EXPLORE:
 
 """
-            for i, feat in enumerate(top_features[:MAX_TOP_FEATURES_DISPLAY]):
+            for i, feat in enumerate(top_features[:min(6, len(top_features))]):
                 imp = feature_importance.get(feat, 0.5)
-                mechanism += f"  {i+1}. {feat} (relative importance: {imp:.3f})\n"
+                mechanism += f"  • {feat} (importance: {imp:.3f})\n"
             
             if interactions:
-                mechanism += f"\nKEY INTERACTIONS:\n"
-                for f1, f2 in interactions:
-                    mechanism += f"  - {f1} × {f2}\n"
+                mechanism += f"\n\nDISCOVERED INTERACTION PATTERNS:\n"
+                for i, (f1, f2) in enumerate(interactions[:3]):
+                    mechanism += f"  {i+1}. {f1} × {f2}: Multiplicative synergy pattern\n"
+                    mechanism += f"     Hypothesis: When both features are high, effect amplifies\n"
             
             # Normalize weights properly
             total_importance = sum(feature_importance.get(feat, 0.5) for feat in top_features[:MAX_TOP_FEATURES])
@@ -313,29 +377,50 @@ KEY FEATURES:
             mechanism += f"\nClipped to [{scale_min}, {scale_max}]"
     
     else:
-        # Variant 2: Non-linear transformations (IMPROVED: Start closer to ML baseline)
+        # Variant 2: Deep pattern learning with rich non-linearities
         if is_deepchem:
-            # For DeepChem: use molecular properties with non-linear transformations
-            mechanism = f"""[ML-GUIDED NON-LINEAR] This mechanism uses non-linear transformations of molecular properties.
+            # For DeepChem: deep pattern learning in molecular space
+            mechanism = f"""[DEEP PATTERN LEARNING] This mechanism discovers complex non-linear patterns in molecular structures.
 
-MECHANISM: Applies saturation and threshold effects to molecular properties derived from SMILES strings.
+================================================================================
+DEEP MOLECULAR PATTERN RECOGNITION
+================================================================================
 
-KEY MOLECULAR PROPERTIES:
+This mechanism learns sophisticated non-linear relationships between molecular properties,
+identifying complex patterns like saturation effects, synergistic interactions, threshold
+behaviors, and inhibitory relationships.
+
+MOLECULAR PATTERN SPACE:
 
 """
-            mechanism += "  1. molecular_weight(SMILES) - overall molecular size\n"
-            mechanism += "  2. num_rings(SMILES) - ring count\n"
-            mechanism += "  3. num_hydroxyl_groups(SMILES) - hydrogen bonding capacity\n"
-            mechanism += "  4. num_halogen(SMILES) - halogen atom count\n"
+            mechanism += "  • molecular_weight(SMILES): Overall molecular size\n"
+            mechanism += "    Pattern: Saturation effects - very large molecules plateau in effectiveness\n\n"
+            mechanism += "  • num_rings(SMILES): Aromatic/cyclic structures\n"
+            mechanism += "    Pattern: Diminishing returns with additional rings\n\n"
+            mechanism += "  • num_hydroxyl_groups(SMILES): Hydrogen bonding sites\n"
+            mechanism += "    Pattern: May enhance or inhibit depending on molecular context\n\n"
+            mechanism += "  • num_halogen(SMILES): Halogenation level\n"
+            mechanism += "    Pattern: Non-linear dampening effect\n\n"
             
-            mechanism += f"\nFORMULA: ŷ = clip(molecular_weight(SMILES) / (100 + molecular_weight(SMILES)) + 0.1 * num_rings(SMILES) / (1 + num_rings(SMILES)) + 0.15 * num_hydroxyl_groups(SMILES) - 0.05 * num_halogen(SMILES), 0, 10)"
+            mechanism += f"COMPLEX PATTERN FORMULA:\n"
+            mechanism += f"ŷ = clip(\n"
+            mechanism += f"    molecular_weight(SMILES) / (100 + molecular_weight(SMILES))  # Michaelis-Menten saturation\n"
+            mechanism += f"    + 0.1 * num_rings(SMILES) / (1 + num_rings(SMILES))  # diminishing returns\n"
+            mechanism += f"    + 0.15 * num_hydroxyl_groups(SMILES) * (1 - num_halogen(SMILES)/10)  # context-dependent\n"
+            mechanism += f"    - 0.05 * num_halogen(SMILES)  # inhibitory effect\n"
+            mechanism += f", 0, 10)"
         else:
-            # For non-DeepChem: use actual features
-            mechanism = f"""[ML-GUIDED NON-LINEAR] This mechanism uses non-linear transformations of the ML model's top features.
+            # For non-DeepChem: deep pattern learning with VERY RICH descriptions
+            mechanism = f"""[DEEP PATTERN LEARNING] This mechanism discovers complex non-linear patterns in the data.
 
-MECHANISM: Applies saturation and threshold effects to the most important features from the ML model, designed to complement the linear ML baseline. Uses normalized coefficients based on relative importance.
+================================================================================
+DEEP PATTERN RECOGNITION & NON-LINEAR RELATIONSHIPS
+================================================================================
 
-KEY FEATURES:
+This mechanism learns sophisticated patterns by analyzing non-linear transformations,
+class-specific signatures, feature synergies, and adaptive thresholds in the data.
+
+FEATURE PATTERN ANALYSIS:
 
 """
             for i, feat in enumerate(top_features[:MAX_TOP_FEATURES_DISPLAY]):
@@ -350,63 +435,181 @@ KEY FEATURES:
             else:
                 scaled_weights = [0.5] * len(top_features[:MAX_TOP_FEATURES])
             
-            mechanism += f"\nINITIAL FORMULA (starting point - optimize coefficients and saturation parameters based on performance metrics R² and MAE):\n"
-            mechanism += f"ŷ = "
-            
-            if len(top_features) >= 2:
-                f1, f2 = top_features[0], top_features[1]
-                w1 = scaled_weights[0] if len(scaled_weights) > 0 else 0.5
-                w2 = scaled_weights[1] if len(scaled_weights) > 1 else 0.5
+            # For classification: use class-specific non-linear scoring with RICH TEXTUAL DESCRIPTIONS
+            if task_type == "classification" and class_names and len(class_names) > 0:
+                mechanism += f"\n{'='*80}\n"
+                mechanism += f"TEXTUAL MECHANISM: CLASS-SPECIFIC PATTERN RECOGNITION\n"
+                mechanism += f"{'='*80}\n\n"
                 
-                # Use normalized weights with saturation for top feature
-                mechanism += f"{w1:.3f} * {f1} / (0.3 + {f1})"
+                mechanism += f"This mechanism distinguishes between {len(class_names)} vehicle classes ({', '.join(class_names)}) "
+                mechanism += f"by identifying unique geometric and shape signatures for each class.\n\n"
                 
-                # Add second feature with interaction or addition
-                if interactions and len(interactions) > 0:
-                    mechanism += f" * (1 + {w2*0.8:.3f}*{f2})"
-                else:
-                    mechanism += f" + {w2*0.8:.3f}*{f2}"
+                # Add feature context
+                mechanism += f"FEATURE LANDSCAPE:\n"
+                for i, feat in enumerate(top_features[:6]):
+                    imp = feature_importance.get(feat, 0.5)
+                    mechanism += f"  • {feat}: importance={imp:.3f} - "
+                    if "VARIANCE" in feat or "SCATTER" in feat:
+                        mechanism += "measures spread and distribution of shape\n"
+                    elif "ASPECT_RATIO" in feat or "LENGTH" in feat:
+                        mechanism += "captures elongation and proportions\n"
+                    elif "CIRCULARITY" in feat or "COMPACTNESS" in feat:
+                        mechanism += "quantifies roundness vs. angularity\n"
+                    elif "RADIUS" in feat:
+                        mechanism += "describes size and extent from center\n"
+                    else:
+                        mechanism += "contributes to shape characterization\n"
                 
-                # Add third feature if available (with reduced weight to avoid overfitting)
-                if len(top_features) >= 3:
-                    f3 = top_features[2]
-                    w3 = scaled_weights[2] if len(scaled_weights) > 2 else 0.5
-                    mechanism += f" + {w3*0.4:.3f}*{f3}"
+                mechanism += f"\nCLASS-SPECIFIC DECISION LOGIC:\n\n"
                 
-                # Add fourth and fifth features with even smaller weights for stability
-                if len(top_features) >= 4:
-                    f4 = top_features[3]
-                    w4 = scaled_weights[3] if len(scaled_weights) > 3 else 0.5
-                    mechanism += f" + {w4*0.2:.3f}*{f4}"
-                if len(top_features) >= 5:
-                    f5 = top_features[4]
-                    w5 = scaled_weights[4] if len(scaled_weights) > 4 else 0.5
-                    mechanism += f" + {w5*0.1:.3f}*{f5}"
+                # Generate rich textual descriptions for each class
+                for i, cls_name in enumerate(class_names[:4]):
+                    f1 = top_features[0] if len(top_features) > 0 else "feature1"
+                    f2 = top_features[1] if len(top_features) > 1 else "feature2"
+                    f3 = top_features[2] if len(top_features) > 2 else "feature3"
+                    f4 = top_features[3] if len(top_features) > 3 else "feature4"
+                    
+                    mechanism += f"CLASS '{cls_name.upper()}':\n"
+                    
+                    if i == 0:
+                        mechanism += f"  Recognition Pattern: Exhibits SATURATION behavior in {f1} - effectiveness plateaus at high values,\n"
+                        mechanism += f"  suggesting this class has a characteristic threshold beyond which additional {f1} doesn't help.\n"
+                        mechanism += f"  Strong SYNERGISTIC interaction between {f1} and {f2}: when both are elevated together,\n"
+                        mechanism += f"  the class signature is amplified (multiplicative effect).\n"
+                        mechanism += f"  \n"
+                        mechanism += f"  Decision Heuristic: High {f1} (>0.5) with proportional {f2} → strong {cls_name} signal\n"
+                        mechanism += f"  Secondary cue: Look for {f3} in moderate range (0.3-0.7) to confirm\n"
+                        
+                    elif i == 1:
+                        mechanism += f"  Recognition Pattern: PRIMARY DOMINANCE of {f1} - this feature alone is highly discriminative.\n"
+                        mechanism += f"  {f2} shows SATURATION DAMPENING: high values are penalized due to inverse relationship,\n"
+                        mechanism += f"  creating a natural ceiling that prevents over-scoring.\n"
+                        mechanism += f"  This class prefers balanced feature values rather than extremes.\n"
+                        mechanism += f"  \n"
+                        mechanism += f"  Decision Heuristic: Moderate-to-high {f1} (0.4-0.8) with controlled {f2} (<0.5) → {cls_name}\n"
+                        mechanism += f"  Watch for {f4} as a tiebreaker when features are ambiguous\n"
+                        
+                    elif i == 2:
+                        mechanism += f"  Recognition Pattern: SQUARE-ROOT TRANSFORMATION of {f1} suggests diminishing returns -\n"
+                        mechanism += f"  early increases matter more than later ones (concave relationship).\n"
+                        mechanism += f"  STRONG AMPLIFICATION via {f1}×{f2} interaction: this class emerges when BOTH features\n"
+                        mechanism += f"  are simultaneously elevated, indicating a complex multi-feature signature.\n"
+                        mechanism += f"  \n"
+                        mechanism += f"  Decision Heuristic: {f1} > 0.6 AND {f2} > 0.5 together → {cls_name} likely\n"
+                        mechanism += f"  Consider {f3} and {f4} ratio for fine-grained discrimination\n"
+                        
+                    else:
+                        mechanism += f"  Recognition Pattern: LINEAR DOMINANCE of {f1} with RATIO-BASED modulation by {f2}.\n"
+                        mechanism += f"  The {f2} ratio term (division by 0.5 + {f2}) creates a ceiling effect,\n"
+                        mechanism += f"  preventing runaway scores and ensuring robustness to outliers.\n"
+                        mechanism += f"  This class is characterized by MODERATE feature values across the board.\n"
+                        mechanism += f"  \n"
+                        mechanism += f"  Decision Heuristic: Middling {f1} (0.2-0.5) with stable {f2} → {cls_name}\n"
+                        mechanism += f"  If uncertain, examine {f3}/{f2} ratio for confirmation\n"
+                    
+                    mechanism += f"\n"
+                
+                mechanism += f"PREDICTION STRATEGY:\n"
+                mechanism += f"1. Compute class-specific confidence score for EACH class using their respective patterns\n"
+                mechanism += f"2. Each class score captures its unique geometric signature and feature interactions\n"
+                mechanism += f"3. The class with MAXIMUM confidence score wins (argmax selection)\n"
+                mechanism += f"4. In case of ties, defer to {f1} as the primary discriminator\n\n"
+                
+                mechanism += f"ADAPTIVE THRESHOLDS:\n"
+                mechanism += f"The mechanism uses soft thresholds and continuous scoring rather than hard cutoffs.\n"
+                mechanism += f"This allows graceful degradation when features are noisy or ambiguous.\n"
+                mechanism += f"Saturation terms (e.g., x/(a+x)) ensure numerical stability and prevent extreme scores.\n\n"
+                
+                # Add simplified formula for LLM execution
+                mechanism += f"EXECUTABLE FORMULA (for LLM prediction engine):\n"
+                mechanism += f"```python\n"
+                mechanism += f"def classify_{class_names[0].lower()}({', '.join(top_features[:MAX_TOP_FEATURES])}):\n"
+                mechanism += f"    import numpy as np\n"
+                mechanism += f"    # Implement the textual logic described above\n"
+                
+                for i, cls_name in enumerate(class_names[:4]):
+                    f1 = top_features[0] if len(top_features) > 0 else "feature1"
+                    f2 = top_features[1] if len(top_features) > 1 else "feature2"
+                    w1 = scaled_weights[0] if len(scaled_weights) > 0 else 0.5
+                    w2 = scaled_weights[1] if len(scaled_weights) > 1 else 0.5
+                    
+                    # Use more complex non-linear transformations
+                    if i == 0:
+                        mechanism += f"    {cls_name.lower()}_score = {w1:.3f} * {f1} / (0.3 + {f1}) + {w2*0.8:.3f} * {f2} * {f1}\n"
+                    elif i == 1:
+                        mechanism += f"    {cls_name.lower()}_score = {w1*1.2:.3f} * {f1} + {w2:.3f} * {f2} / (0.4 + {f2})\n"
+                    elif i == 2:
+                        mechanism += f"    {cls_name.lower()}_score = {w1*0.8:.3f} * np.sqrt(max(0, {f1})) + {w2*1.1:.3f} * {f2} * {f1}\n"
+                    else:
+                        mechanism += f"    {cls_name.lower()}_score = {w1*0.6:.3f} * {f1} + {w2*0.9:.3f} * {f2} / (0.5 + {f2})\n"
+                
+                mechanism += f"    scores = [{', '.join([cn.lower() + '_score' for cn in class_names[:4]])}]\n"
+                mechanism += f"    return scores.index(max(scores))\n"
+                mechanism += f"```\n"
             else:
-                mechanism += f"{top_features[0]} / (0.5 + {top_features[0]})"
+                # For regression: use non-linear transformations
+                mechanism += f"\nINITIAL FORMULA (starting point - optimize coefficients and saturation parameters based on performance metrics R² and MAE):\n"
+                mechanism += f"ŷ = "
+                
+                if len(top_features) >= 2:
+                    f1, f2 = top_features[0], top_features[1]
+                    w1 = scaled_weights[0] if len(scaled_weights) > 0 else 0.5
+                    w2 = scaled_weights[1] if len(scaled_weights) > 1 else 0.5
+                    
+                    # Use normalized weights with saturation for top feature
+                    mechanism += f"{w1:.3f} * {f1} / (0.3 + {f1})"
+                    
+                    # Add second feature with interaction or addition
+                    if interactions and len(interactions) > 0:
+                        mechanism += f" * (1 + {w2*0.8:.3f}*{f2})"
+                    else:
+                        mechanism += f" + {w2*0.8:.3f}*{f2}"
+                    
+                    # Add third feature if available (with reduced weight to avoid overfitting)
+                    if len(top_features) >= 3:
+                        f3 = top_features[2]
+                        w3 = scaled_weights[2] if len(scaled_weights) > 2 else 0.5
+                        mechanism += f" + {w3*0.4:.3f}*{f3}"
+                    
+                    # Add fourth and fifth features with even smaller weights for stability
+                    if len(top_features) >= 4:
+                        f4 = top_features[3]
+                        w4 = scaled_weights[3] if len(scaled_weights) > 3 else 0.5
+                        mechanism += f" + {w4*0.2:.3f}*{f4}"
+                    if len(top_features) >= 5:
+                        f5 = top_features[4]
+                        w5 = scaled_weights[4] if len(scaled_weights) > 4 else 0.5
+                        mechanism += f" + {w5*0.1:.3f}*{f5}"
+                else:
+                    mechanism += f"{top_features[0]} / (0.5 + {top_features[0]})"
             
-            mechanism += f"\n\nCRITICAL: Adjust coefficients, saturation parameters (e.g., 0.3 in denominator), and feature combinations based on R² and MAE performance metrics. Feature importance values are NOT coefficients - learn proper values through optimization."
+            mechanism += f"\n\n{'='*80}\n"
+            mechanism += f"OPTIMIZATION GUIDANCE:\n"
+            mechanism += f"{'='*80}\n"
+            mechanism += f"The textual descriptions above contain the TRUE mechanism logic.\n"
+            mechanism += f"The Python formula is a STARTING POINT that implements these textual patterns.\n\n"
+            mechanism += f"CRITICAL ADJUSTMENTS during TextGrad optimization:\n"
+            mechanism += f"  1. Modify saturation parameters (denominators like 0.3, 0.4) to control feature sensitivity\n"
+            mechanism += f"  2. Adjust coefficient weights to reflect actual class discrimination patterns\n"
+            mechanism += f"  3. Add/remove feature interactions based on which combinations are truly predictive\n"
+            mechanism += f"  4. Introduce conditional logic (if-then rules) when appropriate\n"
+            mechanism += f"  5. Use feature ratios (e.g., {top_features[0]}/{top_features[1]}) to capture relative relationships\n\n"
+            mechanism += f"REMEMBER: Feature importance values are NOT coefficients!\n"
+            mechanism += f"Importance tells you WHICH features matter, not HOW MUCH weight to give them.\n"
+            mechanism += f"Learn proper weights (typically 0.1-2.0) through iterative optimization.\n\n"
+            mechanism += f"TEXTUAL ENRICHMENT:\n"
+            mechanism += f"Prefer adding rich conditional descriptions over complex formulas.\n"
+            mechanism += f"Example: 'When {top_features[0]} exceeds 0.7 AND {top_features[1]} is below 0.3, this strongly\n"
+            mechanism += f"indicates class X due to the characteristic shape signature.'\n"
         
         if task_type == "classification":
             if class_names and len(class_names) > 0:
                 n_classes = len(class_names)
                 class_mapping = ", ".join([f"{i}={cn}" for i, cn in enumerate(class_names)])
-                # Add explicit threshold-based class mapping formula
-                bin_size = (scale_max - scale_min) / n_classes
-                thresholds = [scale_min + (i + 1) * bin_size for i in range(n_classes - 1)]
-                if len(thresholds) == 1:
-                    class_formula = f"ŷ = 0 if score < {thresholds[0]:.2f} else 1"
-                elif len(thresholds) == 2:
-                    class_formula = f"ŷ = 0 if score < {thresholds[0]:.2f} else (1 if score < {thresholds[1]:.2f} else 2)"
-                elif len(thresholds) == 3:
-                    class_formula = f"ŷ = 0 if score < {thresholds[0]:.2f} else (1 if score < {thresholds[1]:.2f} else (2 if score < {thresholds[2]:.2f} else 3))"
-                else:
-                    # General case
-                    class_formula = f"ŷ = 0"
-                    for i in range(len(thresholds)):
-                        class_formula = f"({class_formula} if score < {thresholds[i]:.2f} else {i+1})"
-                    class_formula = f"({class_formula} else {n_classes-1})"
-                mechanism += f"\nMap score to class index: {class_formula}\nClass mapping: {class_mapping}"
+                # For variant 2 (non-linear), the class-specific scoring is already included above
+                # Just add the class mapping reference
+                mechanism += f"\nClass mapping: {class_mapping}"
+                mechanism += f"\n\nThe mechanism uses class-specific non-linear scoring (already defined above). Each class has its own formula with saturation effects and interactions, allowing for complex non-linear decision boundaries."
             else:
                 mechanism += f"\nMap score to class index: ŷ = 0 if score < {(scale_min + scale_max) / 2:.2f} else 1"
         else:
@@ -756,7 +959,7 @@ The ML baseline identifies these as the most important features:
         for i, example in enumerate(ml_failure_analysis["worst_predictions"][:MAX_WORST_PREDICTIONS_DISPLAY]):
             # Format features for display
             feat_items = list(example['features'].items())[:MAX_FEATURES_IN_EXAMPLE]
-            feat_str = ', '.join([f"{k}={v:.2f}" for k, v in feat_items])
+            feat_str = ', '.join([f"{k}={v:.4f}" for k, v in feat_items])
             
             # For classification, use class names; for regression, use numeric values
             if isinstance(example['true'], str) and isinstance(example['predicted'], str):
@@ -782,22 +985,31 @@ The ML baseline identifies these as the most important features:
     feedback += """YOUR TASK: Use the above ML insights and failure patterns to improve your mechanism.
 
 KEY STRATEGIES:
-1. LEARN NEW COEFFICIENT VALUES: Your current formula has coefficients (like 0.783, 0.301, 0.194, etc.) that are starting values. You MUST change these to new values based on performance metrics. Don't just keep the same coefficients and add interaction terms - actually try different coefficient values (e.g., 0.5, 1.0, 1.2, 1.5, 2.0) to find what maximizes R² and minimizes MAE. If R² is low, try increasing important feature coefficients. If MAE is high, adjust coefficients systematically.
+1. USE NON-LINEAR FORMS: Avoid simple linear combinations like "score = a*feature1 + b*feature2". Instead, use:
+   - Saturation effects: feature / (K + feature)
+   - Multiplicative interactions: feature1 * feature2
+   - Threshold effects: max(0, feature - threshold)
+   - Conditional logic: if feature > threshold then ... else ...
+   - Non-linear transformations: sqrt(feature), log(1 + feature), feature^2
+   - Class-specific scoring: Different non-linear formulas for each class (classification)
 
-2. OPTIMIZE COEFFICIENTS BASED ON PERFORMANCE METRICS: Don't just copy feature importance values - adjust coefficients based on R² and MAE (for regression) or Accuracy and F1 (for classification). Feature importance (e.g., 0.392) is NOT a coefficient - it's just a measure of contribution. Learn proper coefficients (typically 0.1-2.0 range) by optimizing performance metrics, not loss.
+2. TEXTUAL DESCRIPTIONS WHEN FORMULAS ARE TOO COMPLEX: If the mechanism is too complex for a simple formula, use a rich textual description instead. The LLM can interpret detailed textual mechanisms better than overly complex formulas. For example:
+   "When COMPACTNESS is high (>0.7) AND CIRCULARITY is moderate (0.4-0.6), the vehicle is likely a bus. When COMPACTNESS is low (<0.3) AND DISTANCE_CIRCULARITY is high (>0.8), it's likely a van. The interaction between SCALED_VARIANCE_MINOR and MAX.LENGTH_ASPECT_RATIO creates a non-linear decision boundary..."
 
-3. FIX ML WEAKNESSES: Target the error patterns identified above - these show where the ML model fails
+3. LEARN NEW COEFFICIENT VALUES: Your current formula has coefficients (like 0.783, 0.301, 0.194, etc.) that are starting values. You MUST change these to new values based on performance metrics. Don't just keep the same coefficients and add interaction terms - actually try different coefficient values (e.g., 0.5, 1.0, 1.2, 1.5, 2.0) to find what maximizes R² and minimizes MAE. If R² is low, try increasing important feature coefficients. If MAE is high, adjust coefficients systematically.
 
-4. ADD NON-LINEAR TERMS: Where ML (linear) fails, add saturation/threshold effects or interactions
+4. OPTIMIZE COEFFICIENTS BASED ON PERFORMANCE METRICS: Don't just copy feature importance values - adjust coefficients based on R² and MAE (for regression) or Accuracy and F1 (for classification). Feature importance (e.g., 0.392) is NOT a coefficient - it's just a measure of contribution. Learn proper coefficients (typically 0.1-2.0 range) by optimizing performance metrics, not loss.
 
-5. USE COUNTERFACTUALS: The suggestions above show which features to emphasize and how to adjust them
+5. FIX ML WEAKNESSES: Target the error patterns identified above - these show where the ML model fails
 
-6. ITERATE BASED ON PERFORMANCE METRICS: Change coefficients, add/remove terms, or modify formulas based on R² and MAE (for regression) or Accuracy and F1 (for classification). Focus on improving these metrics, not just reducing loss.
+6. USE COUNTERFACTUALS: The suggestions above show which features to emphasize and how to adjust them
+
+7. ITERATE BASED ON PERFORMANCE METRICS: Change coefficients, add/remove terms, or modify formulas based on R² and MAE (for regression) or Accuracy and F1 (for classification). Focus on improving these metrics, not just reducing loss.
 
 CRITICAL: Your mechanism formula should use proper mathematical coefficients (typically 0.1-2.0 range), NOT raw feature importance values. The initial formula uses normalized weights as a starting point - you should optimize these based on performance metrics (R²/MAE for regression, Accuracy/F1 for classification), NOT by copying feature importance values.
 
 REMEMBER: Your mechanism should COMPLEMENT the ML model, not replicate it.
-Focus on the error patterns and use different mathematical forms. Adjust coefficients iteratively based on performance metrics (R², MAE, Accuracy, F1), not just loss.
+Focus on the error patterns and use different mathematical forms. If formulas become too complex, use rich textual descriptions that the LLM can interpret. Adjust coefficients iteratively based on performance metrics (R², MAE, Accuracy, F1), not just loss.
 
 """
     

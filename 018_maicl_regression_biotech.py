@@ -186,7 +186,7 @@ def load_gfp_yield_dataset(max_samples: int):
     if not _HAS_PANDAS:
         raise RuntimeError("pandas not installed. pip install pandas")
     try:
-        csv_path = "MohammadFiles/2025_07_25/2025_07_25_GFP_Results_removed_outliers.csv"
+        csv_path = "gfp_yield/2025_07_25_GFP_Results_removed_outliers.csv"
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"File not found: {csv_path}")
         df = pd.read_csv(csv_path)
@@ -689,28 +689,17 @@ def load_tabarena_regression_dataset(dataset_name: str, max_samples: int):
         # For other datasets, try loading from HuggingFace
         from datasets import load_dataset
         
-        # TabArena regression dataset mapping (HuggingFace)
-        # Note: Some datasets may not exist on HuggingFace. We'll try multiple paths or use sklearn alternatives
+        # TabArena regression dataset mapping (HuggingFace/sklearn)
+        # Note: Only datasets that are confirmed to exist and are accessible are included
         TABARENA_REGRESSION_DATASETS = {
-            "housing": ["scikit-learn/california_housing", "mstz/california-housing"],  # Try sklearn first
-            "bike": ["mstz/bike-sharing"],
-            "insurance": ["mstz/insurance"],
-            "concrete": ["mstz/concrete"],
-            "energy": ["mstz/energy-efficiency"],
-            "airfoil": ["mstz/airfoil"],
-            "yacht": ["mstz/yacht-hydrodynamics"],
-            "auto": ["mstz/auto-mpg"],
             "abalone": ["mstz/abalone"],
-            "winequality": ["mstz/wine-quality"],
-            "students": ["mstz/student-performance"],
-            "diamonds": ["mstz/diamonds"],
-            "house-prices": ["mstz/house-prices"],
-            "airbnb": ["mstz/airbnb-price"],
+            "auto": ["scikit-learn/auto-mpg"],
+            "diamonds": ["mstz/diamonds"],  # Requires trust_remote_code=True and config selection
         }
         
         if dataset_name_lower not in TABARENA_REGRESSION_DATASETS:
             available = ["diabetes"] + list(TABARENA_REGRESSION_DATASETS.keys())
-            raise ValueError(f"TabArena regression dataset '{dataset_name}' not found. Available: {available}")
+            raise ValueError(f"TabArena regression dataset '{dataset_name}' not found or not available. Available datasets: {available}")
         
         # Try loading from multiple possible paths
         dataset_paths = TABARENA_REGRESSION_DATASETS[dataset_name_lower]
@@ -719,16 +708,33 @@ def load_tabarena_regression_dataset(dataset_name: str, max_samples: int):
         
         dataset = None
         last_error = None
-        for path in dataset_paths:
-            try:
-                logger.info(f"Trying to load TabArena regression dataset: {dataset_name} from {path}")
-                dataset = load_dataset(path)
-                logger.info(f"Successfully loaded from {path}")
-                break
-            except Exception as e:
-                last_error = e
-                logger.warning(f"Failed to load from {path}: {e}")
-                continue
+        
+        # Special handling for diamonds dataset (requires trust_remote_code and config)
+        if dataset_name_lower == "diamonds":
+            # Try different configs for diamonds dataset
+            diamonds_configs = ["cut", "cut_binary", "encoding"]
+            for config in diamonds_configs:
+                try:
+                    logger.info(f"Trying to load diamonds dataset with config '{config}' from {dataset_paths[0]}")
+                    dataset = load_dataset(dataset_paths[0], config, trust_remote_code=True)
+                    logger.info(f"Successfully loaded diamonds dataset with config '{config}' ({len(dataset.get('train', []))} samples)")
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Failed to load diamonds with config '{config}': {e}")
+                    continue
+        else:
+            # Standard loading for other datasets
+            for path in dataset_paths:
+                try:
+                    logger.info(f"Trying to load TabArena regression dataset: {dataset_name} from {path}")
+                    dataset = load_dataset(path)
+                    logger.info(f"Successfully loaded from {path}")
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.warning(f"Failed to load from {path}: {e}")
+                    continue
         
         if dataset is None:
             available_paths = ", ".join(dataset_paths)
@@ -1000,9 +1006,10 @@ def main():
                              "  TabArena (HuggingFace/sklearn regression):\n"
                              "    - diabetes (sklearn)\n"
                              "    - housing (sklearn, with HuggingFace fallback)\n"
-                             "    - bike, insurance, concrete, energy, airfoil, yacht\n"
-                             "    - auto, abalone, winequality, students, diamonds, house-prices, airbnb\n"
-                             "    Note: Some datasets may not be available on HuggingFace. The code will try multiple paths.\n"
+                             "    - abalone (HuggingFace)\n"
+                             "    - auto (HuggingFace)\n"
+                             "    - diamonds (HuggingFace, requires trust_remote_code)\n"
+                             "    Note: Only confirmed available datasets are listed.\n"
                              "  DeepChem (molecular regression):\n"
                              "    - esol or delaney (water solubility prediction)\n"
                              "    - lipo or lipophilicity (LogP prediction)\n"
@@ -1021,7 +1028,7 @@ def main():
                         help="Plate index (0-based) for protein_expression dataset. Use --list_plates to see available indices.")
     parser.add_argument("--list_plates", action="store_true",
                         help="List all available protein expression plate files and exit")
-    parser.add_argument("--model_name", default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash"),
+    parser.add_argument("--model_name", default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.5-flash"),
                         help="Gemini model name, e.g., gemini-2.0-flash, gemini-2.0-pro")
     parser.add_argument("--ml_mech", default="linear", help="Regression ML mechanism: linear|xgboost|kernelridge|tabicl")
     parser.add_argument("--tabicl_bins", type=int, default=20,
@@ -1109,9 +1116,7 @@ def main():
         X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_deepchem_regression_dataset(
             args.dataset, args.max_samples
         )
-    elif dataset_name_lower in ("diabetes", "housing", "bike", "insurance", "concrete", "energy", 
-                                  "airfoil", "yacht", "auto", "abalone", "winequality", "students", 
-                                  "diamonds", "house-prices", "airbnb") or dataset_name_lower.startswith("tabarena_"):
+    elif dataset_name_lower in ("diabetes", "housing", "abalone", "auto", "diamonds") or dataset_name_lower.startswith("tabarena_"):
         # TabArena regression datasets from HuggingFace
         try:
             # Remove tabarena_ prefix if present
@@ -1128,7 +1133,7 @@ def main():
         except Exception as e:
             raise SystemExit(f"Unknown dataset {args.dataset}. Error: {e}\n"
                            f"Available options: gfp_yield, protein_expression, protein_expression_all, dataset_102, "
-                           f"TabArena (diabetes), "
+                           f"TabArena (diabetes, housing, abalone, auto, diamonds), "
                            f"DeepChem (any molnet dataset, e.g., esol, delaney, lipo, lipophilicity), "
                            f"or enzyme dataset names (e.g., halogenase_NaBr, aminotransferase, olea, phosphatase_achiral)")
     from sklearn.model_selection import train_test_split
@@ -1470,7 +1475,7 @@ def main():
     maicl.train(X_topk, y_topk, X_val_s, y_val_s, iterations=args.iterations, 
                 ml_residuals=residuals_topk if args.use_ml else None,  # Only pass residuals if ML is enabled
                 accept_eval_max=None, X_test=X_test_s, y_test=y_test_s, 
-                use_test_for_acceptance=args.use_test_for_acceptance, **train_kwargs)
+                use_test_for_acceptance=args.use_test_for_acceptance, output_dir=output_dir, **train_kwargs)
 
     # Post metrics
     logger.info("=" * 80)

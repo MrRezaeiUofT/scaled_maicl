@@ -455,28 +455,18 @@ def load_tabarena_classification_dataset(dataset_name: str, max_samples: int):
         from datasets import load_dataset
         from sklearn.preprocessing import LabelEncoder
         
-        # TabArena dataset mapping
+        # TabArena dataset mapping (HuggingFace/sklearn)
+        # Note: Only datasets that are confirmed to exist and are accessible are included
         TABARENA_DATASETS = {
             "adult": "scikit-learn/adult-census-income",
             "bank": "mstz/bank",
-            "income": "scikit-learn/adult-census-income",
+            "income": "scikit-learn/adult-census-income",  # Alias for adult
             "wine": "mstz/wine",
-            "spaceship": "mstz/spaceship-titanic",
-            "default": "mstz/default",
-            "booking": "mstz/booking",
-            "churn": "mstz/churn",
             "iris": "scikit-learn/iris",
-            "breast-cancer": "scikit-learn/breast-cancer",
-            "digits": "scikit-learn/digits",
-            # Additional classification datasets
             "mushroom": "mstz/mushroom",
-            "diabetes": "mstz/diabetes",
-            "credit": "mstz/credit-card",
-            "heart": "mstz/heart-disease",
-            "stroke": "mstz/stroke",
-            "employee": "mstz/employee-attrition",
-            "telecom": "mstz/telecom-churn",
-            "customer": "mstz/customer-churn",
+            "covtype": "mstz/covertype",  # Requires config='covertype'
+            "mnist-digits": "mnist",  # Requires config='mnist'
+            "fashion-mnist": "fashion_mnist",  # Requires config='fashion_mnist'
         }
         
         dataset_name_lower = dataset_name.lower()
@@ -486,7 +476,16 @@ def load_tabarena_classification_dataset(dataset_name: str, max_samples: int):
         
         logger.info(f"Loading TabArena dataset: {dataset_name} ({TABARENA_DATASETS[dataset_name_lower]})")
         
-        dataset = load_dataset(TABARENA_DATASETS[dataset_name_lower])
+        # Special handling for datasets that require config names
+        dataset_path = TABARENA_DATASETS[dataset_name_lower]
+        if dataset_name_lower == "covtype":
+            dataset = load_dataset(dataset_path, "covertype")
+        elif dataset_name_lower == "mnist-digits":
+            dataset = load_dataset(dataset_path, "mnist")
+        elif dataset_name_lower == "fashion-mnist":
+            dataset = load_dataset(dataset_path, "fashion_mnist")
+        else:
+            dataset = load_dataset(dataset_path)
         
         # Convert to pandas DataFrame
         if 'train' in dataset:
@@ -500,7 +499,7 @@ def load_tabarena_classification_dataset(dataset_name: str, max_samples: int):
         possible_targets = [
             'target', 'label', 'class', 'income', 'deposit', 
             'Transported', 'Churn', 'Attrition', 'stroke', 'HeartDisease',
-            'quality', 'y', 'species', 'class_label'
+            'quality', 'y', 'species', 'class_label', 'labels'
         ]
         target_column = None
         for col in possible_targets:
@@ -509,7 +508,16 @@ def load_tabarena_classification_dataset(dataset_name: str, max_samples: int):
                 break
         
         if target_column is None:
-            target_column = df.columns[-1]
+            # For image datasets (MNIST, Fashion-MNIST), the target might be in a different format
+            # Check if this looks like an image dataset (many pixel columns)
+            if dataset_name_lower in ("mnist-digits", "fashion-mnist"):
+                # These datasets typically have 'label' column
+                if 'label' in df.columns:
+                    target_column = 'label'
+                else:
+                    target_column = df.columns[-1]
+            else:
+                target_column = df.columns[-1]
         
         logger.info(f"Using '{target_column}' as target column")
         
@@ -809,10 +817,17 @@ def main():
                         help="Classification dataset name. Options:\n"
                              "  OpenML: car, iris, wine, zoo, glass, vehicle, soybean, primary-tumor, lymphography, ecoli, adult, credit, vote, mushroom\n"
                              "  Synthetic: synthetic5\n"
-                             "  TabArena (HuggingFace):\n"
-                             "    - adult, bank, income, wine, spaceship, default, booking, churn\n"
-                             "    - iris, breast-cancer, digits\n"
-                             "    - mushroom, diabetes, credit, heart, stroke, employee, telecom, customer\n"
+                             "  TabArena (HuggingFace/sklearn):\n"
+                             "    - adult (scikit-learn/adult-census-income)\n"
+                             "    - bank (mstz/bank)\n"
+                             "    - income (alias for adult)\n"
+                             "    - wine (mstz/wine)\n"
+                             "    - iris (scikit-learn/iris)\n"
+                             "    - mushroom (mstz/mushroom)\n"
+                             "    - covtype (mstz/covertype, 7 classes - Forest cover type)\n"
+                             "    - mnist-digits (mnist, 10 classes - Handwritten digits)\n"
+                             "    - fashion-mnist (fashion_mnist, 10 classes - Fashion items)\n"
+                             "    Note: Only confirmed available datasets are listed.\n"
                              "  DeepChem (molecular classification):\n"
                              "    - hiv (HIV protease inhibition, binary)\n"
                              "    - bace (BACE protein binding, binary)\n"
@@ -887,9 +902,7 @@ def main():
             n_clusters_per_class=1,
         )
         ds_label = f"Synthetic 5-Class ({args.dataset})"
-    elif ds_name in ("adult", "bank", "income", "wine", "spaceship", "default", "booking", "churn", 
-                     "iris", "breast-cancer", "digits", "mushroom", "diabetes", "credit", "heart", 
-                     "stroke", "employee", "telecom", "customer") or ds_name.startswith("tabarena_"):
+    elif ds_name in ("adult", "bank", "income", "wine", "iris", "mushroom", "covtype", "mnist-digits", "fashion-mnist") or ds_name.startswith("tabarena_"):
         # TabArena datasets from HuggingFace
         try:
             # Remove tabarena_ prefix if present

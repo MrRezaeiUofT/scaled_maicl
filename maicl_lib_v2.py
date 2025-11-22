@@ -952,7 +952,29 @@ class VariationalMechanismGenerator:
                     # Check if we have any mismatched examples (residual > 0)
                     mismatched_count = np.sum(ml_residuals > 0)
                     if mismatched_count == 0:
-                        logger.warning(f"  [Residual Samples] ⚠️  No mismatched examples found (ML model has 100% accuracy on training set). Showing top samples by residual (all are 0.0):")
+                        logger.warning(f"  [Residual Samples] ⚠️  No mismatched examples found (ML model has 100% accuracy on training set).")
+                        logger.warning(f"  [Residual Samples] Showing diverse examples from different classes to encourage non-linear mechanisms:")
+                        # When all examples are matched, show diverse examples from different classes
+                        # This helps the LLM understand class boundaries and encourages non-linear mechanisms
+                        unique_classes = np.unique(y_train)
+                        if len(unique_classes) > 1:
+                            # Select diverse examples: one from each class, prioritizing edge cases
+                            diverse_indices = []
+                            for cls in unique_classes:
+                                cls_indices = np.where(y_train == cls)[0]
+                                if len(cls_indices) > 0:
+                                    # Select example with median feature values (representative)
+                                    # Or select edge cases (min/max feature values)
+                                    if len(cls_indices) >= 2:
+                                        # Select one from middle and one from edge
+                                        mid_idx = cls_indices[len(cls_indices) // 2]
+                                        diverse_indices.append(mid_idx)
+                                    else:
+                                        diverse_indices.append(cls_indices[0])
+                            top_5_idx = diverse_indices[:MAX_WORST_RESIDUAL_SAMPLES]
+                        else:
+                            # Only one class: show diverse feature combinations
+                            top_5_idx = sorted_indices[:MAX_WORST_RESIDUAL_SAMPLES]
                     else:
                         logger.info(f"  [Residual Samples] Top {min(MAX_WORST_RESIDUAL_SAMPLES, mismatched_count)} worst ML residuals (mismatched examples) passed to LLM during mechanism generation:")
                     # Try to get X_train_original (SMILES) from parent TrainableMAICL if available
@@ -1027,18 +1049,30 @@ class VariationalMechanismGenerator:
             mechanisms = []
             num_variants = min(3, self.num_mechanisms_unknown)
             
-            # If ML model is linear, skip linear variant (variant 0) and use non-linear variants
-            # This ensures LLM mechanisms complement rather than replicate the ML model
-            if is_linear_ml and num_variants == 1:
-                # Only 1 mechanism needed: use non-linear variant (variant 2)
+            # PREFER NON-LINEAR VARIANTS: Always start with variant 1 (interactions) or variant 2 (non-linear)
+            # instead of variant 0 (linear) to ensure mechanisms complement rather than replicate ML models
+            # This encourages more sophisticated mechanisms that can capture patterns ML models miss
+            if num_variants == 1:
+                # Only 1 mechanism needed: use non-linear variant (variant 2) for maximum sophistication
+                # Variant 2 includes saturation effects, non-linear transformations, and interactions
                 variant = 2
                 mech = generate_ml_guided_mechanism(
                     ml_knowledge, self.feature_cols, self.task_type, self.class_names, variant
                 )
                 mechanisms.append(mech)
+            elif num_variants == 2:
+                # 2 mechanisms: use variant 1 (interactions) and variant 2 (non-linear)
+                # Skip variant 0 (linear) to avoid simple linear combinations
+                for variant in [1, 2]:
+                    mech = generate_ml_guided_mechanism(
+                        ml_knowledge, self.feature_cols, self.task_type, self.class_names, variant
+                    )
+                    mechanisms.append(mech)
             else:
-                # Generate multiple variants
-                for variant in range(num_variants):
+                # 3+ mechanisms: use all variants, but prioritize non-linear ones first
+                # Order: variant 2 (non-linear), variant 1 (interactions), variant 0 (linear)
+                variant_order = [2, 1, 0] if not is_linear_ml else [2, 1]  # Skip linear for linear ML
+                for variant in variant_order[:num_variants]:
                     mech = generate_ml_guided_mechanism(
                         ml_knowledge, self.feature_cols, self.task_type, self.class_names, variant
                     )

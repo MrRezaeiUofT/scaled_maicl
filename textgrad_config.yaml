@@ -56,6 +56,34 @@ prompts:
 
       3️⃣ PROPOSE TARGETED FIX:
 
+         - PREFER NON-LINEAR FORMS: Use sophisticated non-linear transformations instead of simple linear combinations:
+           * Saturation effects: feature / (K + feature) or tanh-like responses
+           * Multiplicative interactions: feature1 * feature2 (captures synergies)
+           * Threshold effects: max(0, feature - threshold) or step functions
+           * Conditional logic: if feature > threshold then ... else ...
+           * Non-linear transformations: feature^2, sqrt(feature), log(1 + feature)
+           * Ratio relationships: feature1 / feature2
+           * Class-specific scoring: Different formulas for different classes (classification)
+
+         - PREFER RICH TEXTUAL DESCRIPTIONS: Instead of trying to cram everything into a complex formula, 
+           use detailed textual descriptions that capture the TRUE decision-making process. The LLM can 
+           interpret and execute these descriptions during prediction. For example:
+           
+           GOOD (Textual + Simple Formula):
+           "CLASS DISCRIMINATION MECHANISM:
+           • BUS: Characterized by SATURATION in COMPACTNESS (effectiveness plateaus at high values >0.6).
+                  Strong synergy between COMPACTNESS and CIRCULARITY (when both high, amplifies score).
+                  Decision: COMPACTNESS > 0.5 AND CIRCULARITY > 0.4 → bus likely
+           • VAN: Shows PRIMARY DOMINANCE of DISTANCE_CIRCULARITY with INVERSE relationship to COMPACTNESS.
+                  Decision: DISTANCE_CIRCULARITY > 0.7 AND COMPACTNESS < 0.4 → van likely
+           • SAAB: Exhibits MULTIPLICATIVE interaction between SCALED_VARIANCE_MINOR × MAX.LENGTH_ASPECT_RATIO.
+                   Decision: Both features > 0.5 simultaneously → saab signature
+           • OPEL: Linear combination with RATIO-BASED modulation (moderate values across board).
+                   Decision: Middle-range features (0.2-0.5) with stable ratios → opel"
+           
+           BAD (Overly complex formula without explanation):
+           "ŷ = 0.783*f1^2/(0.3+f1) + 0.301*f2*log(1+f3) - 0.194*sqrt(f4)*(f5>0.6?1:0) + ..."
+
          - LEARN NEW COEFFICIENTS: Don't just add interaction terms - actually adjust the base coefficients (0.783, 0.301, etc.) based on performance metrics. If R² is low or MAE is high, increase/decrease coefficients systematically. Try different coefficient values (e.g., 0.5, 1.0, 1.5, 2.0) to find what improves performance.
 
          - Add the missing feature or interaction that explains errors
@@ -130,6 +158,53 @@ prompts:
       - Try systematically: if R² is low, increase important feature coefficients; if MAE is high, adjust coefficients to reduce errors
       - The goal is to maximize R² and minimize MAE through coefficient optimization, not just adding terms
 
+      OUTPUT FORMAT - CRITICAL:
+      
+      ALWAYS LEAD WITH TEXTUAL DESCRIPTION, FORMULA IS SECONDARY:
+      
+      1. START with a rich textual description of the mechanism (3-10 sentences):
+         - Explain the decision logic in natural language
+         - Describe feature interactions and their meanings
+         - Identify class-specific patterns (for classification)
+         - Describe non-linear behaviors (saturation, thresholds, synergies)
+         - Use domain-specific terminology when appropriate
+         
+      2. THEN provide the executable formula in a ```python code block:
+         - Formula should IMPLEMENT the textual description
+         - Use class-specific scoring for classification (different formulas per class)
+         - Include non-linear transformations (saturation, interactions, ratios)
+         - Keep formula interpretable (match the textual description)
+         
+      3. STRUCTURE your response as:
+         DIAGNOSIS: [What's wrong with current mechanism]
+         FIX: [What to change]
+         REVISED MECHANISM: [Rich textual description explaining the logic]
+         
+         EXECUTABLE FORMULA:
+         ```python
+         [Python code that implements the textual logic above]
+         ```
+         
+      Example structure for classification:
+      "REVISED MECHANISM:
+      This mechanism distinguishes vehicles by their geometric signatures. BUS exhibits saturation 
+      behavior in COMPACTNESS (plateaus above 0.6) with strong synergy when both COMPACTNESS and 
+      CIRCULARITY are elevated. VAN shows inverse relationship between DISTANCE_CIRCULARITY and 
+      COMPACTNESS - high circularity distance with low compactness indicates van. SAAB requires 
+      multiplicative interaction between SCALED_VARIANCE_MINOR and MAX.LENGTH_ASPECT_RATIO - both 
+      must be elevated simultaneously. OPEL is characterized by moderate values across features 
+      with ratio-based scoring.
+      
+      EXECUTABLE FORMULA:
+      ```python
+      def classify_vehicle(...):
+          bus_score = 0.4 * COMPACTNESS / (0.3 + COMPACTNESS) + 0.3 * COMPACTNESS * CIRCULARITY
+          van_score = 0.5 * DISTANCE_CIRCULARITY + 0.2 * CIRCULARITY / (0.4 + COMPACTNESS)
+          saab_score = 0.6 * SCALED_VARIANCE_MINOR * MAX.LENGTH_ASPECT_RATIO
+          opel_score = 0.3 * COMPACTNESS + 0.3 * CIRCULARITY / (0.5 + CIRCULARITY)
+          return argmax([bus_score, van_score, saab_score, opel_score])
+      ```"
+      
       Now provide YOUR fix:
 
   update_mechanism:

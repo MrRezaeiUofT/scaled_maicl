@@ -54,7 +54,7 @@ class GoogleAPIKeyManager:
             if current_key not in self.llm_cache:
                 self.llm_cache[current_key] = ChatGoogleGenerativeAI(
                     model=self.model_name,
-                    temperature=0,
+                    temperature=0.7,
                     google_api_key=current_key
                 )
             return self.llm_cache[current_key]
@@ -154,6 +154,11 @@ class BatchedLLM:
         """Batch invoke LLM calls with parallel execution"""
         if len(messages) == 0:
             return []
+        
+        # Increment batch count for any batch operation (even single-item batches)
+        # This ensures accurate tracking when invoke_batch is called
+        self.batch_count += 1
+        
         if len(messages) == 1:
             return [self.invoke_single(messages[0])]
         
@@ -165,8 +170,6 @@ class BatchedLLM:
                 print(f"\n[LLM Prompt #{self._samples_printed_count} (batch {i+1}/{len(messages)})]:\n{prompt_preview}")
                 if len(messages[i].content) > 1000:
                     print(f"[... truncated, {len(messages[i].content)} chars total]\n")
-        
-        self.batch_count += 1
         results = [None] * len(messages)
         
         def call_api(idx_msg_tuple):
