@@ -1598,9 +1598,19 @@ class TrainableMAICL:
         att_temp = attention_temp if attention_temp is not None else self.attention_temp
         # Optionally relax ML routing during training/acceptance to allow LLM impact
         if relax_routing:
-            hard_gate = hard_ml_gate_threshold if hard_ml_gate_threshold is not None else max(0.90, HARD_ML_GATE_THRESHOLD)
-            min_w = min_ml_weight if min_ml_weight is not None else 0.85
-            max_w = max_ml_weight if max_ml_weight is not None else 0.95
+            # For regression, give LLM mechanisms more weight so they can learn a strong standalone predictor
+            if self.task_type == "regression":
+                # Keep hard gate high so very confident ML predictions can still dominate when appropriate
+                hard_gate = hard_ml_gate_threshold if hard_ml_gate_threshold is not None else max(0.95, HARD_ML_GATE_THRESHOLD)
+                # Allow ML weight to range roughly 0.6–0.85 during relaxed training
+                # This leaves 15–40% capacity for LLM mechanisms to express flexible corrections/mechanisms.
+                min_w = min_ml_weight if min_ml_weight is not None else 0.60
+                max_w = max_ml_weight if max_ml_weight is not None else 0.85
+            else:
+                # Classification keeps the more conservative relaxed routing to protect accuracy/F1
+                hard_gate = hard_ml_gate_threshold if hard_ml_gate_threshold is not None else max(0.90, HARD_ML_GATE_THRESHOLD)
+                min_w = min_ml_weight if min_ml_weight is not None else 0.85
+                max_w = max_ml_weight if max_ml_weight is not None else 0.95
         else:
             hard_gate = hard_ml_gate_threshold if hard_ml_gate_threshold is not None else HARD_ML_GATE_THRESHOLD
             min_w = min_ml_weight if min_ml_weight is not None else MIN_ML_WEIGHT
@@ -2068,7 +2078,9 @@ class TrainableMAICL:
               iterations: int = 3, ml_residuals: Optional[np.ndarray] = None,
               accept_eval_max: Optional[int] = None, accept_eval_min: Optional[int] = None,
               k_shot: int = 0, X_test: Optional[np.ndarray] = None, y_test: Optional[np.ndarray] = None,
-              use_test_for_acceptance: bool = False, X_train_original: Optional[List[Dict]] = None,
+              use_test_for_acceptance: bool = False,
+              acceptance_set: str = "val",
+              X_train_original: Optional[List[Dict]] = None,
               X_val_original: Optional[List[Dict]] = None, X_test_original: Optional[List[Dict]] = None,
               output_dir: Optional[str] = None):
         """Train the MA-ICL system
@@ -2076,10 +2088,13 @@ class TrainableMAICL:
         Args:
             accept_eval_max: Maximum samples for acceptance evaluation. If None, uses full validation set.
             accept_eval_min: Minimum samples for acceptance evaluation. If None, uses accept_max // 4 or full set.
-            X_test: Optional test set features. Used if use_test_for_acceptance=True.
-            y_test: Optional test set targets. Used if use_test_for_acceptance=True.
-            use_test_for_acceptance: If True, use test set for acceptance evaluation instead of validation set.
-                                    This helps ensure optimization generalizes to test set, but risks overfitting to test.
+            X_test: Optional test set features. Used if acceptance_set='test' (or use_test_for_acceptance=True).
+            y_test: Optional test set targets. Used if acceptance_set='test' (or use_test_for_acceptance=True).
+            use_test_for_acceptance: (DEPRECATED) If True and acceptance_set is left at its default,
+                                     use the test set for acceptance instead of validation.
+            acceptance_set: Which split to use for acceptance evaluation: 'train', 'val', or 'test'.
+                            Defaults to 'val'. If both acceptance_set and use_test_for_acceptance are
+                            provided, acceptance_set takes precedence unless left as the default 'val'.
         """
         logger.info(f"\n[Training] Starting {iterations} iterations...")
         
@@ -2112,13 +2127,32 @@ class TrainableMAICL:
             logger.info(f"  [K-shot] Using {k_shot} few-shot examples per prediction")
         
         # Choose which set to use for acceptance evaluation
-        if use_test_for_acceptance:
+        # Normalize and combine legacy flag with new acceptance_set argument
+        if acceptance_set is None:
+            acceptance_set = "val"
+        acceptance_set = str(acceptance_set).lower().strip()
+        if acceptance_set not in ("train", "val", "test"):
+            # Fallback to validation if an unknown value is provided
+            logger.warning(f"[AcceptEval] Unknown acceptance_set='{acceptance_set}', defaulting to 'val'")
+            acceptance_set = "val"
+
+        # Backward compatibility: legacy flag can still request test when acceptance_set
+        # has not been explicitly changed from its default 'val'.
+        if use_test_for_acceptance and acceptance_set == "val":
+            acceptance_set = "test"
+
+        if acceptance_set == "test":
             if X_test is None or y_test is None:
-                raise ValueError("use_test_for_acceptance=True requires X_test and y_test to be provided")
+                raise ValueError("acceptance_set='test' (or use_test_for_acceptance=True) requires X_test and y_test")
             X_accept = X_test
             y_accept = y_test
             set_name = "test"
             logger.info(f"  [AcceptEval] Using TEST set for acceptance evaluation (n={len(X_test)} samples)")
+        elif acceptance_set == "train":
+            X_accept = X_train
+            y_accept = y_train
+            set_name = "train"
+            logger.info(f"  [AcceptEval] Using TRAIN set for acceptance evaluation (n={len(X_train)} samples)")
         else:
             X_accept = X_val
             y_accept = y_val
@@ -2472,7 +2506,7 @@ class TrainableMAICL:
             eval_kwargs = dict(routing_kwargs)
             if hasattr(self, 'X_val_original') and hasattr(self, 'X_test_original'):
                 # Determine which X_original to use based on which set is used for acceptance
-                if use_test_for_acceptance and self.X_test_original is not None:
+                if acceptance_set == "test" and self.X_test_original is not None:
                     # Use consistent subset of X_test_original matching accept_idx
                     if len(accept_idx) == len(X_accept):
                         X_accept_original = self.X_test_original
@@ -2480,12 +2514,20 @@ class TrainableMAICL:
                         X_accept_original = [self.X_test_original[i] for i in accept_idx] if len(accept_idx) <= len(self.X_test_original) else None
                     if X_accept_original is not None:
                         eval_kwargs['X_original'] = X_accept_original
-                elif not use_test_for_acceptance and self.X_val_original is not None:
+                elif acceptance_set == "val" and self.X_val_original is not None:
                     # Use consistent subset of X_val_original matching accept_idx
                     if len(accept_idx) == len(X_accept):
                         X_accept_original = self.X_val_original
                     else:
                         X_accept_original = [self.X_val_original[i] for i in accept_idx] if len(accept_idx) <= len(self.X_val_original) else None
+                    if X_accept_original is not None:
+                        eval_kwargs['X_original'] = X_accept_original
+                elif acceptance_set == "train" and self.X_train_original is not None:
+                    # Use consistent subset of X_train_original matching accept_idx
+                    if len(accept_idx) == len(X_accept):
+                        X_accept_original = self.X_train_original
+                    else:
+                        X_accept_original = [self.X_train_original[i] for i in accept_idx] if len(accept_idx) <= len(self.X_train_original) else None
                     if X_accept_original is not None:
                         eval_kwargs['X_original'] = X_accept_original
                 # Always use X_train_original as pool for few-shot examples
@@ -3141,6 +3183,45 @@ class TrainableMAICL:
                         acc_degradation <= 0.01 and f1_degradation <= 0.01):
                         accept = True
                         reason = f"early exploration (iter {i+1}, tiny degradation {new_loss - current_loss:.4f} <= {max_allowed_degradation}, metrics stable)"
+                
+                # FINAL SAFETY CHECK: Enforce "global best only" acceptance policy
+                # This ensures that we only *accept* iterations that truly beat the best performance so far.
+                # Non-best iterations may still be evaluated, but they will not be marked as accepted updates.
+                if accept:
+                    if self.task_type == "regression":
+                        # Compare new metrics against global best-so-far (before this update)
+                        global_best_r2 = getattr(self, "_best_r2", None)
+                        global_best_mae = getattr(self, "_best_mae", None)
+                        better_vs_best = False
+                        # Any strict improvement in R2 or MAE vs global best counts as better
+                        if new_r2 is not None and global_best_r2 is not None and new_r2 > global_best_r2:
+                            better_vs_best = True
+                        if new_mae is not None and global_best_mae is not None and new_mae < global_best_mae:
+                            better_vs_best = True
+                        # Also allow acceptance if loss strictly improves vs best loss
+                        loss_better_vs_best = new_loss < best_loss
+                        if not (better_vs_best or loss_better_vs_best):
+                            logger.info(
+                                "  ✗ Global-best constraint: rejecting update that does not beat "
+                                "best-seen regression performance (R2/MAE/loss)"
+                            )
+                            accept = False
+                    elif self.task_type == "classification":
+                        # For classification: compare against best Accuracy/F1 seen so far
+                        global_best_acc = best_acc_for_comparison if best_acc_for_comparison is not None else best_acc
+                        global_best_f1 = best_f1_for_comparison if best_f1_for_comparison is not None else best_f1
+                        better_vs_best = False
+                        if global_best_acc is not None and new_acc > global_best_acc:
+                            better_vs_best = True
+                        if global_best_f1 is not None and new_f1 > global_best_f1:
+                            better_vs_best = True
+                        loss_better_vs_best = new_loss < best_loss
+                        if not (better_vs_best or loss_better_vs_best):
+                            logger.info(
+                                "  ✗ Global-best constraint: rejecting update that does not beat "
+                                "best-seen classification performance (ACC/F1/loss)"
+                            )
+                            accept = False
                 
                 if accept:
                     logger.info(f"  ✓ Accepted update: loss {current_loss:.4f} → {new_loss:.4f} ({reason})")
@@ -3844,15 +3925,21 @@ class TrainableMAICL:
 
     def train_on_residuals(self, X_full: np.ndarray, y_full: np.ndarray, top_k: int = -1,
                            iterations: int = 3, X_test: Optional[np.ndarray] = None,
-                           y_test: Optional[np.ndarray] = None, use_test_for_acceptance: bool = False) -> Dict[str, Any]:
+                           y_test: Optional[np.ndarray] = None,
+                           use_test_for_acceptance: bool = False,
+                           acceptance_set: str = "val") -> Dict[str, Any]:
         """
         Convenience training that computes ML residuals, selects top-K, and trains.
         Requires an ML mechanism to be present and trained when use_ml_mechanism=True.
         
         Args:
-            X_test: Optional test set features. Used if use_test_for_acceptance=True.
-            y_test: Optional test set targets. Used if use_test_for_acceptance=True.
-            use_test_for_acceptance: If True, use test set for acceptance evaluation instead of validation set.
+            X_test: Optional test set features. Used if acceptance_set='test' (or use_test_for_acceptance=True).
+            y_test: Optional test set targets. Used if acceptance_set='test' (or use_test_for_acceptance=True).
+            use_test_for_acceptance: (DEPRECATED) If True and acceptance_set is left at its default,
+                                     use the test set for acceptance instead of validation.
+            acceptance_set: Which split to use for acceptance evaluation: 'train', 'val', or 'test'.
+                            Defaults to 'val'. If both acceptance_set and use_test_for_acceptance are
+                            provided, acceptance_set takes precedence unless left as the default 'val'.
         """
         if self.use_ml_mechanism and (self.mech_generator.ml_mechanism is None or not self.mech_generator.ml_mechanism.is_trained):
             raise RuntimeError("ML mechanism is not trained. Call train_ml_mechanism(...) first or disable use_ml_mechanism.")
@@ -3879,8 +3966,18 @@ class TrainableMAICL:
             else:
                 # Select residuals corresponding to the top-K samples
                 residual_sel = residuals[top_indices]
-        self.train(X_sel, y_sel, X_full, y_full, iterations=iterations, ml_residuals=residual_sel,
-                   X_test=X_test, y_test=y_test, use_test_for_acceptance=use_test_for_acceptance)
+        self.train(
+            X_sel,
+            y_sel,
+            X_full,
+            y_full,
+            iterations=iterations,
+            ml_residuals=residual_sel,
+            X_test=X_test,
+            y_test=y_test,
+            use_test_for_acceptance=use_test_for_acceptance,
+            acceptance_set=acceptance_set,
+        )
         return {
             "top_indices": top_indices,
             "residuals": residuals.tolist() if hasattr(residuals, "tolist") else residuals,

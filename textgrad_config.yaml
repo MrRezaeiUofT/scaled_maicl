@@ -168,6 +168,8 @@ prompts:
          - Identify class-specific patterns (for classification)
          - Describe non-linear behaviors (saturation, thresholds, synergies)
          - Use domain-specific terminology when appropriate
+         - For REGRESSION (like GFP yield): explicitly describe how the mechanism behaves across LOW, MEDIUM, and HIGH output regions (e.g., \"low GFP yield\" vs. \"very high GFP yield\" regimes).
+         - Include at least one or two CONCRETE EXAMPLES (\"when Temperature is high and Magnesium is low, the mechanism predicts ... because ...\").
          
       2. THEN provide the executable formula in a ```python code block:
          - Formula should IMPLEMENT the textual description
@@ -179,6 +181,9 @@ prompts:
          DIAGNOSIS: [What's wrong with current mechanism]
          FIX: [What to change]
          REVISED MECHANISM: [Rich textual description explaining the logic]
+           - Include a short BULLET LIST that maps each major term in the formula to its role (e.g., \"magnesium_saturation term: captures saturating cofactor effect on GFP yield\").
+           - Clearly state how the mechanism can be used for PREDICTION (\"given new experimental conditions, this mechanism outputs a GFP yield by...\").
+           - Provide 1–2 short scenario-style examples that a scientist could read to understand the mechanism qualitatively.
          
          EXECUTABLE FORMULA:
          ```python
@@ -219,7 +224,13 @@ prompts:
 
       {update_instruction}
 
-      Updated mechanism (2-3 concise sentences):
+      Updated mechanism (RICH, TEXTUAL, ELABORATED DESCRIPTION):
+
+      REVISED MECHANISM:
+      - Provide a multi-sentence, narrative description (3–8 sentences) that focuses on how the mechanism PREDICTS the target variable.
+      - Explicitly explain how each major feature influences the prediction (e.g., \"Magnesium concentration (mM)\" increases the predicted GFP yield with a saturating effect at high values).
+      - Emphasize predictive behavior: which regions of feature space lead to high vs. low predicted outputs, and why.
+      - Make it clear how the mechanism, on its own, can serve as a strong predictive model for the target (not only as a residual correction to the ML baseline).
 
   update_instructions:
     classification: "Update the mechanism to improve Accuracy and F1 score (primary metrics) by refining feature interactions, thresholds, and decision boundaries. Do NOT use feature importance values as coefficients - learn proper coefficients (0.1-2.0 range) by optimizing Accuracy and F1. Preserve correctness on easy cases and focus on systematic residual patterns."

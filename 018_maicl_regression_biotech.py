@@ -1028,7 +1028,7 @@ def main():
                         help="Plate index (0-based) for protein_expression dataset. Use --list_plates to see available indices.")
     parser.add_argument("--list_plates", action="store_true",
                         help="List all available protein expression plate files and exit")
-    parser.add_argument("--model_name", default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.5-flash"),
+    parser.add_argument("--model_name", default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash"),
                         help="Gemini model name, e.g., gemini-2.0-flash, gemini-2.0-pro")
     parser.add_argument("--ml_mech", default="linear", help="Regression ML mechanism: linear|xgboost|kernelridge|tabicl")
     parser.add_argument("--tabicl_bins", type=int, default=20,
@@ -1038,9 +1038,28 @@ def main():
     parser.add_argument("--max_samples", type=int, default=200)
     parser.add_argument("--top_k", type=int, default=1000, help="-1 to use full dataset")
     parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--use_test_for_acceptance", action="store_true",
-                        help="Use test set for acceptance evaluation instead of validation set. "
-                             "This helps ensure optimization generalizes to test set, but risks overfitting to test.")
+    parser.add_argument(
+        "--acceptance_set",
+        type=str,
+        choices=["train", "val", "test"],
+        default="val",
+        help=(
+            "Which split to use for acceptance evaluation in TextGrad: "
+            "'train', 'val', or 'test'. Defaults to 'val'. "
+            "Using 'test' can help align optimization with test performance "
+            "but risks overfitting to the test set."
+        ),
+    )
+    parser.add_argument(
+        "--use_test_for_acceptance",
+        action="store_true",
+        help=(
+            "[DEPRECATED] Legacy flag to use the test set for acceptance. "
+            "Prefer --acceptance_set=test instead. If provided together with "
+            "--acceptance_set (left at its default 'val'), this flag will switch "
+            "acceptance to the test set for backward compatibility."
+        ),
+    )
     parser.add_argument("--topk_strategy", choices=["residual", "residual_balanced"], default="residual",
                         help="Top-K selection: 'residual' = global highest | 'residual_balanced' = highest within y-quantile bins")
     parser.add_argument("--relax_eval", type=int, default=0, choices=[0,1],
@@ -1460,8 +1479,18 @@ def main():
     logger.info("TRAINING MA-ICL")
     logger.info("=" * 80)
     logger.info(f"Training on {len(X_topk)} top-K residual samples for {args.iterations} iterations")
-    if args.use_test_for_acceptance:
+    # Resolve which split is used for acceptance (train/val/test)
+    acceptance_set = (args.acceptance_set or "val").lower()
+    if acceptance_set not in ("train", "val", "test"):
+        logger.warning(f"Unknown --acceptance_set='{acceptance_set}', defaulting to 'val'")
+        acceptance_set = "val"
+    # Backward compatibility: legacy flag can still request test when acceptance_set is left at default
+    if args.use_test_for_acceptance and acceptance_set == "val":
+        acceptance_set = "test"
+    if acceptance_set == "test":
         logger.info(f"Using TEST set ({len(X_test_s)} samples) for acceptance evaluation")
+    elif acceptance_set == "train":
+        logger.info(f"Using TRAIN set ({len(X_topk)} samples) for acceptance evaluation")
     else:
         logger.info(f"Using full validation set ({len(X_val_s)} samples) for acceptance evaluation")
     # Use validation or test set for acceptance; pass only TRAIN residuals to LLM
@@ -1472,10 +1501,24 @@ def main():
     if is_deepchem_dataset:
         train_kwargs['X_val_original'] = X_original_val
         train_kwargs['X_test_original'] = X_original_test
-    maicl.train(X_topk, y_topk, X_val_s, y_val_s, iterations=args.iterations, 
-                ml_residuals=residuals_topk if args.use_ml else None,  # Only pass residuals if ML is enabled
-                accept_eval_max=None, X_test=X_test_s, y_test=y_test_s, 
-                use_test_for_acceptance=args.use_test_for_acceptance, output_dir=output_dir, **train_kwargs)
+    maicl.train(
+        X_topk,
+        y_topk,
+        X_val_s,
+        y_val_s,
+        iterations=args.iterations,
+        ml_residuals=residuals_topk if args.use_ml else None,  # Only pass residuals if ML is enabled
+        accept_eval_max=None,
+        # Use few-shot examples during training so LLM mechanisms see rich context
+        # This also propagates to LLM-only evaluation (k_shot is stored on the MA-ICL instance)
+        k_shot=10,
+        X_test=X_test_s,
+        y_test=y_test_s,
+        use_test_for_acceptance=args.use_test_for_acceptance,
+        acceptance_set=acceptance_set,
+        output_dir=output_dir,
+        **train_kwargs,
+    )
 
     # Post metrics
     logger.info("=" * 80)
@@ -1484,7 +1527,8 @@ def main():
     
     # For final test metrics: use same routing as training
     # If we optimized on test set, use relaxed routing; otherwise use strict routing to avoid leakage
-    final_relax_routing = args.use_test_for_acceptance or (args.relax_eval == 1)
+    optimized_on_test = (acceptance_set == "test")
+    final_relax_routing = optimized_on_test or (args.relax_eval == 1)
     if final_relax_routing:
         logger.info("Using relaxed routing for final evaluation (same as training)")
     else:
