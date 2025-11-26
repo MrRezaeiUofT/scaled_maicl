@@ -5,6 +5,7 @@ Visualization and result saving utilities for MA-ICL
 import os
 import json
 import csv
+import re
 import numpy as np
 from typing import List, Dict, Any, Optional
 import logging
@@ -14,6 +15,12 @@ try:
     _HAS_MPL = True
 except:
     _HAS_MPL = False
+
+try:
+    import networkx as nx
+    _HAS_NX = True
+except:
+    _HAS_NX = False
 
 try:
     from sklearn.metrics import confusion_matrix
@@ -225,7 +232,7 @@ def plot_scatter_predictions(y_true: np.ndarray, y_pred: np.ndarray,
 
 def create_result_visualizations(y_test: np.ndarray, 
                                  ml_baseline_metrics: Dict[str, Any],
-                                 pre_metrics: Dict[str, Any], 
+                                 pre_metrics: Dict[str, Any],
                                  post_metrics: Dict[str, Any],
                                  task_type: str = "classification",
                                  class_names: Optional[List[str]] = None,
@@ -335,6 +342,94 @@ def create_result_visualizations(y_test: np.ndarray,
             logger.warning(f"Failed to create confusion matrices: {e}")
     
     logger.info(f"✓ Created visualizations in {output_dir}")
+
+
+def parse_causal_graph(mechanism_text: str):
+    """
+    Parses the mechanism text to extract nodes and edges for the causal graph.
+    Returns a list of nodes and a list of edges (tuples).
+    """
+    nodes = []
+    edges = []
+    
+    # Regular expressions for parsing
+    node_pattern = re.compile(r"^\s*-\s*([^:]+):")
+    edge_pattern = re.compile(r"^\s*-\s*([^->]+)\s*->\s*([^:]+):")
+    
+    lines = mechanism_text.split('\n')
+    section = None
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+            
+        if "## NODES" in line:
+            section = "NODES"
+            continue
+        elif "## EDGES" in line:
+            section = "EDGES"
+            continue
+        elif "## EXECUTION FLOW" in line or "EXECUTABLE FORMULA" in line:
+            section = None
+            continue
+            
+        if section == "NODES":
+            match = node_pattern.match(line)
+            if match:
+                node_name = match.group(1).strip()
+                nodes.append(node_name)
+        
+        elif section == "EDGES":
+            match = edge_pattern.match(line)
+            if match:
+                source = match.group(1).strip()
+                target = match.group(2).strip()
+                edges.append((source, target))
+                
+    return nodes, edges
+
+
+def visualize_mechanism_graph(mechanism_text: str, title: str, output_path: str):
+    """
+    Visualizes the causal graph from the mechanism text and saves it to a file.
+    """
+    if not _HAS_MPL or not _HAS_NX:
+        if not _HAS_NX:
+            logger.warning("NetworkX not available, skipping graph visualization")
+        return
+
+    try:
+        nodes, edges = parse_causal_graph(mechanism_text)
+        
+        if not nodes and not edges:
+            return
+
+        G = nx.DiGraph()
+        G.add_nodes_from(nodes)
+        G.add_edges_from(edges)
+        
+        plt.figure(figsize=(10, 8))
+        pos = nx.spring_layout(G, seed=42)  # Consistent layout
+        
+        # Draw nodes
+        nx.draw_networkx_nodes(G, pos, node_size=2000, node_color='skyblue', alpha=0.8)
+        
+        # Draw edges
+        nx.draw_networkx_edges(G, pos, width=2, alpha=0.6, arrowsize=20)
+        
+        # Draw labels
+        nx.draw_networkx_labels(G, pos, font_size=10, font_family='sans-serif')
+        
+        plt.title(title, fontsize=15)
+        plt.axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+    except Exception as e:
+        logger.warning(f"Failed to visualize mechanism graph: {e}")
 
 
 # =========================
@@ -536,13 +631,18 @@ def persist_iteration_artifacts(iteration: int,
     mech_txt_path = os.path.join(output_dir, f"mechanisms_iter_{iteration}.txt")
     try:
         content = []
-        for m, t in zip(mech_snapshot["mechanisms"], mech_snapshot["mechanism_types"]):
+        for i, (m, t) in enumerate(zip(mech_snapshot["mechanisms"], mech_snapshot["mechanism_types"])):
             content.append(f"[{t.upper()}] {m}")
+            
+            # Visualize the graph if it's an LLM mechanism (which typically contains the graph)
+            if t.lower() == "llm":
+                graph_path = os.path.join(output_dir, f"mechanism_graph_iter_{iteration}_mech_{i+1}.png")
+                visualize_mechanism_graph(m, f"Mechanism {i+1} (Iter {iteration})", graph_path)
+                
         _safe_write_text(mech_txt_path, "\n\n".join(content))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to save mechanisms text or visualization: {e}")
     
     # JSONL append
     jsonl_path = os.path.join(output_dir, "mechanism_evolution.jsonl")
     _safe_append_jsonl(jsonl_path, {**mech_snapshot, "metrics": metrics})
-

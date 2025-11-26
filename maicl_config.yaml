@@ -17,20 +17,22 @@ prompts:
     single_mechanism: |
       You are applying a SCIENTIFIC MECHANISM to make a prediction.
 
-      MECHANISM (this describes a causal process):
+      MECHANISM (HIERARCHICAL CAUSAL GRAPH + FORMULA):
       {mechanism}
 
-      Your task: INTERPRET and EXECUTE this mechanism for the given input.
+      Your task: INTERPRET the Causal Graph and EXECUTE the Formula for the given input.
 
       CRITICAL APPROACH:
 
-      1. UNDERSTAND the mechanism:
+      1. UNDERSTAND the Causal Graph:
 
          - What causal process does it describe?
 
          - Which features play which roles (substrate, catalyst, inhibitor)?
 
-         - What are the key interactions?
+         - What are the key interactions defined in the EDGES section?
+
+         - Follow the EXECUTION FLOW defined in the graph.
 
       2. APPLY to input values:
 
@@ -58,9 +60,24 @@ prompts:
 
       EXECUTION EXAMPLE:
 
-      Mechanism: "NAD provides energy via saturation kinetics. tRNA enhances via synergy."
-
-      Formula: ŷ = 0.6 * nad/(0.3+nad) * (1+0.5*trna)
+      Mechanism: 
+      "# HIERARCHICAL CAUSAL GRAPH
+      ## NODES
+      - NAD: Energy source (Saturation)
+      - tRNA: Enhancer (Synergy)
+      
+      ## EDGES
+      - NAD -> Yield: Saturation kinetics
+      - tRNA -> Yield: Linear enhancement
+      
+      ## EXECUTION FLOW
+      1. Calculate NAD saturation.
+      2. Multiply by tRNA factor.
+      
+      EXECUTABLE FORMULA:
+      ```python
+      y = 0.6 * nad/(0.3+nad) * (1+0.5*trna)
+      ```"
 
       Input: {{"nad": 0.7, "trna": 0.4}}
 
@@ -81,14 +98,14 @@ prompts:
     batch_mechanisms: |
       You are applying SCIENTIFIC MECHANISMS to make predictions.
 
-      MECHANISMS (M={num_mechanisms}) - These describe causal processes:
+      MECHANISMS (M={num_mechanisms}) - These contain HIERARCHICAL CAUSAL GRAPHS and Formulas:
       {mechanisms_block}
 
       Your task: INTERPRET and EXECUTE each mechanism for the given inputs.
 
       CRITICAL APPROACH:
 
-      1. UNDERSTAND each mechanism:
+      1. UNDERSTAND each Causal Graph:
 
          - What causal process does it describe?
 
@@ -119,9 +136,20 @@ prompts:
 
       EXECUTION EXAMPLE:
 
-      Mechanism: "NAD provides energy via saturation kinetics. tRNA enhances via synergy."
-
-      Formula: ŷ = 0.6 * nad/(0.3+nad) * (1+0.5*trna)
+      Mechanism: 
+      "# HIERARCHICAL CAUSAL GRAPH
+      ## NODES
+      - NAD: Energy source (Saturation)
+      - tRNA: Enhancer (Synergy)
+      
+      ## EXECUTION FLOW
+      1. Calculate NAD saturation.
+      2. Multiply by tRNA factor.
+      
+      EXECUTABLE FORMULA:
+      ```python
+      y = 0.6 * nad/(0.3+nad) * (1+0.5*trna)
+      ```"
 
       Input: {{"nad": 0.7, "trna": 0.4}}
 
@@ -146,14 +174,14 @@ prompts:
     batch_single_mechanism: |
       You are applying a SCIENTIFIC MECHANISM to make predictions.
 
-      MECHANISM (this describes a causal process):
+      MECHANISM (HIERARCHICAL CAUSAL GRAPH + FORMULA):
       {mechanism}
 
-      Your task: INTERPRET and EXECUTE this mechanism for the given inputs.
+      Your task: INTERPRET the Causal Graph and EXECUTE the Formula for the given inputs.
 
       CRITICAL APPROACH:
 
-      1. UNDERSTAND the mechanism:
+      1. UNDERSTAND the Causal Graph:
 
          - What causal process does it describe?
 
@@ -186,9 +214,20 @@ prompts:
 
       EXECUTION EXAMPLE:
 
-      Mechanism: "NAD provides energy via saturation kinetics. tRNA enhances via synergy."
-
-      Formula: ŷ = 0.6 * nad/(0.3+nad) * (1+0.5*trna)
+      Mechanism: 
+      "# HIERARCHICAL CAUSAL GRAPH
+      ## NODES
+      - NAD: Energy source (Saturation)
+      - tRNA: Enhancer (Synergy)
+      
+      ## EXECUTION FLOW
+      1. Calculate NAD saturation.
+      2. Multiply by tRNA factor.
+      
+      EXECUTABLE FORMULA:
+      ```python
+      y = 0.6 * nad/(0.3+nad) * (1+0.5*trna)
+      ```"
 
       Input: {{"nad": 0.7, "trna": 0.4}}
 
@@ -259,17 +298,21 @@ prompts:
       regression_single: |
         Regression Task: Predict a numeric scalar in [{ymin}, {ymax}].
 
-        IMPORTANT: All target values are scaled to [{ymin}, {ymax}]. Your prediction MUST be between {ymin} and {ymax}.
-        Apply the mechanism as math; do not output text.
-        Return confidence (0-10).
+        IMPORTANT: 
+        1. All target values are scaled to [{ymin}, {ymax}]. 
+        2. Your formula must output values in this range.
+        3. If your raw formula produces values > {ymax} or < {ymin}, check your coefficients.
+        4. Return confidence (0-10).
 
         Format: {{"y_hat": <float between {ymin} and {ymax}>, "confidence": <number>}}
 
       regression_batch: |
         Regression Task: Predict a numeric scalar in [{ymin}, {ymax}].
 
-        IMPORTANT: All target values are scaled to [{ymin}, {ymax}]. Your prediction MUST be between {ymin} and {ymax}.
-        Apply the mechanism's mathematical description to compute the output value from the input features.
+        IMPORTANT: 
+        1. All target values are scaled to [{ymin}, {ymax}]. 
+        2. Your formula must output values in this range.
+        3. Apply the mechanism's mathematical description exactly.
 
     # Format instructions for JSON responses
     format_instructions:
@@ -320,13 +363,13 @@ prompts:
 
       Latent mechanism z: {latent_z}
 
-      Generate an executable mechanism formula.
+      Generate a CAUSAL GRAPH description followed by an EXECUTABLE FORMULA.
 
     # Note: decoder_prompt is referenced but not explicitly defined in the code
     # This should be set based on the task type and dataset
     decoder_default: |
-      You are a mechanism decoder that converts latent representations into executable mechanism formulas.
-      Generate a clear, interpretable mechanism that can be applied to make predictions.
+      You are a mechanism decoder that converts latent representations into Causal Graphs and executable formulas.
+      Generate a clear, interpretable Causal Graph that explains the underlying process, followed by a formula that implements it.
 
   # =========================
   # FEW-SHOT EXAMPLES
@@ -347,38 +390,30 @@ training:
     # Primary thresholds (strict) - used in PRIMARY acceptance check
     primary:
       regression:
-        r2: 0.005  # Require at least 0.005 improvement in R2 for primary acceptance
-        mae: 0.005  # Require at least 0.005 improvement in MAE for primary acceptance
+        r2: 0.001  # Relaxed: Require at least 0.001 improvement
+        mae: 0.001  # Relaxed: Require at least 0.001 improvement
       classification:
-        acc: 0.005  # Require at least 0.5% improvement in accuracy for primary acceptance
-        f1: 0.005  # Require at least 0.5% improvement in F1 for primary acceptance
+        acc: 0.001  # Relaxed: Require at least 0.1% improvement
+        f1: 0.001  # Relaxed: Require at least 0.1% improvement
     
     # Secondary thresholds (lenient) - used in fallback acceptance checks
     secondary:
       regression:
-        r2: 0.01  # Require at least 0.01 improvement in R2 for secondary acceptance
-        mae: 0.01  # Require at least 0.01 improvement in MAE for secondary acceptance
-        r2_vs_current_multiplier: 2.0  # Multiply threshold when comparing vs current (2x = 0.02)
-        mae_vs_current_multiplier: 2.0  # Multiply threshold when comparing vs current (2x = 0.02)
+        r2: 0.002  # Relaxed secondary
+        mae: 0.002  # Relaxed secondary
+        r2_vs_current_multiplier: 1.0  # Lower multiplier
+        mae_vs_current_multiplier: 1.0  # Lower multiplier
       classification:
-        acc: 0.01  # Require at least 1% improvement in accuracy for secondary acceptance
-        f1: 0.01  # Require at least 1% improvement in F1 for secondary acceptance
-        acc_vs_current_multiplier: 2.0  # Multiply threshold when comparing vs current (2x = 0.02)
-        f1_vs_current_multiplier: 2.0  # Multiply threshold when comparing vs current (2x = 0.02)
-    
-    # Very significant improvement thresholds (for allowing loss degradation)
-    very_significant:
-      regression:
-        r2: 0.05  # Very significant R2 improvement to justify loss degradation
-        mae: 0.05  # Very significant MAE improvement to justify loss degradation
-        r2_significant: 0.02  # Significant R2 improvement to justify loss degradation vs best
-        mae_significant: 0.02  # Significant MAE improvement to justify loss degradation vs best
-  
+        acc: 0.002  # Relaxed secondary
+        f1: 0.002  # Relaxed secondary
+        acc_vs_current_multiplier: 1.0  # Lower multiplier
+        f1_vs_current_multiplier: 1.0  # Lower multiplier
+
   # Loss degradation thresholds
   loss_degradation:
-    vs_current: 0.01  # Reject if loss is more than 0.01 worse than current state
-    vs_best: 0.05  # Reject if loss is more than 0.05 worse than best-seen state
-    tiny_degradation: 0.01  # Allow tiny degradation (0.01) if metrics improved
+    vs_current: 0.02  # Allow slightly more degradation (0.02) for exploration
+    vs_best: 0.10  # Allow more degradation vs best (0.10) to escape local optima
+    tiny_degradation: 0.02  # Allow tiny degradation
   
   # Metric degradation thresholds (for rejection)
   metric_degradation:

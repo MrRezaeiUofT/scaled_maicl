@@ -6,6 +6,7 @@ MA-ICL Regression Runner (Biotech/Biological Datasets)
 - Trains an ML baseline on scaled features
 - Computes residuals on train set and selects top-K by residual magnitude
 - Trains MA-ICL on the residual-difficult subset (optimization target: MAE or R2, configurable via --regression_loss)
+- Generates and optimizes Causal Graph descriptions alongside mathematical formulas
 - Reports pre/post: MAE, R2, and MSE on the test set
 
 Available Datasets:
@@ -1101,6 +1102,8 @@ def main():
     dataset_name_lower = args.dataset.lower()
     dataset_name_original = args.dataset  # Preserve original case for enzyme datasets
     
+    logger.info(f"Running MA-ICL with Causal Graph Optimization enabled.")
+    
     # Extract plate information for protein_expression dataset to include in output directory
     plate_suffix = ""
     if dataset_name_lower == "protein_expression":
@@ -1534,16 +1537,12 @@ def main():
     else:
         logger.info("Using strict routing for final evaluation (to avoid validation leakage)")
     
-    # CRITICAL: Mechanism performance will always be recalculated on the test set to ensure
-    # accurate routing with the final accepted mechanisms. The preserve_mechanism_performance
-    # flag only affects whether we update the snapshot, not whether we recalculate.
-    # This ensures post-training results reflect the actual performance of the final mechanisms.
-    preserve_perf = args.use_test_for_acceptance
-    if preserve_perf:
-        logger.info("Recalculating mechanism performance on test set (preserving snapshot for consistency)")
-        logger.info("  Note: Performance is recalculated to ensure accurate routing with final accepted mechanisms")
-    else:
-        logger.info("Recalculating mechanism performance scores on test set (for accurate routing)")
+    # CRITICAL: Always preserve mechanism performance scores from training snapshot for final evaluation.
+    # This ensures that we evaluate the EXACT model state (mechanisms + weights) that was restored as "best".
+    # Recalculating scores on the test set is transductive and changes the model, which invalidates the "best iteration" choice.
+    preserve_perf = True
+    logger.info("Using frozen mechanism performance scores from best training iteration (no recalculation on test set)")
+    logger.info("  Note: This ensures we evaluate the exact model configuration selected during training")
     
     # Log final accepted mechanisms for transparency
     final_mechanism_count = len(maicl.mechanisms) if hasattr(maicl, 'mechanisms') else 0

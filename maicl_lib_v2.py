@@ -1746,21 +1746,21 @@ class TrainableMAICL:
             should_recalculate = False
             should_update_snapshot = False
             logger.info(f"  [Evaluate] Preserving pre-training performance snapshot to maintain baseline accuracy")
-        elif relax_routing and preserve_mechanism_performance:
-            # During training with explicit preservation: recalculate for accuracy but don't update snapshot
-            # This ensures accurate routing while maintaining consistency with training logs
-            should_recalculate = True
-            should_update_snapshot = False  # Don't update snapshot to match training behavior
-            logger.info(f"  [Evaluate] Recalculating mechanism performance on evaluation set (preserving snapshot for consistency)")
-            if hasattr(self, 'mechanism_performance_snapshot') and self.mechanism_performance_snapshot:
-                logger.debug(f"  [Evaluate] Snapshot exists but will be recalculated: {self.mechanism_performance_snapshot}")
-        elif relax_routing and not preserve_mechanism_performance:
+        elif preserve_mechanism_performance:
+            # When explicitly preserving performance (e.g., final test evaluation with frozen model):
+            # Do NOT recalculate. Use the snapshot scores exactly as they are.
+            should_recalculate = False
+            should_update_snapshot = False
+            logger.info(f"  [Evaluate] Using frozen mechanism performance from snapshot (no recalculation)")
+            
+        elif relax_routing:
             # During training without explicit preservation: recalculate and update snapshot
             should_recalculate = True
             should_update_snapshot = True
             logger.debug(f"  [Evaluate] Recalculating mechanism performance scores (training mode, updating snapshot)")
+            
         else:
-            # Final evaluation (test set): always recalculate for accuracy
+            # Final evaluation (test set) without preservation: always recalculate for accuracy
             should_recalculate = True
             should_update_snapshot = True
             logger.info(f"  [Evaluate] Recalculating mechanism performance scores on test set (final evaluation)")
@@ -3010,79 +3010,64 @@ class TrainableMAICL:
                         # Also compare against best-seen metrics
                         best_r2 = getattr(self, '_best_r2', current_r2)
                         best_mae = getattr(self, '_best_mae', current_mae)
-                        r2_improved_vs_best = (new_r2 is not None and best_r2 is not None and new_r2 > best_r2)
-                        mae_improved_vs_best = (new_mae is not None and best_mae is not None and new_mae < best_mae)
                         
-                        # Reject if metrics degrade significantly vs best-seen
-                        # Stricter thresholds: reject if R2 drops by more than 0.02 or MAE increases by more than 0.05
-                        max_r2_degradation = 0.02  # Reject if R2 drops by more than 0.02 vs best
-                        max_mae_degradation = 0.05  # Reject if MAE increases by more than 0.05 vs best
+                        # CRITICAL: STRICT ACCEPTANCE CRITERIA
+                        # Reject ANY degradation vs current best metrics. We want MONOTONIC improvement in the best-seen performance.
+                        # Allow tiny tolerance (0.001) for numerical stability, but otherwise strictly reject degradation.
+                        
+                        max_r2_degradation = 0.001  # STRICT: Reject if R2 drops by more than 0.001 vs best
+                        max_mae_degradation = 0.001  # STRICT: Reject if MAE increases by more than 0.001 vs best
                         
                         r2_degradation_vs_best = (best_r2 - new_r2) if (best_r2 is not None and new_r2 is not None) else 0.0
                         mae_degradation_vs_best = (new_mae - best_mae) if (best_mae is not None and new_mae is not None) else 0.0
                         
                         if (r2_degradation_vs_best > max_r2_degradation or mae_degradation_vs_best > max_mae_degradation):
                             accept = False
-                            reason = f"rejected: metric degradation vs best (R2: {best_r2:.4f} → {new_r2:.4f} ({r2_degradation_vs_best:+.4f}), MAE: {best_mae:.4f} → {new_mae:.4f} ({mae_degradation_vs_best:+.4f}))"
+                            reason = f"rejected: STRICT metric degradation vs best (R2: {best_r2:.4f} → {new_r2:.4f} ({r2_degradation_vs_best:+.4f}), MAE: {best_mae:.4f} → {new_mae:.4f} ({mae_degradation_vs_best:+.4f}))"
                         else:
-                            # For regression, check both overall improvement AND mechanism-level improvements
-                            # IMPROVED: Also check if LLM mechanisms improved individually, even if overall loss didn't improve much
-                            # This is important when LLM mechanisms have low routing weight - they can improve without affecting overall loss much
-                            llm_improved = False
-                            if hasattr(self, 'mechanism_metrics_snapshot') and self.mechanism_metrics_snapshot:
-                                llm_indices = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "llm"]
-                                for llm_idx in llm_indices:
-                                    old_metrics = self.mechanism_metrics_snapshot.get(llm_idx, {})
-                                    # Re-evaluate new mechanism metrics (will be updated after acceptance)
-                                    # For now, check if mechanism performance score improved
-                                    old_perf = self.mechanism_performance_snapshot.get(llm_idx, 0.5)
-                                    # We'll check new performance after re-evaluation, but for now accept if overall improvement
+                            # If metrics are stable or improving, check loss
+                            # CRITICAL: If performance (R2 or MAE) improved vs best, ACCEPT unconditionally (ignore loss).
+                            # The user explicitly requested to prioritize performance metrics over loss.
                             
-                            # CRITICAL FIX: Reject if new_loss is significantly worse than current_loss OR best_loss
-                            # This prevents accepting updates that degrade from the current state or best we've seen
-                            # Allow small degradation (0.01 vs current, 0.05 vs best) only if metrics improve significantly
-                            max_loss_degradation_vs_current = 0.01  # Reject if loss is more than 0.01 worse than current
-                            max_loss_degradation_vs_best = 0.05  # Reject if loss is more than 0.05 worse than best
-                            loss_degradation_vs_current = new_loss - current_loss
-                            loss_degradation_vs_best = new_loss - best_loss_for_comparison
-                            
-                            # Calculate actual improvement values vs best
-                            r2_improvement_vs_best_val = (new_r2 - best_r2) if (new_r2 is not None and best_r2 is not None) else 0.0
+                            r2_improved_vs_best_val = (new_r2 - best_r2) if (new_r2 is not None and best_r2 is not None) else 0.0
                             mae_improvement_vs_best_val = (best_mae - new_mae) if (best_mae is not None and new_mae is not None) else 0.0
                             
-                            # First check: reject if loss degraded significantly vs current (even if metrics improved)
-                            if loss_degradation_vs_current > max_loss_degradation_vs_current:
-                                # Loss degraded vs current - reject unless metrics improved VERY significantly vs best
-                                # Require larger metric improvements to justify degrading from current state
-                                if (r2_improved_vs_best and r2_improvement_vs_best_val >= 0.05) or (mae_improved_vs_best and mae_improvement_vs_best_val >= 0.05):
-                                    # Metrics improved very significantly vs best - allow even if loss degraded vs current
-                                    accept = True
-                                    reason = f"loss degraded vs current ({loss_degradation_vs_current:+.4f}) but metrics improved very significantly vs best (R2: {best_r2:.4f}→{new_r2:.4f} (+{r2_improvement_vs_best_val:.4f}), MAE: {best_mae:.4f}→{new_mae:.4f} (-{mae_improvement_vs_best_val:.4f}))"
-                                else:
-                                    # Reject: loss degraded too much vs current and metrics didn't improve enough
-                                    accept = False
-                                    reason = f"rejected: loss degraded vs current ({loss_degradation_vs_current:+.4f} > {max_loss_degradation_vs_current:.4f}, current={current_loss:.4f}, new={new_loss:.4f})"
-                            elif loss_degradation_vs_best > max_loss_degradation_vs_best:
-                                # New loss is significantly worse than best - reject unless metrics improved significantly vs best
-                                if (r2_improved_vs_best and r2_improvement_vs_best_val >= 0.02) or (mae_improved_vs_best and mae_improvement_vs_best_val >= 0.02):
-                                    # Metrics improved significantly vs best - allow even if loss degraded
-                                    accept = True
-                                    reason = f"loss degraded vs best ({loss_degradation_vs_best:+.4f}) but metrics improved significantly vs best (R2: {best_r2:.4f}→{new_r2:.4f} (+{r2_improvement_vs_best_val:.4f}), MAE: {best_mae:.4f}→{new_mae:.4f} (-{mae_improvement_vs_best_val:.4f}))"
-                                else:
-                                    # Reject: loss degraded too much vs best and metrics didn't improve enough
-                                    accept = False
-                                    reason = f"rejected: loss degraded vs best ({loss_degradation_vs_best:+.4f} > {max_loss_degradation_vs_best:.4f}, best={best_loss_for_comparison:.4f}, new={new_loss:.4f})"
-                            elif improvement > 0:
+                            r2_improved_vs_best_bool = (new_r2 is not None and best_r2 is not None and new_r2 > best_r2)
+                            mae_improved_vs_best_bool = (new_mae is not None and best_mae is not None and new_mae < best_mae)
+                            
+                            if r2_improved_vs_best_bool or mae_improved_vs_best_bool:
+                                # Performance improved! Accept regardless of loss.
                                 accept = True
-                                reason = f"improvement {improvement:.4f} >= threshold {adaptive_threshold:.4f}"
-                            elif improvement >= -0.01 and (r2_improved or mae_improved):
-                                # Allow tiny degradation (0.01) if R2 or MAE improved - mechanism is getting better
-                                accept = True
-                                reason = f"tiny degradation {improvement:.4f} but metrics improved (R2: {current_r2:.4f}→{new_r2:.4f}, MAE: {current_mae:.4f}→{new_mae:.4f})"
+                                if r2_improved_vs_best_bool and mae_improved_vs_best_bool:
+                                    reason = f"PERFORMANCE IMPROVED vs best (ignoring loss): R2 {best_r2:.4f}→{new_r2:.4f}, MAE {best_mae:.4f}→{new_mae:.4f}"
+                                elif r2_improved_vs_best_bool:
+                                    reason = f"PERFORMANCE IMPROVED vs best (ignoring loss): R2 {best_r2:.4f}→{new_r2:.4f}"
+                                else:
+                                    reason = f"PERFORMANCE IMPROVED vs best (ignoring loss): MAE {best_mae:.4f}→{new_mae:.4f}"
                             else:
-                                # Reject significant degradation for regression
-                                accept = False
-                                reason = f"rejected: degradation {improvement:.4f} (regression requires improvement or tiny degradation with metric improvement)"
+                                # Metrics stable but not strictly better. Now check loss degradation.
+                                # Reject if new_loss is significantly worse than best_loss
+                                max_loss_degradation_vs_best = 0.02  # Stricter: Reject if loss is more than 0.02 worse than best
+                                loss_degradation_vs_current = new_loss - current_loss
+                                loss_degradation_vs_best = new_loss - best_loss_for_comparison
+                                
+                                # First check: reject if loss degraded significantly vs current
+                                if loss_degradation_vs_current > 0.01: # 0.01 tolerance vs current
+                                    accept = False
+                                    reason = f"rejected: loss degraded vs current ({loss_degradation_vs_current:+.4f} > 0.01, metrics stable but not improved)"
+                                elif loss_degradation_vs_best > max_loss_degradation_vs_best:
+                                    accept = False
+                                    reason = f"rejected: loss degraded vs best ({loss_degradation_vs_best:+.4f} > {max_loss_degradation_vs_best:.4f}, metrics stable but not improved)"
+                                elif improvement > 0:
+                                    accept = True
+                                    reason = f"improvement {improvement:.4f} >= threshold {adaptive_threshold:.4f}"
+                                elif improvement >= -0.01:
+                                    # Allow tiny degradation (0.01) if metrics are stable
+                                    accept = True
+                                    reason = f"tiny degradation {improvement:.4f} but metrics stable"
+                                else:
+                                    accept = False
+                                    reason = f"rejected: degradation {improvement:.4f}"
                 
                 # Criterion 2: Wilcoxon test (if small sample)
                 elif len(X_accept_consistent) < 50 and improvement > 0:
@@ -3302,17 +3287,32 @@ class TrainableMAICL:
                         mae_threshold = get_best_snapshot_threshold('regression', 'mae')
                         
                         # Check if performance metrics improved
+                        # Strict improvement logic
                         r2_improved = (new_r2 is not None and best_r2 is not None and new_r2 > best_r2 + r2_threshold)
                         mae_improved = (new_mae is not None and best_mae is not None and new_mae < best_mae - mae_threshold)
                         
-                        # PRIORITY: Update if metrics improved (even if loss didn't)
-                        if r2_improved or mae_improved:
+                        # Also handle first iteration where best might be None
+                        if best_r2 is None: r2_improved = True
+                        if best_mae is None: mae_improved = True
+                        
+                        # PRIORITY: Update if R2 significantly improved
+                        if r2_improved:
                             is_new_best = True
-                            logger.info(f"  [Best Performance] Metrics improved: R2 {best_r2:.4f}→{new_r2:.4f}, MAE {best_mae:.4f}→{new_mae:.4f}")
-                        # Also update if loss improved significantly (secondary priority)
-                        elif new_loss < best_loss - 0.01:  # Require at least 0.01 improvement in loss
-                            is_new_best = True
-                            logger.info(f"  [Best Performance] Loss improved: {best_loss:.4f}→{new_loss:.4f}")
+                            logger.info(f"  [Best Performance] R2 improved: {best_r2 if best_r2 is not None else 'N/A'}→{new_r2:.4f}")
+                        
+                        # PRIORITY: Update if MAE significantly improved AND R2 is stable
+                        elif mae_improved:
+                            # Ensure R2 didn't drop significantly (allow small 0.01 drop)
+                            if new_r2 is not None and best_r2 is not None and new_r2 >= best_r2 - 0.01:
+                                is_new_best = True
+                                logger.info(f"  [Best Performance] MAE improved (R2 stable): MAE {best_mae if best_mae is not None else 'N/A'}→{new_mae:.4f}, R2 {best_r2:.4f}→{new_r2:.4f}")
+                            else:
+                                logger.info(f"  [Best Performance] MAE improved but R2 dropped too much: MAE {best_mae:.4f}→{new_mae:.4f}, R2 {best_r2:.4f}→{new_r2:.4f} (ignoring)")
+                        
+                        # Secondary: Update if loss improved significantly AND R2 didn't crash
+                        # REMOVED: Do not update best snapshot based on loss alone. Performance metrics are king.
+                        # Only use loss as a tie-breaker if needed, but here we strictly follow R2/MAE.
+
                     
                     elif self.task_type == "classification":
                         # For classification: PRIORITIZE Accuracy and F1 over loss
@@ -3323,14 +3323,23 @@ class TrainableMAICL:
                         acc_improved = (new_acc > best_acc_for_comparison + acc_threshold)
                         f1_improved = (new_f1 > best_f1_for_comparison + f1_threshold)
                         
-                        # PRIORITY: Update if metrics improved (even if loss didn't)
+                        # Handle first iteration
+                        if best_acc_for_comparison is None: acc_improved = True
+                        if best_f1_for_comparison is None: f1_improved = True
+                        
+                        # PRIORITY: Update if performance metrics improved (ignore loss)
                         if acc_improved or f1_improved:
                             is_new_best = True
-                            logger.info(f"  [Best Performance] Metrics improved: ACC {best_acc_for_comparison:.4f}→{new_acc:.4f}, F1 {best_f1_for_comparison:.4f}→{new_f1:.4f}")
-                        # Also update if loss improved significantly (secondary priority)
-                        elif new_loss < best_loss - 0.01:  # Require at least 0.01 improvement in loss
-                            is_new_best = True
-                            logger.info(f"  [Best Performance] Loss improved: {best_loss:.4f}→{new_loss:.4f}")
+                            if acc_improved and f1_improved:
+                                logger.info(f"  [Best Performance] Metrics improved: ACC {best_acc_for_comparison:.4f}→{new_acc:.4f}, F1 {best_f1_for_comparison:.4f}→{new_f1:.4f}")
+                            elif acc_improved:
+                                logger.info(f"  [Best Performance] Accuracy improved: ACC {best_acc_for_comparison:.4f}→{new_acc:.4f}")
+                            else:
+                                logger.info(f"  [Best Performance] F1 improved: F1 {best_f1_for_comparison:.4f}→{new_f1:.4f}")
+                        
+                        # Secondary: Update if loss improved significantly (only if metrics stable)
+                        # REMOVED: Do not update best snapshot based on loss alone for classification either.
+
                     
                     if is_new_best:
                         best_loss = float(new_loss)
@@ -3384,7 +3393,11 @@ class TrainableMAICL:
                         elif self.task_type == "regression":
                             logger.info(f"  [Best Snapshot] Updated best-performing model: R2={self._best_r2:.4f}, MAE={self._best_mae:.4f}, Loss={best_loss:.4f}")
                 else:
-                    logger.info(f"  ✗ Rejected update: loss {current_loss:.4f} → {new_loss:.4f}")
+                    if reason:
+                        logger.info(f"  ✗ Rejected update: {reason}")
+                    else:
+                        logger.info(f"  ✗ Rejected update: loss {current_loss:.4f} → {new_loss:.4f}")
+                    
                     self.mechanisms = prev_mechanisms
                     rejected = 1
                     

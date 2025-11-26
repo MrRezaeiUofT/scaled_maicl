@@ -17,27 +17,27 @@ prompts:
 
       {feature_instruction}
 
-      YOUR TASK: FIX THE MECHANISM BY LEARNING NEW COEFFICIENTS
+      YOUR TASK: FIX THE MECHANISM BY REFINING THE HIERARCHICAL CAUSAL GRAPH AND FORMULA
 
-      CRITICAL: Your mechanism formula has coefficients (like 0.783, 0.301, 0.194, etc.) that are starting values. 
-      You MUST learn new coefficient values based on performance metrics (R² and MAE for regression, Accuracy and F1 for classification).
-      Don't just add interaction terms - actually change the base coefficients to improve performance.
+      CRITICAL: You are optimizing a mechanism that consists of a HIERARCHICAL CAUSAL GRAPH description and an EXECUTABLE FORMULA.
+      Your goal is to improve the scientific validity and predictive accuracy of both.
 
       Follow this diagnostic process:
 
       1️⃣ ANALYZE THE ERROR PATTERNS:
-
          - What are the systematic failures? (overestimation? underestimation?)
-
          - Which features correlate with large errors?
-
          - Are errors worse for high/low values of specific features?
 
-      2️⃣ IDENTIFY THE ROOT CAUSE:
+      2️⃣ IDENTIFY THE CAUSAL MISMATCH:
+         - Is the Causal Graph missing a key relationship (e.g., X causes Y)?
+         - Is a relationship mischaracterized (e.g., linear vs. saturation)?
+         - Are there missing interactions (e.g., A modulates B)?
 
-         - Is a key feature missing from the mechanism?
-
-         - Are feature interactions modeled incorrectly?
+      3️⃣ REFINE THE MECHANISM:
+         - UPDATE the "HIERARCHICAL CAUSAL GRAPH" section to reflect better scientific understanding.
+         - UPDATE the "FORMULA" to match the new graph and minimize errors.
+         - You MUST learn new coefficients based on performance metrics.
 
          - Are there saturation effects or thresholds being ignored?
 
@@ -65,26 +65,36 @@ prompts:
            * Ratio relationships: feature1 / feature2
            * Class-specific scoring: Different formulas for different classes (classification)
 
-         - PREFER RICH TEXTUAL DESCRIPTIONS: Instead of trying to cram everything into a complex formula, 
-           use detailed textual descriptions that capture the TRUE decision-making process. The LLM can 
-           interpret and execute these descriptions during prediction. For example:
+         - PREFER RICH HIERARCHICAL DESCRIPTIONS: Instead of simple text, use a structured HIERARCHICAL CAUSAL GRAPH that describes the decision-making process. 
+           Focus on the PREDICTIVE POWER of the graph. Avoid generalities.
            
-           GOOD (Textual + Simple Formula):
-           "CLASS DISCRIMINATION MECHANISM:
-           • BUS: Characterized by SATURATION in COMPACTNESS (effectiveness plateaus at high values >0.6).
-                  Strong synergy between COMPACTNESS and CIRCULARITY (when both high, amplifies score).
-                  Decision: COMPACTNESS > 0.5 AND CIRCULARITY > 0.4 → bus likely
-           • VAN: Shows PRIMARY DOMINANCE of DISTANCE_CIRCULARITY with INVERSE relationship to COMPACTNESS.
-                  Decision: DISTANCE_CIRCULARITY > 0.7 AND COMPACTNESS < 0.4 → van likely
-           • SAAB: Exhibits MULTIPLICATIVE interaction between SCALED_VARIANCE_MINOR × MAX.LENGTH_ASPECT_RATIO.
-                   Decision: Both features > 0.5 simultaneously → saab signature
-           • OPEL: Linear combination with RATIO-BASED modulation (moderate values across board).
-                   Decision: Middle-range features (0.2-0.5) with stable ratios → opel"
+           GOOD (Hierarchical Graph + Simple Formula):
+           "# HIERARCHICAL CAUSAL GRAPH
+           ## NODES (Variables)
+           - COMPACTNESS: Primary driver for BUS classification.
+           - CIRCULARITY: Modulator for BUS and OPEL.
            
-           BAD (Overly complex formula without explanation):
-           "ŷ = 0.783*f1^2/(0.3+f1) + 0.301*f2*log(1+f3) - 0.194*sqrt(f4)*(f5>0.6?1:0) + ..."
+           ## EDGES (Relationships)
+           - COMPACTNESS -> BUS Score: Saturation relationship (diminishing returns).
+           - COMPACTNESS * CIRCULARITY -> BUS Score: Synergistic amplification.
+           
+           ## EXECUTION FLOW
+           1. Calculate BUS score via saturation of COMPACTNESS.
+           2. Modulate OPEL score based on feature ratios.
+           3. Select class with max score."
+           
+           BAD (Text block):
+           "REVISED MECHANISM: This mechanism classifies vehicles based on..."
 
          - LEARN NEW COEFFICIENTS: Don't just add interaction terms - actually adjust the base coefficients (0.783, 0.301, etc.) based on performance metrics. If R² is low or MAE is high, increase/decrease coefficients systematically. Try different coefficient values (e.g., 0.5, 1.0, 1.5, 2.0) to find what improves performance.
+         
+         - DRASTIC CHANGES REQUIRED IF STUCK:
+           If your mechanism is consistently REJECTED (loss unchanged), it likely has very low weight in the ensemble.
+           You must make DRAMATIC changes to the coefficients or logic to achieve >10% accuracy improvement.
+           - Double or halve coefficients.
+           - Invert relationships if negative correlation is observed.
+           - Add strong threshold logic (e.g., "if x > 0.8 then score += 5.0").
+           - Your goal is to make the mechanism relevant!
 
          - Add the missing feature or interaction that explains errors
 
@@ -147,58 +157,81 @@ prompts:
 
       REVISED MECHANISM:
 
-      [Clear description of the causal process]
+      # HIERARCHICAL CAUSAL GRAPH
+      ## NODES (Variables)
+      - [Node 1]: [Description]
+      
+      ## EDGES (Relationships)
+      - [Node 1] -> [Outcome]: [Description of relationship, e.g., Saturation, Linear, Threshold]
+      
+      ## EXECUTION FLOW
+      [Step-by-step logic description]
 
-      Formula: ŷ = [executable expression with ACTUAL feature names]
+      EXECUTABLE FORMULA:
+      ```python
+      [Python code that implements the logic above]
+      ```
       {formula_instruction}
 
       CRITICAL REQUIREMENTS FOR YOUR FORMULA:
-      - If the current formula has coefficients like 0.783, 0.301, 0.194, you MUST change these to new values (e.g., 0.5, 1.0, 1.2, 1.5, 2.0) that improve R² and MAE
+      - **INTERCEPT/BIAS**: Always include a base term (e.g., `y_hat = 1.5 + ...`) to capture the baseline value when features are low. This is critical for R² > 0.
+      - If the current formula has coefficients like 0.783, 0.301, 0.194, you MUST change these to new values (e.g., 0.5, 1.0, 1.2, 1.5, 2.0, 5.0) that improve R² and MAE
       - Don't just copy the same coefficients and add interaction terms - actually learn new coefficient values
       - Try systematically: if R² is low, increase important feature coefficients; if MAE is high, adjust coefficients to reduce errors
       - The goal is to maximize R² and minimize MAE through coefficient optimization, not just adding terms
 
       OUTPUT FORMAT - CRITICAL:
       
-      ALWAYS LEAD WITH TEXTUAL DESCRIPTION, FORMULA IS SECONDARY:
+      ALWAYS LEAD WITH HIERARCHICAL CAUSAL GRAPH, FORMULA IS SECONDARY:
       
-      1. START with a rich textual description of the mechanism (3-10 sentences):
-         - Explain the decision logic in natural language
-         - Describe feature interactions and their meanings
-         - Identify class-specific patterns (for classification)
-         - Describe non-linear behaviors (saturation, thresholds, synergies)
-         - Use domain-specific terminology when appropriate
-         - For REGRESSION (like GFP yield): explicitly describe how the mechanism behaves across LOW, MEDIUM, and HIGH output regions (e.g., \"low GFP yield\" vs. \"very high GFP yield\" regimes).
-         - Include at least one or two CONCRETE EXAMPLES (\"when Temperature is high and Magnesium is low, the mechanism predicts ... because ...\").
+      1. START with a structured HIERARCHICAL CAUSAL GRAPH:
+         - DO NOT write paragraphs of text. Use the specific Markdown structure below.
+         - ## NODES (Variables): List key features acting as nodes.
+         - ## EDGES (Relationships): Describe the causal links (e.g., "Saturation", "Synergy", "Inhibition").
+         - ## EXECUTION FLOW: Briefly describe the logical steps to reach a prediction.
          
       2. THEN provide the executable formula in a ```python code block:
-         - Formula should IMPLEMENT the textual description
-         - Use class-specific scoring for classification (different formulas per class)
-         - Include non-linear transformations (saturation, interactions, ratios)
-         - Keep formula interpretable (match the textual description)
+         - Formula should IMPLEMENT the graph logic exactly.
+         - Use class-specific scoring for classification (different formulas per class).
+         - Include non-linear transformations (saturation, interactions, ratios).
          
       3. STRUCTURE your response as:
-         DIAGNOSIS: [What's wrong with current mechanism]
-         FIX: [What to change]
-         REVISED MECHANISM: [Rich textual description explaining the logic]
-           - Include a short BULLET LIST that maps each major term in the formula to its role (e.g., \"magnesium_saturation term: captures saturating cofactor effect on GFP yield\").
-           - Clearly state how the mechanism can be used for PREDICTION (\"given new experimental conditions, this mechanism outputs a GFP yield by...\").
-           - Provide 1–2 short scenario-style examples that a scientist could read to understand the mechanism qualitatively.
+         DIAGNOSIS: [Diagnosis]
+         FIX: [Fix]
+         REVISED MECHANISM:
+         
+         # HIERARCHICAL CAUSAL GRAPH
+         ## NODES (Variables)
+         - [Name]: [Role]
+         
+         ## EDGES (Relationships)
+         - [Relation]: [Description]
+         
+         ## EXECUTION FLOW
+         - [Step 1]
+         - [Step 2]
          
          EXECUTABLE FORMULA:
          ```python
-         [Python code that implements the textual logic above]
+         [Python code]
          ```
          
       Example structure for classification:
       "REVISED MECHANISM:
-      This mechanism distinguishes vehicles by their geometric signatures. BUS exhibits saturation 
-      behavior in COMPACTNESS (plateaus above 0.6) with strong synergy when both COMPACTNESS and 
-      CIRCULARITY are elevated. VAN shows inverse relationship between DISTANCE_CIRCULARITY and 
-      COMPACTNESS - high circularity distance with low compactness indicates van. SAAB requires 
-      multiplicative interaction between SCALED_VARIANCE_MINOR and MAX.LENGTH_ASPECT_RATIO - both 
-      must be elevated simultaneously. OPEL is characterized by moderate values across features 
-      with ratio-based scoring.
+      
+      # HIERARCHICAL CAUSAL GRAPH
+      ## NODES (Variables)
+      - COMPACTNESS: Shape descriptor.
+      - CIRCULARITY: Shape descriptor.
+      
+      ## EDGES (Relationships)
+      - COMPACTNESS -> BUS: Saturation effect (plateaus > 0.6).
+      - COMPACTNESS * CIRCULARITY -> BUS: Synergistic amplification.
+      
+      ## EXECUTION FLOW
+      1. Compute BUS score using saturation of COMPACTNESS.
+      2. Add interaction term.
+      3. Argmax for final class.
       
       EXECUTABLE FORMULA:
       ```python
@@ -224,13 +257,28 @@ prompts:
 
       {update_instruction}
 
-      Updated mechanism (RICH, TEXTUAL, ELABORATED DESCRIPTION):
+      Updated mechanism (HIERARCHICAL CAUSAL GRAPH + FORMULA):
 
       REVISED MECHANISM:
-      - Provide a multi-sentence, narrative description (3–8 sentences) that focuses on how the mechanism PREDICTS the target variable.
-      - Explicitly explain how each major feature influences the prediction (e.g., \"Magnesium concentration (mM)\" increases the predicted GFP yield with a saturating effect at high values).
-      - Emphasize predictive behavior: which regions of feature space lead to high vs. low predicted outputs, and why.
-      - Make it clear how the mechanism, on its own, can serve as a strong predictive model for the target (not only as a residual correction to the ML baseline).
+      
+      # HIERARCHICAL CAUSAL GRAPH
+      ## NODES (Variables)
+      - [Name]: [Role/Description]
+      
+      ## EDGES (Relationships)
+      - [Source] -> [Target]: [Interaction type: Saturation/Synergy/Inhibition etc.]
+      
+      ## EXECUTION FLOW
+      - [Step 1]
+      - [Step 2]
+      
+      EXECUTABLE FORMULA:
+      ```python
+      [Python code]
+      ```
+      
+      - Ensure the Causal Graph explains the PREDICTIVE LOGIC clearly.
+      - Ensure the Formula IMPLEMENTS the graph exactly.
 
   update_instructions:
     classification: "Update the mechanism to improve Accuracy and F1 score (primary metrics) by refining feature interactions, thresholds, and decision boundaries. Do NOT use feature importance values as coefficients - learn proper coefficients (0.1-2.0 range) by optimizing Accuracy and F1. Preserve correctness on easy cases and focus on systematic residual patterns."
