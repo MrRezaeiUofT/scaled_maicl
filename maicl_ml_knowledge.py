@@ -31,7 +31,8 @@ def extract_ml_knowledge(ml_mechanism, feature_cols: List[str], task_type: str =
     """
     knowledge = {
         "feature_importance": {},
-        "coefficients": None,
+        "coefficients": {},  # Changed to dict for mapping feature -> coef
+        "intercept": 0.0,
         "top_features": [],
         "feature_interactions": [],
         "model_formula": ""
@@ -45,19 +46,28 @@ def extract_ml_knowledge(ml_mechanism, feature_cols: List[str], task_type: str =
         model_name = getattr(ml_mechanism, "model_name", "unknown")
         
         # Extract feature importance/coefficients based on model type
-        if model_name in ["LinearRegression", "LogisticRegression"]:
+        if model_name in ["LinearRegression", "LogisticRegression", "Ridge", "Lasso", "ElasticNet"]:
             # Linear models: use coefficients
             if hasattr(model, "coef_"):
                 coef = model.coef_
                 if coef.ndim > 1:
                     coef = coef[0]  # Take first class for binary/multiclass
                 
-                knowledge["coefficients"] = coef.tolist()
+                # Store intercept
+                if hasattr(model, "intercept_"):
+                    intercept = model.intercept_
+                    if isinstance(intercept, np.ndarray):
+                        intercept = float(intercept[0]) if intercept.size > 0 else 0.0
+                    else:
+                        intercept = float(intercept)
+                    knowledge["intercept"] = intercept
                 
-                # Map to feature importance (absolute value)
+                # Store coefficients map
                 for i, feat in enumerate(feature_cols):
                     if i < len(coef):
-                        knowledge["feature_importance"][feat] = float(abs(coef[i]))
+                        val = float(coef[i])
+                        knowledge["coefficients"][feat] = val
+                        knowledge["feature_importance"][feat] = abs(val)
                 
                 # Generate formula
                 intercept = model.intercept_ if hasattr(model, "intercept_") else 0
@@ -224,26 +234,52 @@ def generate_ml_guided_mechanism(ml_knowledge: Dict[str, Any],
                 mechanism += f"Each class ({', '.join(class_names)}) activates via distinct pathways.\n"
             
             mechanism += f"\nEXECUTABLE FORMULA:\n```python\n"
-            mechanism += f"ŷ = "
-            if len(top_features) >= 2:
-                f1, f2 = top_features[0], top_features[1]
-                w1 = scaled_weights[0] if len(scaled_weights) > 0 else 0.5
-                w2 = scaled_weights[1] if len(scaled_weights) > 1 else 0.5
-                mechanism += f"{w1:.3f} * {f1} / (0.3 + {f1})  # Saturation of {f1}\n"
-                mechanism += f"    + {w2:.3f} * {f2} * {f1}  # Interaction {f1}*{f2}\n"
+            
+            # Use exact coefficients if available (for Linear Regression)
+            coefficients = ml_knowledge.get("coefficients", {})
+            intercept = ml_knowledge.get("intercept", 0.0)
+            
+            # Check if we have valid coefficients for the top features
+            has_valid_coefs = coefficients and isinstance(coefficients, dict) and any(f in coefficients for f in top_features)
+            
+            if has_valid_coefs:
+                # Linear Regression Strategy: Use exact learned formula
+                mechanism += f"ŷ = {intercept:.4f}"
+                for feat in top_features[:MAX_TOP_FEATURES]:
+                    if feat in coefficients:
+                        coef = coefficients[feat]
+                        sign = "+" if coef >= 0 else "-"
+                        mechanism += f" {sign} {abs(coef):.4f} * {feat}"
                 
-                if len(top_features) >= 3:
-                    f3 = top_features[2]
-                    w3 = scaled_weights[2] if len(scaled_weights) > 2 else 0.5
-                    mechanism += f"    + {w3*0.6:.3f} * sqrt({f3})  # Non-linear {f3}\n"
-                    
-                if len(top_features) >= 4:
-                    f4 = top_features[3]
-                    w4 = scaled_weights[3] if len(scaled_weights) > 3 else 0.5
-                    mechanism += f"    + {w4*0.4:.3f} * {f4} / (0.5 + {f4})  # Saturation {f4}\n"
+                # Add interaction hints if we want to encourage LLM to add them
+                if len(top_features) >= 2:
+                     mechanism += f"  # Base linear model"
+                
+                mechanism += "\n```"
+                mechanism += f"\n\nNOTE: The formula above uses EXACT coefficients learned from the data. The intercept ({intercept:.4f}) and signs are critical."
+            
             else:
-                mechanism += f"{top_features[0]} / (0.5 + {top_features[0]})"
-            mechanism += f"```"
+                # Fallback Strategy: Normalized weights (original logic)
+                mechanism += f"ŷ = "
+                if len(top_features) >= 2:
+                    f1, f2 = top_features[0], top_features[1]
+                    w1 = scaled_weights[0] if len(scaled_weights) > 0 else 0.5
+                    w2 = scaled_weights[1] if len(scaled_weights) > 1 else 0.5
+                    mechanism += f"{w1:.3f} * {f1} / (0.3 + {f1})  # Saturation of {f1}\n"
+                    mechanism += f"    + {w2:.3f} * {f2} * {f1}  # Interaction {f1}*{f2}\n"
+                    
+                    if len(top_features) >= 3:
+                        f3 = top_features[2]
+                        w3 = scaled_weights[2] if len(scaled_weights) > 2 else 0.5
+                        mechanism += f"    + {w3*0.6:.3f} * sqrt({f3})  # Non-linear {f3}\n"
+                        
+                    if len(top_features) >= 4:
+                        f4 = top_features[3]
+                        w4 = scaled_weights[3] if len(scaled_weights) > 3 else 0.5
+                        mechanism += f"    + {w4*0.4:.3f} * {f4} / (0.5 + {f4})  # Saturation {f4}\n"
+                else:
+                    mechanism += f"{top_features[0]} / (0.5 + {top_features[0]})"
+                mechanism += f"```"
         
         if task_type == "classification":
             if class_names and len(class_names) > 0:

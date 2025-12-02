@@ -114,8 +114,10 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
                                 pre_maicl: Dict[str, Any], 
                                 post_maicl: Dict[str, Any],
                                 task_type: str = "classification",
-                                output_path: Optional[str] = None):
-    """Plot performance comparison between ML baseline, pre-training MA-ICL, and post-training MA-ICL"""
+                                output_path: Optional[str] = None,
+                                llm_only_maicl: Optional[Dict[str, Any]] = None,
+                                vanilla_llm_metrics: Optional[Dict[str, Any]] = None):
+    """Plot performance comparison between ML baseline, pre-training MA-ICL, post-training MA-ICL, LLM Mechanism, and Vanilla LLM"""
     if not _HAS_MPL:
         logger.warning("Matplotlib not available, skipping performance comparison plot")
         return
@@ -132,12 +134,20 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
             ylabel = 'Score'
             ylim = None
         
-        fig, axes = plt.subplots(1, len(metrics), figsize=(12, 5))
+        fig, axes = plt.subplots(1, len(metrics), figsize=(max(6, 2 * len(metrics) + 4), 5))
         if len(metrics) == 1:
             axes = [axes]
         
         models = ['ML Baseline', 'MA-ICL\n(Pre-train)', 'MA-ICL\n(Post-train)']
         colors = ['#3498db', '#e74c3c', '#2ecc71']
+        
+        if llm_only_maicl:
+            models.append('LLM Mechanism')
+            colors.append('#9b59b6') # Purple color for LLM Mechanism
+            
+        if vanilla_llm_metrics:
+            models.append('Vanilla LLM')
+            colors.append('#f1c40f') # Yellow color for Vanilla LLM
         
         for idx, (metric, metric_label) in enumerate(zip(metrics, metric_labels)):
             ax = axes[idx]
@@ -149,14 +159,31 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
             
             values = [ml_val, pre_val, post_val]
             
+            if llm_only_maicl:
+                llm_val = llm_only_maicl.get(metric, 0)
+                values.append(llm_val)
+                
+            if vanilla_llm_metrics:
+                vanilla_val = vanilla_llm_metrics.get(metric, 0)
+                values.append(vanilla_val)
+            
             bars = ax.bar(models, values, color=colors, alpha=0.8, edgecolor='black', linewidth=1.5)
             
             # Add value labels on bars
             for bar, val in zip(bars, values):
                 height = bar.get_height()
+                
+                # Position text correctly for negative values
+                if height < 0:
+                    text_va = 'top'
+                    text_y = height - (abs(height) * 0.05 if abs(height) > 0 else 0.01) 
+                else:
+                    text_va = 'bottom'
+                    text_y = height + (height * 0.01 if height > 0 else 0.01)
+
                 ax.text(bar.get_x() + bar.get_width()/2., height,
                        f'{val:.4f}',
-                       ha='center', va='bottom', fontsize=10, fontweight='bold')
+                       ha='center', va=text_va, fontsize=10, fontweight='bold')
             
             ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
             ax.set_title(metric_label, fontsize=14, fontweight='bold')
@@ -237,7 +264,8 @@ def create_result_visualizations(y_test: np.ndarray,
                                  task_type: str = "classification",
                                  class_names: Optional[List[str]] = None,
                                  output_dir: Optional[str] = None,
-                                 llm_only_metrics: Optional[Dict[str, Any]] = None):
+                                 llm_only_metrics: Optional[Dict[str, Any]] = None,
+                                 vanilla_llm_metrics: Optional[Dict[str, Any]] = None):
     """Create all result visualizations (confusion matrices + performance comparison + scatter plots)
     
     Args:
@@ -249,6 +277,7 @@ def create_result_visualizations(y_test: np.ndarray,
         class_names: List of class names for classification
         output_dir: Output directory for visualizations
         llm_only_metrics: Optional metrics from LLM-only evaluation (excluding ML)
+        vanilla_llm_metrics: Optional metrics from Vanilla LLM baseline
     """
     if output_dir is None:
         from maicl_lib_v2 import OUTPUT_DIR
@@ -259,7 +288,9 @@ def create_result_visualizations(y_test: np.ndarray,
     # Performance comparison plot
     perf_plot_path = os.path.join(output_dir, "performance_comparison.png")
     plot_performance_comparison(ml_baseline_metrics, pre_metrics, post_metrics, 
-                                task_type=task_type, output_path=perf_plot_path)
+                                task_type=task_type, output_path=perf_plot_path,
+                                llm_only_maicl=llm_only_metrics,
+                                vanilla_llm_metrics=vanilla_llm_metrics)
     
     # Scatter plots for regression
     if task_type == "regression":
@@ -282,6 +313,16 @@ def create_result_visualizations(y_test: np.ndarray,
             llm_scatter_path = os.path.join(output_dir, "scatter_llm_only.png")
             plot_scatter_predictions(y_test, y_pred_llm_only, "LLM-only Mechanism Predictions",
                                     output_path=llm_scatter_path, r2=llm_r2, mae=llm_mae, mse=llm_mse)
+        
+        # Vanilla LLM scatter plot (if available)
+        if vanilla_llm_metrics is not None and "predictions" in vanilla_llm_metrics:
+            y_pred_vanilla = np.array(vanilla_llm_metrics["predictions"])
+            vanilla_r2 = vanilla_llm_metrics.get('r2', None)
+            vanilla_mae = vanilla_llm_metrics.get('mae', None)
+            vanilla_mse = vanilla_llm_metrics.get('mse', None)
+            vanilla_scatter_path = os.path.join(output_dir, "scatter_vanilla_llm.png")
+            plot_scatter_predictions(y_test, y_pred_vanilla, "Vanilla LLM Predictions",
+                                    output_path=vanilla_scatter_path, r2=vanilla_r2, mae=vanilla_mae, mse=vanilla_mse)
         
         # MA-ICL pre-training scatter plot
         if "predictions" in pre_metrics:

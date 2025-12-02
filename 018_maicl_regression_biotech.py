@@ -35,6 +35,11 @@ import json
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
 try:
+    from langchain.schema import HumanMessage
+except Exception:
+    from langchain_core.messages import HumanMessage
+
+try:
     import matplotlib.pyplot as plt
     import matplotlib
     matplotlib.use('Agg')  # Non-interactive backend
@@ -999,6 +1004,107 @@ def load_deepchem_regression_dataset(dataset_name: str, max_samples: int):
         raise RuntimeError(f"DeepChem dataset '{dataset_name}' not available: {e}")
 
 
+def run_vanilla_llm_baseline(llm, X_train_s, y_train_s, X_test_s, y_test_s, 
+                             X_train_original, X_test_original, feature_cols, k_shot=5):
+    """
+    Run a vanilla LLM baseline using few-shot prompting with KNN retrieval.
+    Does not use any learned mechanisms or causal graphs.
+    """
+    logger.info(f"Running Vanilla LLM Baseline (k={k_shot})...")
+    
+    # Pre-compute distances for KNN if dataset is small enough
+    # If too large, we might need a more efficient approach, but for <1000 samples brute force is fine
+    prompts = []
+    
+    for i in range(len(X_test_s)):
+        # 1. Find k nearest neighbors in training set based on scaled features
+        # Calculate Euclidean distance
+        test_vec = X_test_s[i]
+        dists = np.linalg.norm(X_train_s - test_vec, axis=1)
+        nn_indices = np.argsort(dists)[:k_shot]
+        
+        # 2. Construct Prompt
+        prompt_text = "You are a regression expert. Predict the exact target value for the last example based on the similar examples provided.\n\n"
+        
+        # Add examples
+        for idx in nn_indices:
+            feat_dict = X_train_original[idx]
+            target_val = y_train_s[idx]
+            
+            # Format features
+            if isinstance(feat_dict, dict) and 'SMILES' in feat_dict:
+                # Special handling for DeepChem/SMILES
+                feat_str = f"SMILES: {feat_dict['SMILES']}"
+            elif isinstance(feat_dict, dict):
+                # Standard features
+                feat_parts = []
+                for k, v in feat_dict.items():
+                    # Format float nicely
+                    val_str = f"{v:.4f}" if isinstance(v, float) else str(v)
+                    feat_parts.append(f"{k}: {val_str}")
+                feat_str = ", ".join(feat_parts)
+            else:
+                feat_str = str(feat_dict)
+                
+            prompt_text += f"Input: {feat_str}\nTarget: {target_val:.4f}\n\n"
+        
+        # Add test case
+        test_feat_dict = X_test_original[i]
+        if isinstance(test_feat_dict, dict) and 'SMILES' in test_feat_dict:
+            test_feat_str = f"SMILES: {test_feat_dict['SMILES']}"
+        elif isinstance(test_feat_dict, dict):
+            feat_parts = []
+            for k, v in test_feat_dict.items():
+                val_str = f"{v:.4f}" if isinstance(v, float) else str(v)
+                feat_parts.append(f"{k}: {val_str}")
+            test_feat_str = ", ".join(feat_parts)
+        else:
+            test_feat_str = str(test_feat_dict)
+            
+        prompt_text += f"Input: {test_feat_str}\nTarget:"
+        
+        prompts.append(HumanMessage(content=prompt_text))
+        
+    # 3. Batch Query LLM
+    logger.info(f"Querying LLM for {len(prompts)} test samples...")
+    responses = llm.invoke_batch(prompts)
+    
+    # 4. Parse Responses
+    preds = []
+    for resp in responses:
+        try:
+            # Extract the last number in the response
+            # Remove any non-numeric chars except . and - and digits
+            # Look for the last float
+            import re
+            matches = re.findall(r"[-+]?\d*\.\d+|\d+", resp)
+            if matches:
+                val = float(matches[-1])
+                # Clip to valid range [0, 10] as per scaling
+                val = max(0.0, min(10.0, val))
+                preds.append(val)
+            else:
+                preds.append(0.0) # Default fallback
+        except Exception:
+            preds.append(0.0)
+            
+    preds = np.array(preds)
+    
+    # 5. Compute Metrics
+    r2 = r2_score(y_test_s, preds)
+    mae = mean_absolute_error(y_test_s, preds)
+    mse = mean_squared_error(y_test_s, preds)
+    
+    logger.info(f"Vanilla LLM Baseline: R2={r2:.4f} MAE={mae:.4f} MSE={mse:.4f}")
+    
+    return {
+        "r2": r2,
+        "mae": mae,
+        "mse": mse,
+        "predictions": preds.tolist()
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description="MA-ICL regression on biotech/experimental datasets with top-K residuals")
     parser.add_argument("--dataset", type=str, required=True,
@@ -1551,10 +1657,12 @@ def main():
     logger.info(f"Evaluating with final accepted mechanisms: {final_mechanism_count} total ({final_llm_count} LLM, {final_ml_count} ML)")
     
     # For DeepChem datasets, pass X_original to use SMILES strings instead of vectorized features
-    post = maicl.evaluate(X_test_s, y_test_s, X_train_s, y_train_s, return_details=True, 
+    # CRITICAL: Use X_topk/y_topk as the pool to ensure few-shot context matches training conditions
+    # This prevents performance drop due to changing the nature of few-shot examples (hard vs random)
+    post = maicl.evaluate(X_test_s, y_test_s, X_topk, y_topk, return_details=True, 
                           relax_routing=final_relax_routing, preserve_mechanism_performance=preserve_perf,
                           X_original=X_original_test if is_deepchem_dataset else None,
-                          X_pool_original=X_original_train if is_deepchem_dataset else None)
+                          X_pool_original=X_original_topk if is_deepchem_dataset else None)
     post_mae = float(post.get('mae', 0.0))
     post_r2 = float(post.get('r2', 0.0))
     post_rmse = float(post.get('rmse', 0.0))
@@ -1591,6 +1699,7 @@ def main():
         if is_deepchem_dataset:
             llm_only_kwargs['X_original'] = X_original_test
             llm_only_kwargs['X_pool_original'] = X_original_train
+        # Use X_train_s as pool for LLM-only evaluation to provide representative context
         llm_only_metrics = maicl.evaluate_llm_only(X_test_s, y_test_s, X_train_s, y_train_s, 
                                                     return_details=True, k_shot=maicl.k_shot if hasattr(maicl, 'k_shot') else 10,
                                                     **llm_only_kwargs)
@@ -1611,6 +1720,26 @@ def main():
         logger.warning(f"Failed to evaluate LLM-only mechanisms: {e}")
         import traceback
         traceback.print_exc()
+
+    # Evaluate Vanilla LLM Baseline
+    logger.info("\n" + "=" * 80)
+    logger.info("VANILLA LLM BASELINE (Few-shot Prompting)")
+    logger.info("=" * 80)
+    vanilla_llm_metrics = None
+    try:
+        # Use X_train_s as pool for few-shot examples
+        vanilla_llm_metrics = run_vanilla_llm_baseline(
+            llm, 
+            X_train_s, y_train_s, 
+            X_test_s, y_test_s,
+            X_original_train, X_original_test,
+            feature_cols,
+            k_shot=maicl.k_shot if hasattr(maicl, 'k_shot') else 10
+        )
+    except Exception as e:
+        logger.warning(f"Failed to evaluate Vanilla LLM baseline: {e}")
+        import traceback
+        traceback.print_exc()
     
     # Generate performance comparison visualizations
     logger.info("\n[Visualizations] Generating performance comparison plots...")
@@ -1622,7 +1751,9 @@ def main():
             post_metrics=post,
             task_type="regression",
             class_names=None,
-            output_dir=output_dir
+            output_dir=output_dir,
+            llm_only_metrics=llm_only_metrics,
+            vanilla_llm_metrics=vanilla_llm_metrics
         )
     except Exception as e:
         logger.warning(f"Failed to generate visualizations: {e}")
@@ -1666,6 +1797,11 @@ def main():
             "mse": float(llm_only_metrics.get('mse', 1e9)) if llm_only_metrics else None,
             "rmse": float(np.sqrt(llm_only_metrics.get('mse', 1e9))) if llm_only_metrics and 'mse' in llm_only_metrics else None
         } if llm_only_metrics else None,
+        "vanilla_llm": {
+            "r2": float(vanilla_llm_metrics.get('r2', -1.0)) if vanilla_llm_metrics else None,
+            "mae": float(vanilla_llm_metrics.get('mae', 1e9)) if vanilla_llm_metrics else None,
+            "mse": float(vanilla_llm_metrics.get('mse', 1e9)) if vanilla_llm_metrics else None,
+        } if vanilla_llm_metrics else None,
         "mechanism_info": {
             "total_mechanisms": len(maicl.mechanisms),
             "mechanism_types": maicl.mechanism_types,
@@ -1712,7 +1848,12 @@ def main():
         llm_only_r2 = float(llm_only_metrics.get('r2', -1.0))
         llm_only_mae = float(llm_only_metrics.get('mae', 1e9))
         llm_only_mse = float(llm_only_metrics.get('mse', 1e9))
-        logger.info(f"  LLM-only:     R2={llm_only_r2:.4f}, MAE={llm_only_mae:.4f}, MSE={llm_only_mse:.4f}")
+        logger.info(f"  LLM Mechanism: R2={llm_only_r2:.4f}, MAE={llm_only_mae:.4f}, MSE={llm_only_mse:.4f}")
+    if vanilla_llm_metrics:
+        vanilla_r2 = float(vanilla_llm_metrics.get('r2', -1.0))
+        vanilla_mae = float(vanilla_llm_metrics.get('mae', 1e9))
+        vanilla_mse = float(vanilla_llm_metrics.get('mse', 1e9))
+        logger.info(f"  Vanilla LLM:   R2={vanilla_r2:.4f}, MAE={vanilla_mae:.4f}, MSE={vanilla_mse:.4f}")
     logger.info("")
     logger.info("Training Improvement (Post vs Pre):")
     logger.info(f"  ΔR2={final_results['improvements']['training_improvement']['r2_delta']:+.4f}, "
