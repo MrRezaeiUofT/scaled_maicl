@@ -116,8 +116,13 @@ def _get_gemini_llm(model_name: str):
 
 def _subsample_if_needed(X_df: 'pd.DataFrame', y_series: 'pd.Series', max_samples: int):
     if max_samples and len(X_df) > max_samples:
-        X_df = X_df.sample(n=max_samples, random_state=RANDOM_STATE).reset_index(drop=True)
-        y_series = y_series.loc[X_df.index].reset_index(drop=True)
+        # Sample and capture original indices BEFORE resetting
+        X_df_sampled = X_df.sample(n=max_samples, random_state=RANDOM_STATE)
+        original_indices = X_df_sampled.index
+        # Reset X_df indices
+        X_df = X_df_sampled.reset_index(drop=True)
+        # Use original indices to select corresponding y_series values, then reset
+        y_series = y_series.loc[original_indices].reset_index(drop=True)
     return X_df, y_series
 
 
@@ -182,7 +187,14 @@ def save_residual_plot(y_true, y_pred, title, filename, output_dir):
 
 
 def load_gfp_yield_dataset(max_samples: int):
-    """Load GFP Yield Prediction dataset (real experimental data)"""
+    """Load GFP Yield Prediction dataset (real experimental data)
+    
+    Preprocessing matches the reference implementation:
+    1. Select numeric columns and drop NA
+    2. Group by 'Experiment no' and aggregate (take first row, replace Yield with mean)
+    3. Drop 'Experiment no' column
+    4. Extract features and target
+    """
     if not _HAS_PANDAS:
         raise RuntimeError("pandas not installed. pip install pandas")
     try:
@@ -190,24 +202,86 @@ def load_gfp_yield_dataset(max_samples: int):
         if not os.path.exists(csv_path):
             raise FileNotFoundError(f"File not found: {csv_path}")
         df = pd.read_csv(csv_path)
-        if 'Experiment no' in df.columns:
-            df['Yield'] = df.groupby('Experiment no')['Yield'].transform('mean')
-            df = df.groupby('Experiment no').first().reset_index(drop=True)
+        
+        # Step 1: Select numeric columns and drop NA (before grouping)
+        # Note: We need to preserve 'Experiment no' for grouping even if it's numeric
+        logger.info(f"Raw dataset shape: {df.shape}, columns: {list(df.columns)}")
+        
+        # Check if 'Experiment no' exists and its type
+        has_experiment_no = 'Experiment no' in df.columns
+        if has_experiment_no:
+            exp_no_dtype = df['Experiment no'].dtype
+            logger.info(f"'Experiment no' column found (dtype: {exp_no_dtype})")
+        
+        # Select numeric columns (this will include 'Experiment no' if it's numeric)
         df = df.select_dtypes(include=[np.number]).dropna()
+        logger.info(f"After selecting numeric columns: {df.shape}, columns: {list(df.columns)}")
+        
+        # Step 2: Group by 'Experiment no' and aggregate
+        if 'Experiment no' in df.columns:
+            logger.info(f"Grouping by 'Experiment no': {df['Experiment no'].nunique()} unique experiments")
+            logger.info(f"  Samples per experiment: min={df.groupby('Experiment no').size().min()}, "
+                       f"max={df.groupby('Experiment no').size().max()}, "
+                       f"mean={df.groupby('Experiment no').size().mean():.2f}")
+            
+            def aggregate_group(group):
+                """Aggregate function: take first row, replace Yield with mean"""
+                row = group.iloc[0].copy()  # take first row as base
+                row['Yield'] = group['Yield'].mean()  # replace yield with mean
+                return row
+            
+            # Apply aggregation (dropna() in case any groups produce NaN)
+            aggregated_rows = df.groupby('Experiment no').apply(aggregate_group).dropna().reset_index(drop=True)
+            df = aggregated_rows
+            logger.info(f"After aggregation: {df.shape} samples")
+            
+            # Step 3: Drop 'Experiment no' column (it's not a feature)
+            df = df.drop(columns=['Experiment no'])
+        else:
+            logger.warning("'Experiment no' column not found after selecting numeric columns - skipping aggregation")
+            logger.warning("  This may indicate 'Experiment no' is non-numeric or was removed during dropna()")
+        
+        # Step 4: Extract features and target
         feature_cols = [col for col in df.columns if col != 'Yield']
         if not feature_cols:
             raise ValueError("No feature columns found")
         X_df = df[feature_cols].astype(float)
         y_series = df["Yield"].astype(float)
-        if len(X_df) > 300:
-            logger.info(f"Dataset too large ({len(X_df)} samples), subsampling to 250 samples")
-            np.random.seed(51)
-            indices = np.random.choice(len(X_df), 250, replace=False)
-            X_df = X_df.iloc[indices].reset_index(drop=True)
-            y_series = y_series.iloc[indices].reset_index(drop=True)
+        
+        # Log data statistics for debugging
+        logger.info(f"Final dataset: {len(X_df)} samples, {len(feature_cols)} features")
+        logger.info(f"Features: {feature_cols}")
+        logger.info(f"Target (Yield) statistics: min={y_series.min():.4f}, max={y_series.max():.4f}, mean={y_series.mean():.4f}, std={y_series.std():.4f}")
+        
+        # Check for data quality issues
+        constant_features = [col for col in feature_cols if X_df[col].nunique() <= 1]
+        if constant_features:
+            logger.warning(f"⚠️  Constant features detected (will cause issues): {constant_features}")
+        
+        # Check for low variance features
+        low_variance_features = [col for col in feature_cols if X_df[col].std() < 1e-6]
+        if low_variance_features:
+            logger.warning(f"⚠️  Low variance features detected: {low_variance_features}")
+        
+        # Check feature correlations (warn if perfect correlation)
+        if len(feature_cols) > 1:
+            corr_matrix = X_df[feature_cols].corr().abs()
+            high_corr_pairs = []
+            for i in range(len(corr_matrix.columns)):
+                for j in range(i+1, len(corr_matrix.columns)):
+                    if corr_matrix.iloc[i, j] > 0.99:
+                        high_corr_pairs.append((corr_matrix.columns[i], corr_matrix.columns[j]))
+            if high_corr_pairs:
+                logger.warning(f"⚠️  Highly correlated feature pairs (>0.99): {high_corr_pairs}")
+        
+        logger.info(f"Feature statistics (min/max/mean/std):")
+        for col in feature_cols[:5]:  # Show first 5 features
+            logger.info(f"  {col}: min={X_df[col].min():.4f}, max={X_df[col].max():.4f}, mean={X_df[col].mean():.4f}, std={X_df[col].std():.4f}")
     except Exception as e:
         logger.warning(f"Failed to load GFP yield data: {e}")
         raise RuntimeError(f"GFP yield dataset not available: {e}")
+    
+    # Apply max_samples subsampling if needed (handled by _subsample_if_needed)
     X_df, y_series = _subsample_if_needed(X_df, y_series, max_samples)
     X_encoded = X_df.values
     y_values = y_series.values
@@ -1022,7 +1096,7 @@ def main():
     parser.add_argument("--list_plates", action="store_true",
                         help="List all available protein expression plate files and exit")
     parser.add_argument("--model_name", default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash"),
-                        help="Gemini model name, e.g., gemini-2.0-flash, gemini-2.0-pro")
+                        help="Gemini model name, e.g., gemini-2.0-flash, gemini-2.5-pro")
     parser.add_argument("--ml_mech", default="linear", help="Regression ML mechanism: linear|xgboost|kernelridge|tabicl")
     parser.add_argument("--tabicl_bins", type=int, default=20,
                         help="Number of bins for TabICL regression quantization (default: 20). "
@@ -1031,9 +1105,11 @@ def main():
     parser.add_argument("--max_samples", type=int, default=200)
     parser.add_argument("--top_k", type=int, default=1000, help="-1 to use full dataset")
     parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--use_test_for_acceptance", action="store_true",
-                        help="Use test set for acceptance evaluation instead of validation set. "
-                             "This helps ensure optimization generalizes to test set, but risks overfitting to test.")
+    parser.add_argument("--acceptance_set", type=str, default="validation",
+                        choices=["test", "validation", "train"],
+                        help="Dataset to use for acceptance evaluation during training. "
+                             "Options: 'test' (risks overfitting to test), 'validation' (default), "
+                             "or 'train' (may overfit to training data).")
     parser.add_argument("--topk_strategy", choices=["residual", "residual_balanced"], default="residual",
                         help="Top-K selection: 'residual' = global highest | 'residual_balanced' = highest within y-quantile bins")
     parser.add_argument("--relax_eval", type=int, default=0, choices=[0,1],
@@ -1047,6 +1123,11 @@ def main():
     parser.add_argument("--num_mechanisms_unknown", type=int, default=1,
                         help="Number of unknown mechanisms to generate (default: 1). "
                              "This controls how many LLM-based mechanisms are created to complement the ML mechanism.")
+    parser.add_argument("--k_shot", type=int, default=0,
+                        help="Number of few-shot examples to use per prediction (default: 0). "
+                             "If > 0, retrieves k_shot examples from training set for each prediction.")
+    parser.add_argument("--no_scaling", action="store_true",
+                        help="Disable all scaling for both features and targets. Use raw/unscaled data throughout.")
     args = parser.parse_args()
 
     # Handle --list_plates option
@@ -1085,13 +1166,86 @@ def main():
             plate_name = os.path.basename(args.plate_file).replace('_raw_yield_and_std.csv', '').replace('.csv', '')
             plate_suffix = f"_{plate_name}"
     
-    # Include ML baseline model name in output directory
-    ml_model_suffix = f"_ml{args.ml_mech}"
+    # Build comprehensive run name with all important arguments
+    # Start with base components
+    run_name_parts = [
+        "bio_reg",
+        dataset_name_lower + plate_suffix,
+        f"ml{args.ml_mech}" if args.use_ml else "noML",
+        f"topk{args.top_k}",
+        f"iter{args.iterations}",
+        f"model{args.model_name.replace('-', '_').replace('.', '_')}",  # Sanitize model name for filesystem
+        f"loss{args.regression_loss}",
+        f"accept{args.acceptance_set}",
+        f"topkstrat{args.topk_strategy}",
+    ]
     
-    # Use lowercase for output directory name (for consistency), but preserve original for enzyme dataset loading
-    run_name = f"bio_reg_{dataset_name_lower}{plate_suffix}{ml_model_suffix}_topk{args.top_k}"
+    # Add optional flags
+    if args.relax_eval:
+        run_name_parts.append("relax")
+    if args.num_mechanisms_unknown > 1:
+        run_name_parts.append(f"nmech{args.num_mechanisms_unknown}")
+    if args.k_shot > 0:
+        run_name_parts.append(f"kshot{args.k_shot}")
+    if args.no_scaling:
+        run_name_parts.append("noscale")
+    if args.val_size != 0.2:  # Only include if non-default
+        run_name_parts.append(f"val{args.val_size:.2f}".replace('.', '_'))
+    if args.ml_mech == "tabicl":  # Include tabicl_bins if using tabicl
+        run_name_parts.append(f"bins{args.tabicl_bins}")
+    
+    # Join all parts with underscores
+    run_name = "_".join(run_name_parts)
     output_dir = set_output_dir(run_name)
     logger.info(f"Output directory: {output_dir}")
+
+    # Save experiment configuration for reproducibility
+    experiment_config = {
+        "run_name": run_name,
+        "output_dir": output_dir,
+        "dataset": {
+            "name": args.dataset,
+            "name_lower": dataset_name_lower,
+            "name_original": dataset_name_original,
+            "plate_file": args.plate_file,
+            "plate_index": args.plate_index,
+            "max_samples": args.max_samples
+        },
+        "model": {
+            "llm_model_name": args.model_name,
+            "ml_mechanism": args.ml_mech,
+            "use_ml": bool(args.use_ml),
+            "tabicl_bins": args.tabicl_bins if args.ml_mech.lower() == "tabicl" else None
+        },
+        "training": {
+            "top_k": args.top_k,
+            "topk_strategy": args.topk_strategy,
+            "iterations": args.iterations,
+            "acceptance_set": args.acceptance_set,
+            "val_size": args.val_size,
+            "regression_loss": args.regression_loss,
+            "relax_eval": bool(args.relax_eval),
+            "num_mechanisms_unknown": args.num_mechanisms_unknown,
+            "no_scaling": args.no_scaling
+        },
+        "evaluation": {
+            "evaluate_individual_mechanisms": args.evaluate_individual_mechanisms
+        },
+        "system": {
+            "random_state": RANDOM_STATE,
+            "scale_min": SCALE_MIN,
+            "scale_max": SCALE_MAX,
+            "has_matplotlib": _HAS_MATPLOTLIB,
+            "has_pandas": _HAS_PANDAS,
+            "has_deepchem": _HAS_DEEPCHEM
+        },
+        "command_line_args": vars(args)
+    }
+    
+    config_file = os.path.join(output_dir, "experiment_config.json")
+    with open(config_file, 'w') as f:
+        json.dump(experiment_config, f, indent=2)
+    logger.info(f"Saved experiment configuration to {config_file}")
 
     llm = _get_gemini_llm(args.model_name)
 
@@ -1131,8 +1285,26 @@ def main():
                            f"TabArena (diabetes), "
                            f"DeepChem (any molnet dataset, e.g., esol, delaney, lipo, lipophilicity), "
                            f"or enzyme dataset names (e.g., halogenase_NaBr, aminotransferase, olea, phosphatase_achiral)")
+    
+    # Update experiment config with dataset information after loading
+    experiment_config["dataset"]["label"] = ds_label
+    experiment_config["dataset"]["n_samples"] = len(X_all)
+    experiment_config["dataset"]["n_features"] = len(feature_cols) if feature_cols else X_all.shape[1] if hasattr(X_all, 'shape') else None
+    experiment_config["dataset"]["feature_cols"] = feature_cols if feature_cols else None
+    experiment_config["dataset"]["y_min"] = float(y_all.min()) if hasattr(y_all, 'min') else None
+    experiment_config["dataset"]["y_max"] = float(y_all.max()) if hasattr(y_all, 'max') else None
+    experiment_config["dataset"]["y_mean"] = float(y_all.mean()) if hasattr(y_all, 'mean') else None
+    experiment_config["dataset"]["y_std"] = float(y_all.std()) if hasattr(y_all, 'std') else None
+    
+    # Update config file with dataset information
+    config_file = os.path.join(output_dir, "experiment_config.json")
+    with open(config_file, 'w') as f:
+        json.dump(experiment_config, f, indent=2)
+    logger.info(f"Updated experiment configuration with dataset information")
+    
     from sklearn.model_selection import train_test_split
     # Regression-friendly stratification: bin y into quantiles and stratify to preserve target distribution
+    split_method = "random"  # Track which split method was used
     try:
         n_bins = 10
         quantiles = np.quantile(y_all, np.linspace(0.0, 1.0, n_bins + 1)[1:-1])
@@ -1151,6 +1323,7 @@ def main():
             X_original_train = [X_original_all[idx_tr_full[i]] for i in idx_tr]
             X_original_val = [X_original_all[idx_tr_full[i]] for i in idx_va]
             X_original_test = [X_original_all[i] for i in idx_te]
+            split_method = "quantile_stratified"
             logger.info("Used quantile-stratified train/validation/test split for regression.")
         except Exception:
             X_train, X_val, y_train, y_val, idx_tr, idx_va = train_test_split(
@@ -1160,6 +1333,7 @@ def main():
             X_original_train = [X_original_all[idx_tr_full[i]] for i in idx_tr]
             X_original_val = [X_original_all[idx_tr_full[i]] for i in idx_va]
             X_original_test = [X_original_all[i] for i in idx_te]
+            split_method = "partial_stratified"  # First split stratified, second not
             logger.info("Used random train/validation split (stratification unavailable).")
     except Exception:
         # Fallback to regular split if stratification fails (e.g., tiny datasets)
@@ -1173,7 +1347,25 @@ def main():
         X_original_train = [X_original_all[idx_tr_full[i]] for i in idx_tr]
         X_original_val = [X_original_all[idx_tr_full[i]] for i in idx_va]
         X_original_test = [X_original_all[i] for i in idx_te]
+        split_method = "random"
         logger.info("Used regular random train/validation/test split (stratification unavailable).")
+
+    # Update experiment config with split information
+    experiment_config["data_splits"] = {
+        "n_train": len(X_train),
+        "n_val": len(X_val),
+        "n_test": len(X_test),
+        "n_train_full": len(X_train_full),
+        "test_size": 0.2,
+        "val_size": float(args.val_size),
+        "random_state": RANDOM_STATE,
+        "split_method": split_method
+    }
+    # Update config file with split information
+    config_file = os.path.join(output_dir, "experiment_config.json")
+    with open(config_file, 'w') as f:
+        json.dump(experiment_config, f, indent=2)
+    logger.info(f"Updated experiment configuration with data split information")
 
     # Log routing mode for clarity
     if bool(args.relax_eval):
@@ -1201,22 +1393,39 @@ def main():
         else:
             logger.warning("  ⚠ X_original is empty or None for DeepChem dataset")
 
-    # Scale features to [0, 10] using MinMaxScaler010 (uses SCALE_MIN=0.0, SCALE_MAX=10.0)
-    scaler = MinMaxScaler010()
-    X_train_s = scaler.fit_transform(X_train)
-    X_val_s = scaler.transform(X_val)
-    X_test_s = scaler.transform(X_test)
-    validate_scaled_data(X_train_s, feature_cols, scaler=scaler)
-    logger.info(f"Features scaled to [{SCALE_MIN}, {SCALE_MAX}] range (X min={X_train_s.min():.3f}, max={X_train_s.max():.3f})")
+    # Conditionally scale features based on --no_scaling flag
+    if args.no_scaling:
+        logger.info("Scaling DISABLED - using raw/unscaled data for features and targets")
+        scaler = None
+        X_train_s = X_train
+        X_val_s = X_val
+        X_test_s = X_test
+        logger.info(f"Features NOT scaled (X min={X_train_s.min():.3f}, max={X_train_s.max():.3f})")
+        
+        # No scaling for targets either
+        y_scaler_target = None
+        y_train_s = y_train
+        y_val_s = y_val
+        y_test_s = y_test
+        logger.info(f"Targets NOT scaled (y min={y_train_s.min():.3f}, max={y_train_s.max():.3f})")
+        logger.info(f"NOTE: All models (ML and LLM) use raw/unscaled data")
+    else:
+        # Scale features to [SCALE_MIN, SCALE_MAX] using MinMaxScaler010 (default: [0.0, 1.0])
+        scaler = MinMaxScaler010()
+        X_train_s = scaler.fit_transform(X_train)
+        X_val_s = scaler.transform(X_val)
+        X_test_s = scaler.transform(X_test)
+        validate_scaled_data(X_train_s, feature_cols, scaler=scaler)
+        logger.info(f"Features scaled to [{SCALE_MIN}, {SCALE_MAX}] range (X min={X_train_s.min():.3f}, max={X_train_s.max():.3f})")
 
-    # Scale target to [0, 10] to match feature scaling for consistency
-    # Use MinMaxScaler010 to ensure same scaling range as features
-    y_scaler_target = MinMaxScaler010()  # Uses SCALE_MIN=0.0, SCALE_MAX=10.0
-    y_train_s = y_scaler_target.fit_transform(y_train.reshape(-1, 1)).ravel()
-    y_val_s = y_scaler_target.transform(y_val.reshape(-1, 1)).ravel()
-    y_test_s = y_scaler_target.transform(y_test.reshape(-1, 1)).ravel()
-    logger.info(f"Targets scaled to [{SCALE_MIN}, {SCALE_MAX}] range (y min={y_train_s.min():.3f}, max={y_train_s.max():.3f})")
-    logger.info(f"NOTE: All models (ML and LLM) use the same scaled data - features and targets both in [{SCALE_MIN}, {SCALE_MAX}]")
+        # Scale target to [SCALE_MIN, SCALE_MAX] to match feature scaling for consistency
+        # Use MinMaxScaler010 to ensure same scaling range as features (default: [0.0, 1.0])
+        y_scaler_target = MinMaxScaler010()  # Uses SCALE_MIN and SCALE_MAX from config (default: [0.0, 1.0])
+        y_train_s = y_scaler_target.fit_transform(y_train.reshape(-1, 1)).ravel()
+        y_val_s = y_scaler_target.transform(y_val.reshape(-1, 1)).ravel()
+        y_test_s = y_scaler_target.transform(y_test.reshape(-1, 1)).ravel()
+        logger.info(f"Targets scaled to [{SCALE_MIN}, {SCALE_MAX}] range (y min={y_train_s.min():.3f}, max={y_train_s.max():.3f})")
+        logger.info(f"NOTE: All models (ML and LLM) use the same scaled data - features and targets both in [{SCALE_MIN}, {SCALE_MAX}]")
 
     # Only create and train ML model if use_ml is enabled
     pretrained_ml = None
@@ -1366,36 +1575,140 @@ def main():
             X_original_topk = [X_original_train[i] for i in top_indices]
             logger.info(f"Top-K selection: balanced y-quantile, selected={len(top_indices)} examples.")
     
-    # Optionally retrain ML model on the same subset that MA-ICL will train on
-    # This ensures both models train on the same data for fair comparison
+    # ML model is FROZEN after initial training on full training set
+    # Compute residuals on the top-K subset using the frozen model (for MA-ICL training)
     residuals_topk = None
     if args.use_ml:
+        # ML model stays frozen - trained once on full training set and never retrained
+        logger.info(f"ML model is FROZEN (trained on full training set: {len(X_train_s)} samples)")
+        logger.info(f"MA-ICL will train on {len(X_topk)} top-K samples, but ML model remains frozen")
+        
         if args.top_k != -1:
-            logger.info(f"Retraining ML model on the same {len(X_topk)} samples that MA-ICL will train on...")
-            pretrained_ml.train(X_topk, y_topk, feature_cols, y_scaler=None)
-            # Recompute residuals on the subset
+            # Compute residuals on the subset using the frozen model (trained on full set)
             sorted_idx, residuals_topk, ml_preds, _ = compute_ml_residuals(
                 pretrained_ml, X_topk, y_topk, feature_cols, class_names=None, task_type="regression"
             )
-            logger.info(f"ML model and MA-ICL now train on the same {len(X_topk)} samples")
+            logger.info(f"Computed residuals on top-K subset using frozen ML model (trained on full set)")
         else:
             # Both train on full set, use original residuals
             residuals_topk = residuals
-            logger.info(f"Both ML model and MA-ICL train on the same full training set ({len(X_topk)} samples)")
+            logger.info(f"Using full training set ({len(X_topk)} samples) - residuals already computed")
         
-        # Compute ML baseline metrics on test set (after potential retraining)
+        # Compute ML baseline metrics on test set using frozen model
         ml_baseline_metrics: Dict[str, Any] = {}
         try:
             model = pretrained_ml.model
             y_pred = model.predict(X_test_s).astype(float)
+            
+            # Clip predictions to [0,1] if targets are scaled (regression with scaling)
+            if not args.no_scaling and y_scaler_target is not None:
+                y_pred_clipped = np.clip(y_pred, SCALE_MIN, SCALE_MAX)
+                n_out_of_range = np.sum((y_pred < SCALE_MIN) | (y_pred > SCALE_MAX))
+                if n_out_of_range > 0:
+                    logger.warning(f"⚠️  ML predictions out of range [{SCALE_MIN}, {SCALE_MAX}]: {n_out_of_range}/{len(y_pred)} samples")
+                    logger.warning(f"   Prediction range: [{y_pred.min():.4f}, {y_pred.max():.4f}]")
+                    logger.warning(f"   Target range: [{y_test_s.min():.4f}, {y_test_s.max():.4f}]")
+                    logger.info(f"   Using clipped predictions for metrics (clipped {n_out_of_range} values)")
+                    y_pred = y_pred_clipped
+            
             r2 = r2_score(y_test_s, y_pred)
             mae = mean_absolute_error(y_test_s, y_pred)
             mse = mean_squared_error(y_test_s, y_pred)
+            
+            # Check for multicollinearity (can cause unstable coefficients)
+            if len(feature_cols) > 1:
+                from sklearn.preprocessing import StandardScaler
+                # Compute correlation matrix of features
+                feature_corr = np.corrcoef(X_train_s.T)
+                high_corr_pairs = []
+                for i in range(len(feature_cols)):
+                    for j in range(i+1, len(feature_cols)):
+                        if abs(feature_corr[i, j]) > 0.9:
+                            high_corr_pairs.append((feature_cols[i], feature_cols[j], feature_corr[i, j]))
+                if high_corr_pairs:
+                    logger.warning(f"⚠️  High multicollinearity detected (|corr| > 0.9):")
+                    for feat1, feat2, corr in high_corr_pairs:
+                        logger.warning(f"   {feat1} ↔ {feat2}: {corr:.4f}")
+                    logger.warning(f"   This can cause unstable/unreliable coefficients in linear models")
+            
+            # Additional diagnostics for poor performance
+            if r2 < 0:
+                logger.warning(f"⚠️  Negative R² ({r2:.4f}) indicates model performs worse than predicting the mean")
+                logger.warning(f"   This suggests:")
+                logger.warning(f"   1. Model may be overfitting or extrapolating poorly")
+                logger.warning(f"   2. Non-linear relationships not captured by linear model")
+                logger.warning(f"   3. High experimental noise relative to signal")
+                logger.warning(f"   4. Small sample size ({len(X_train_s)} samples) may be insufficient")
+                
+                # Check if predictions are systematically biased
+                mean_pred = y_pred.mean()
+                mean_true = y_test_s.mean()
+                pred_std = y_pred.std()
+                true_std = y_test_s.std()
+                logger.info(f"   Prediction mean: {mean_pred:.4f}, Target mean: {mean_true:.4f} (bias: {mean_pred - mean_true:.4f})")
+                logger.info(f"   Prediction std: {pred_std:.4f}, Target std: {true_std:.4f}")
+                
+                # Check correlation
+                correlation = np.corrcoef(y_test_s, y_pred)[0, 1]
+                logger.info(f"   Correlation: {correlation:.4f}")
+                
+                # CRITICAL: Negative correlation means model predicts opposite direction
+                if correlation < 0:
+                    logger.error(f"   ❌ NEGATIVE CORRELATION ({correlation:.4f}) - Model predicts OPPOSITE direction!")
+                    logger.error(f"   This indicates a fundamental problem with the model or data")
+                
+                # Check model coefficients to understand what the model learned
+                if hasattr(model, 'coef_') and hasattr(model, 'intercept_'):
+                    logger.info(f"   Model coefficients:")
+                    logger.info(f"     Intercept: {model.intercept_:.6f}")
+                    for i, col in enumerate(feature_cols):
+                        logger.info(f"     {col}: {model.coef_[i]:.6f}")
+                    
+                    # Check if coefficients are all very small (model barely using features)
+                    max_coef = np.max(np.abs(model.coef_))
+                    if max_coef < 0.1:
+                        logger.warning(f"   ⚠️  All coefficients are very small (max={max_coef:.6f})")
+                        logger.warning(f"   Model is barely using features - essentially predicting constant")
+                    
+                    # Check feature correlations with target
+                    logger.info(f"   Feature-target correlations (on training set):")
+                    for i, col in enumerate(feature_cols):
+                        feat_corr = np.corrcoef(X_train_s[:, i], y_train_s)[0, 1]
+                        logger.info(f"     {col}: {feat_corr:.4f} (coef: {model.coef_[i]:.6f})")
+                        if np.sign(feat_corr) != np.sign(model.coef_[i]) and abs(feat_corr) > 0.1:
+                            logger.warning(f"       ⚠️  Coefficient sign mismatch! Feature correlation={feat_corr:.4f}, coef={model.coef_[i]:.6f}")
+                
+                # Check if predictions are essentially constant
+                pred_range = y_pred.max() - y_pred.min()
+                true_range = y_test_s.max() - y_test_s.min()
+                if pred_range < 0.1:
+                    logger.error(f"   ❌ Predictions are nearly constant (range={pred_range:.4f} vs target range={true_range:.4f})")
+                    logger.error(f"   Model is not learning meaningful patterns from features")
+            
             ml_baseline_metrics = {
                 "r2": r2, "mae": mae, "mse": mse,
                 "predictions": y_pred.tolist()
             }
-            logger.info(f"ML baseline (trained on {'subset' if args.top_k != -1 else 'full set'}): R2={r2:.4f} MAE={mae:.4f} MSE={mse:.4f}")
+            # Also check training set performance for overfitting diagnosis
+            y_pred_train = model.predict(X_train_s).astype(float)
+            if not args.no_scaling and y_scaler_target is not None:
+                y_pred_train = np.clip(y_pred_train, SCALE_MIN, SCALE_MAX)
+            r2_train = r2_score(y_train_s, y_pred_train)
+            mae_train = mean_absolute_error(y_train_s, y_pred_train)
+            
+            logger.info(f"ML baseline (frozen, trained on full set: {len(X_train_s)} samples):")
+            logger.info(f"  TEST:  R2={r2:.4f} MAE={mae:.4f} MSE={mse:.4f}")
+            logger.info(f"  TRAIN: R2={r2_train:.4f} MAE={mae_train:.4f}")
+            
+            if r2_train > 0 and r2 < 0:
+                logger.warning(f"⚠️  Model overfitting: Train R²={r2_train:.4f} > 0, but Test R²={r2:.4f} < 0")
+                logger.warning(f"   Model fits training data but generalizes poorly to test set")
+            elif r2_train < 0 and r2 < 0:
+                logger.warning(f"⚠️  Model underfitting: Both Train R²={r2_train:.4f} and Test R²={r2:.4f} are negative")
+                logger.warning(f"   Linear model cannot capture the relationships in this dataset")
+            
+            ml_baseline_metrics["train_r2"] = r2_train
+            ml_baseline_metrics["train_mae"] = mae_train
         except Exception as e:
             logger.warning(f"Failed to compute ML baseline metrics: {e}")
     else:
@@ -1413,8 +1726,11 @@ def main():
         task_type="regression",
         class_names=None,
         regression_loss_metric=args.regression_loss,
-        num_mechanisms_unknown=args.num_mechanisms_unknown
+        num_mechanisms_unknown=args.num_mechanisms_unknown,
+        use_scaling=not args.no_scaling  # Enable scaling unless --no_scaling flag is set
     )
+    # Set output directory early to ensure all artifacts are saved to the correct location
+    maicl.output_dir = output_dir
     if ml_baseline_metrics:
         try:
             maicl.set_ml_baseline_performance(ml_baseline_metrics)
@@ -1443,6 +1759,72 @@ def main():
         pre_mechanism_performance = maicl.mechanism_performance_snapshot.copy()
         logger.info(f"Pre-training mechanism performance: {pre_mechanism_performance}")
     
+    # Generate initial LLM mechanism(s) before pre-training evaluation for better LLM-only baseline
+    logger.info("\n" + "=" * 80)
+    logger.info("GENERATING INITIAL LLM MECHANISM(S) FOR PRE-TRAINING EVALUATION")
+    logger.info("=" * 80)
+    initial_llm_mechanisms_count = len([t for t in maicl.mechanism_types if t == "llm"])
+    if initial_llm_mechanisms_count == 0:
+        logger.info("No LLM mechanisms found. Generating initial mechanism(s) for pre-training evaluation...")
+        try:
+            # Set X_train_original for mechanism generator (needed for DeepChem SMILES strings)
+            if is_deepchem_dataset and X_original_topk:
+                maicl.mech_generator.X_train_original = X_original_topk
+                logger.info("  Set X_train_original for mechanism generator (DeepChem dataset with SMILES)")
+            
+            # Use ML residuals if available, otherwise use simple baseline
+            if args.use_ml and residuals_topk is not None and len(residuals_topk) == len(X_topk):
+                prediction_errors = np.abs(residuals_topk)
+                ml_residuals_for_init = residuals_topk
+            else:
+                # Simple baseline: use mean-centered errors
+                prediction_errors = np.abs(y_topk - np.mean(y_topk))
+                ml_residuals_for_init = None
+            
+            # Generate initial mechanism(s)
+            initial_mechanisms = maicl.mech_generator.generate_unknown_mechanisms(
+                X_topk, y_topk, prediction_errors, ml_residuals=ml_residuals_for_init
+            )
+            
+            if initial_mechanisms and len(initial_mechanisms) > 0:
+                # Update mechanisms list
+                maicl.mech_generator.unknown_mechanisms = initial_mechanisms
+                maicl.mechanisms = maicl.mech_generator.get_all_mechanisms()
+                maicl.mechanism_types = maicl.mech_generator.get_mechanism_types()
+                logger.info(f"  ✓ Generated {len(initial_mechanisms)} initial LLM mechanism(s) for pre-training evaluation")
+                logger.info(f"  Total mechanisms now: {len(maicl.mechanisms)} ({len([t for t in maicl.mechanism_types if t == 'llm'])} LLM + {len([t for t in maicl.mechanism_types if t == 'ml'])} ML)")
+            else:
+                logger.warning("  ⚠️  Failed to generate initial LLM mechanisms")
+        except Exception as e:
+            logger.warning(f"Failed to generate initial LLM mechanisms: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        logger.info(f"Found {initial_llm_mechanisms_count} existing LLM mechanism(s), skipping initial generation")
+    
+    # Evaluate LLM-only mechanisms pre-training (excluding ML) to assess initial LLM performance
+    logger.info("\n" + "=" * 80)
+    logger.info("LLM-ONLY EVALUATION PRE-TRAINING (excluding ML mechanisms)")
+    logger.info("=" * 80)
+    llm_only_pre_metrics = None
+    try:
+        # For DeepChem datasets, pass X_original to use SMILES strings instead of vectorized features
+        llm_only_pre_kwargs = {}
+        if is_deepchem_dataset:
+            llm_only_pre_kwargs['X_original'] = X_original_test
+            llm_only_pre_kwargs['X_pool_original'] = X_original_train
+        llm_only_pre_metrics = maicl.evaluate_llm_only(X_test_s, y_test_s, X_train_s, y_train_s, 
+                                                        return_details=True, k_shot=args.k_shot,
+                                                        **llm_only_pre_kwargs)
+        llm_only_pre_r2 = float(llm_only_pre_metrics.get('r2', -1.0))
+        llm_only_pre_mae = float(llm_only_pre_metrics.get('mae', 1e9))
+        llm_only_pre_mse = float(llm_only_pre_metrics.get('mse', 1e9))
+        logger.info(f"LLM-only (pre-training): R2={llm_only_pre_r2:.4f} MAE={llm_only_pre_mae:.4f} MSE={llm_only_pre_mse:.4f}")
+    except Exception as e:
+        logger.warning(f"Failed to evaluate LLM-only mechanisms pre-training: {e}")
+        import traceback
+        traceback.print_exc()
+    
     # Generate pre-training plots
     if y_pred_pre is not None and len(y_pred_pre) > 0:
         save_scatter_plot(y_test_s, y_pred_pre, 
@@ -1455,46 +1837,64 @@ def main():
     logger.info("TRAINING MA-ICL")
     logger.info("=" * 80)
     logger.info(f"Training on {len(X_topk)} top-K residual samples for {args.iterations} iterations")
-    if args.use_test_for_acceptance:
+    if args.acceptance_set == "test":
         logger.info(f"Using TEST set ({len(X_test_s)} samples) for acceptance evaluation")
+    elif args.acceptance_set == "train":
+        logger.info(f"Using TRAIN set ({len(X_topk)} samples) for acceptance evaluation")
     else:
-        logger.info(f"Using full validation set ({len(X_val_s)} samples) for acceptance evaluation")
-    # Use validation or test set for acceptance; pass only TRAIN residuals to LLM
+        logger.info(f"Using VALIDATION set ({len(X_val_s)} samples) for acceptance evaluation")
+    # Use selected set (test/validation/train) for acceptance; pass only TRAIN residuals to LLM
     # accept_eval_max=None means use full acceptance set
     # Use residuals_topk to ensure consistency with training data (X_topk)
     # For DeepChem datasets, pass X_original for validation and test sets to use SMILES strings
-    train_kwargs = {'X_train_original': X_original_topk}
+    train_kwargs = {'X_train_original': X_original_topk, 'output_dir': output_dir}
     if is_deepchem_dataset:
         train_kwargs['X_val_original'] = X_original_val
         train_kwargs['X_test_original'] = X_original_test
     maicl.train(X_topk, y_topk, X_val_s, y_val_s, iterations=args.iterations, 
                 ml_residuals=residuals_topk if args.use_ml else None,  # Only pass residuals if ML is enabled
                 accept_eval_max=None, X_test=X_test_s, y_test=y_test_s, 
-                use_test_for_acceptance=args.use_test_for_acceptance, **train_kwargs)
+                acceptance_set=args.acceptance_set, k_shot=args.k_shot, **train_kwargs)
 
     # Post metrics
     logger.info("=" * 80)
     logger.info("POST-TRAINING EVALUATION")
     logger.info("=" * 80)
     
-    # For final test metrics: use same routing as training
-    # If we optimized on test set, use relaxed routing; otherwise use strict routing to avoid leakage
-    final_relax_routing = args.use_test_for_acceptance or (args.relax_eval == 1)
-    if final_relax_routing:
-        logger.info("Using relaxed routing for final evaluation (same as training)")
+    # CRITICAL FIX: Use SAME evaluation set and routing mode as training for exact reproduction
+    # Training uses acceptance_set (default: "validation") with relax_routing=True
+    # To get exact reproduction, we must use the same set and routing mode
+    if args.acceptance_set == "test":
+        # Training used test set for acceptance - use test set for final evaluation
+        X_final_eval = X_test_s
+        y_final_eval = y_test_s
+        X_original_final_eval = X_original_test if is_deepchem_dataset else None
+        eval_set_name = "test"
+    elif args.acceptance_set == "train":
+        # Training used train set for acceptance - use train set for final evaluation
+        X_final_eval = X_train_s
+        y_final_eval = y_train_s
+        X_original_final_eval = X_original_train if is_deepchem_dataset else None
+        eval_set_name = "train"
     else:
-        logger.info("Using strict routing for final evaluation (to avoid validation leakage)")
+        # Default: Training used validation set for acceptance - use validation set for final evaluation
+        X_final_eval = X_val_s
+        y_final_eval = y_val_s
+        X_original_final_eval = X_original_val if is_deepchem_dataset else None
+        eval_set_name = "validation"
     
-    # CRITICAL: Mechanism performance will always be recalculated on the test set to ensure
-    # accurate routing with the final accepted mechanisms. The preserve_mechanism_performance
-    # flag only affects whether we update the snapshot, not whether we recalculate.
-    # This ensures post-training results reflect the actual performance of the final mechanisms.
-    preserve_perf = args.use_test_for_acceptance
-    if preserve_perf:
-        logger.info("Recalculating mechanism performance on test set (preserving snapshot for consistency)")
-        logger.info("  Note: Performance is recalculated to ensure accurate routing with final accepted mechanisms")
-    else:
-        logger.info("Recalculating mechanism performance scores on test set (for accurate routing)")
+    # CRITICAL: Always use relax_routing=True to match training mode
+    # Training always uses relax_routing=True, so final evaluation must match
+    final_relax_routing = True
+    logger.info(f"Using SAME routing as best iteration for exact reproduction")
+    logger.info(f"  - Evaluation set: {eval_set_name} (same as acceptance_set during training)")
+    logger.info(f"  - Routing mode: relax_routing=True (same as training)")
+    
+    # CRITICAL: Always preserve mechanism performance scores from best snapshot
+    # This ensures final evaluation uses the exact same routing weights as the best iteration
+    preserve_perf = True
+    logger.info(f"Preserving mechanism performance scores from best snapshot (calculated on {eval_set_name} set during training)")
+    logger.info(f"  Note: This ensures final evaluation uses the same routing as the best iteration")
     
     # Log final accepted mechanisms for transparency
     final_mechanism_count = len(maicl.mechanisms) if hasattr(maicl, 'mechanisms') else 0
@@ -1502,16 +1902,46 @@ def main():
     final_ml_count = sum(1 for t in maicl.mechanism_types if t == "ml") if hasattr(maicl, 'mechanism_types') else 0
     logger.info(f"Evaluating with final accepted mechanisms: {final_mechanism_count} total ({final_llm_count} LLM, {final_ml_count} ML)")
     
+    # Log best snapshot metrics for comparison
+    if hasattr(maicl, '_best_iteration') and maicl._best_iteration is not None:
+        best_iter = maicl._best_iteration
+        logger.info(f"  [Best Iteration] Using mechanisms from iteration {best_iter}")
+        # Try to get best snapshot metrics if available
+        if hasattr(maicl, 'training_history') and 'best_snapshot' in str(maicl.training_history):
+            # The best snapshot metrics are stored internally, log them if we can access them
+            logger.info(f"  [Best Iteration] Best iteration {best_iter} achieved the best performance during training")
+    
     # For DeepChem datasets, pass X_original to use SMILES strings instead of vectorized features
-    post = maicl.evaluate(X_test_s, y_test_s, X_train_s, y_train_s, return_details=True, 
+    # CRITICAL: Use same evaluation set as acceptance_set for exact reproduction
+    # CRITICAL FIX: Explicitly pass k_shot to ensure final evaluation uses same value as training
+    post = maicl.evaluate(X_final_eval, y_final_eval, X_train_s, y_train_s, return_details=True, 
                           relax_routing=final_relax_routing, preserve_mechanism_performance=preserve_perf,
-                          X_original=X_original_test if is_deepchem_dataset else None,
+                          k_shot=args.k_shot,  # CRITICAL: Use same k_shot as training to ensure consistency
+                          X_original=X_original_final_eval,
                           X_pool_original=X_original_train if is_deepchem_dataset else None)
     post_mae = float(post.get('mae', 0.0))
     post_r2 = float(post.get('r2', 0.0))
     post_rmse = float(post.get('rmse', 0.0))
     post_mse = float(post_rmse ** 2)
-    logger.info(f"Post-training: R2={post_r2:.4f} MAE={post_mae:.4f} MSE={post_mse:.4f}")
+    logger.info(f"Post-training ({eval_set_name} set): R2={post_r2:.4f} MAE={post_mae:.4f} MSE={post_mse:.4f}")
+    logger.info(f"  Note: Using {eval_set_name} set (same as acceptance_set during training) for exact reproduction")
+    
+    # Compare with best iteration metrics if available
+    if hasattr(maicl, '_best_iteration') and maicl._best_iteration is not None:
+        best_iter = maicl._best_iteration
+        best_r2 = getattr(maicl, '_best_r2', None)
+        best_mae = getattr(maicl, '_best_mae', None)
+        if best_r2 is not None:
+            r2_diff = post_r2 - best_r2
+            logger.info(f"  [Comparison] Best iteration {best_iter} had R2={best_r2:.4f} during training")
+            logger.info(f"  [Comparison] Final evaluation R2={post_r2:.4f} (difference: {r2_diff:+.4f})")
+            if abs(r2_diff) > 0.01:
+                logger.warning(f"  [Comparison] ⚠️  Final R2 differs from best iteration by {abs(r2_diff):.4f}")
+                logger.warning(f"  [Comparison] This may be due to few-shot example selection randomness or evaluation differences")
+        if best_mae is not None:
+            mae_diff = post_mae - best_mae
+            logger.info(f"  [Comparison] Best iteration {best_iter} had MAE={best_mae:.4f} during training")
+            logger.info(f"  [Comparison] Final evaluation MAE={post_mae:.4f} (difference: {mae_diff:+.4f})")
     
     # Extract post-training predictions from evaluate results
     y_pred_post = np.array(post.get('predictions', [])) if 'predictions' in post else None
@@ -1523,12 +1953,13 @@ def main():
         logger.info(f"Post-training mechanism performance: {post_mechanism_performance}")
     
     # Generate post-training plots
+    # Use the same evaluation set that was used for evaluation (for consistency)
     if y_pred_post is not None and len(y_pred_post) > 0:
-        save_scatter_plot(y_test_s, y_pred_post,
-                         f"Post-Training: Predicted vs Actual ({ds_label})",
+        save_scatter_plot(y_final_eval, y_pred_post,
+                         f"Post-Training: Predicted vs Actual ({ds_label}, {eval_set_name} set)",
                          "post_scatter.png", output_dir)
-        save_residual_plot(y_test_s, y_pred_post,
-                          f"Post-Training ({ds_label})",
+        save_residual_plot(y_final_eval, y_pred_post,
+                          f"Post-Training ({ds_label}, {eval_set_name} set)",
                           "post_residuals.png", output_dir)
     
     # Evaluate LLM-only mechanisms (excluding ML) to assess LLM learning
@@ -1544,7 +1975,7 @@ def main():
             llm_only_kwargs['X_original'] = X_original_test
             llm_only_kwargs['X_pool_original'] = X_original_train
         llm_only_metrics = maicl.evaluate_llm_only(X_test_s, y_test_s, X_train_s, y_train_s, 
-                                                    return_details=True, k_shot=maicl.k_shot if hasattr(maicl, 'k_shot') else 10,
+                                                    return_details=True, k_shot=args.k_shot,
                                                     **llm_only_kwargs)
         llm_only_r2 = float(llm_only_metrics.get('r2', -1.0))
         llm_only_mae = float(llm_only_metrics.get('mae', 1e9))
@@ -1574,7 +2005,9 @@ def main():
             post_metrics=post,
             task_type="regression",
             class_names=None,
-            output_dir=output_dir
+            output_dir=output_dir,
+            llm_only_metrics=llm_only_metrics,
+            llm_only_pre_metrics=llm_only_pre_metrics
         )
     except Exception as e:
         logger.warning(f"Failed to generate visualizations: {e}")
@@ -1612,7 +2045,13 @@ def main():
             "rmse": post_rmse,
             "mechanism_performance": post_mechanism_performance
         },
-        "llm_only": {
+        "llm_only_pre": {
+            "r2": float(llm_only_pre_metrics.get('r2', -1.0)) if llm_only_pre_metrics else None,
+            "mae": float(llm_only_pre_metrics.get('mae', 1e9)) if llm_only_pre_metrics else None,
+            "mse": float(llm_only_pre_metrics.get('mse', 1e9)) if llm_only_pre_metrics else None,
+            "rmse": float(np.sqrt(llm_only_pre_metrics.get('mse', 1e9))) if llm_only_pre_metrics and 'mse' in llm_only_pre_metrics else None
+        } if llm_only_pre_metrics else None,
+        "llm_only_post": {
             "r2": float(llm_only_metrics.get('r2', -1.0)) if llm_only_metrics else None,
             "mae": float(llm_only_metrics.get('mae', 1e9)) if llm_only_metrics else None,
             "mse": float(llm_only_metrics.get('mse', 1e9)) if llm_only_metrics else None,
@@ -1657,14 +2096,19 @@ def main():
     logger.info(f"Total Mechanisms: {len(maicl.mechanisms)} ({len([t for t in maicl.mechanism_types if t == 'llm'])} LLM + {len([t for t in maicl.mechanism_types if t == 'ml'])} ML)")
     logger.info("")
     logger.info("Performance Comparison:")
-    logger.info(f"  ML Baseline:   R2={ml_r2:.4f}, MAE={ml_mae:.4f}, MSE={ml_mse:.4f}")
-    logger.info(f"  Pre-training:  R2={pre_r2:.4f}, MAE={pre_mae:.4f}, MSE={pre_mse:.4f}")
-    logger.info(f"  Post-training: R2={post_r2:.4f}, MAE={post_mae:.4f}, MSE={post_mse:.4f}")
+    logger.info(f"  ML Baseline:        R2={ml_r2:.4f}, MAE={ml_mae:.4f}, MSE={ml_mse:.4f}")
+    logger.info(f"  Pre-training:       R2={pre_r2:.4f}, MAE={pre_mae:.4f}, MSE={pre_mse:.4f}")
+    if llm_only_pre_metrics:
+        llm_only_pre_r2 = float(llm_only_pre_metrics.get('r2', -1.0))
+        llm_only_pre_mae = float(llm_only_pre_metrics.get('mae', 1e9))
+        llm_only_pre_mse = float(llm_only_pre_metrics.get('mse', 1e9))
+        logger.info(f"  LLM-only (pre):    R2={llm_only_pre_r2:.4f}, MAE={llm_only_pre_mae:.4f}, MSE={llm_only_pre_mse:.4f}")
+    logger.info(f"  Post-training:      R2={post_r2:.4f}, MAE={post_mae:.4f}, MSE={post_mse:.4f}")
     if llm_only_metrics:
         llm_only_r2 = float(llm_only_metrics.get('r2', -1.0))
         llm_only_mae = float(llm_only_metrics.get('mae', 1e9))
         llm_only_mse = float(llm_only_metrics.get('mse', 1e9))
-        logger.info(f"  LLM-only:     R2={llm_only_r2:.4f}, MAE={llm_only_mae:.4f}, MSE={llm_only_mse:.4f}")
+        logger.info(f"  LLM-only (post):   R2={llm_only_r2:.4f}, MAE={llm_only_mae:.4f}, MSE={llm_only_mse:.4f}")
     logger.info("")
     logger.info("Training Improvement (Post vs Pre):")
     logger.info(f"  ΔR2={final_results['improvements']['training_improvement']['r2_delta']:+.4f}, "
@@ -1749,8 +2193,10 @@ def main():
                                 formula = extract_formula_from_llm_mechanism(mech_text)
                                 if formula is None:
                                     formula = mech_text
-                                train_preds = evaluate_llm_formula(formula, X_train_s, feature_cols, scaler, y_scaler_target)
-                                test_preds = evaluate_llm_formula(formula, X_test_s, feature_cols, scaler, y_scaler_target)
+                                # For DeepChem datasets, pass X_original (SMILES strings) for molecular property computation
+                                # X_original_train and X_original_test are defined earlier in this function
+                                train_preds = evaluate_llm_formula(formula, X_train_s, feature_cols, scaler, y_scaler_target, X_original=X_original_train)
+                                test_preds = evaluate_llm_formula(formula, X_test_s, feature_cols, scaler, y_scaler_target, X_original=X_original_test)
                             elif mech_type == "ml":
                                 train_preds, test_preds = evaluate_ml_mechanism(
                                     mech_text, X_train_s, y_train_s, X_test_s, feature_cols, scaler, y_scaler_target

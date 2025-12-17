@@ -254,8 +254,8 @@ def get_dataset_specific_known_mechanisms(
     feature_cols: Optional[List[str]],
     task_type: str,
     class_names: Optional[List[str]],
-    scale_min: float,
-    scale_max: float,
+    scale_min: Optional[float],
+    scale_max: Optional[float],
     X_train_original: Optional[List[Any]] = None,
     predictor: Optional[Any] = None
 ) -> List[str]:
@@ -267,15 +267,25 @@ def get_dataset_specific_known_mechanisms(
         feature_cols: List of feature column names
         task_type: "classification" or "regression"
         class_names: Optional list of class names for classification
-        scale_min: Minimum value in scaling range
-        scale_max: Maximum value in scaling range
+        scale_min: Minimum value in scaling range (None if scaling is disabled)
+        scale_max: Maximum value in scaling range (None if scaling is disabled)
         X_train_original: Optional original training data (for SMILES detection)
         predictor: Optional predictor object (for SMILES detection)
     
     Returns:
         List of known mechanism description strings
     """
-    scale_range_str = f"[{scale_min}, {scale_max}]"
+    # Helper function to get scaling constraints string
+    def get_scaling_constraints_str() -> str:
+        if scale_min is not None and scale_max is not None:
+            scale_range_str = f"[{scale_min}, {scale_max}]"
+            return f"""- All inputs are normalized to {scale_range_str}
+- Output must be a numeric value in {scale_range_str}
+- Clip ŷ to {scale_range_str}"""
+        else:
+            return """- Output must be a numeric value (no scaling/clipping constraints)"""
+    
+    scale_range_str = f"[{scale_min}, {scale_max}]" if scale_min is not None and scale_max is not None else "unscaled"
     
     # Check if this is a DeepChem dataset
     is_deepchem = is_deepchem_dataset(feature_cols)
@@ -302,13 +312,17 @@ def get_dataset_specific_known_mechanisms(
             class_list = formatted_class_names
         
         # Build formula with explicit class mapping
+        # Use default range [0, 1] if scaling is disabled (scale_min/scale_max are None)
+        effective_scale_min = scale_min if scale_min is not None else 0.0
+        effective_scale_max = scale_max if scale_max is not None else 1.0
+        
         if feature_cols and len(feature_cols) > 0:
             feature_sum = " + ".join(feature_cols[:min(5, len(feature_cols))])
             n_feat = min(5, len(feature_cols))
             if class_names_str and len(class_list) > 0:
                 n_classes = len(class_list)
-                bin_size = (scale_max - scale_min) / n_classes
-                thresholds = [scale_min + (i + 1) * bin_size for i in range(n_classes - 1)]
+                bin_size = (effective_scale_max - effective_scale_min) / n_classes
+                thresholds = [effective_scale_min + (i + 1) * bin_size for i in range(n_classes - 1)]
                 
                 # Create nested if-else structure for explicit class mapping
                 if len(thresholds) == 1:
@@ -325,9 +339,9 @@ def get_dataset_specific_known_mechanisms(
                 
                 formula = f"score = ({feature_sum}) / {n_feat}; {class_mapping}"
             else:
-                formula = f"score = ({feature_sum}) / {n_feat}; ŷ = 0 if score < {(scale_min + scale_max) / 2:.2f} else 1"
+                formula = f"score = ({feature_sum}) / {n_feat}; ŷ = 0 if score < {(effective_scale_min + effective_scale_max) / 2:.2f} else 1"
         else:
-            formula = f"score = (sum of all features) / (number of features); ŷ = 0 if score < {(scale_min + scale_max) / 2:.2f} else 1"
+            formula = f"score = (sum of all features) / (number of features); ŷ = 0 if score < {(effective_scale_min + effective_scale_max) / 2:.2f} else 1"
         
         # Build class output description
         class_output_desc = ""
@@ -1060,6 +1074,7 @@ Key insights:
 - Non-linear relationships may exist between features and target
 - Domain-specific patterns influence predictions"""
             
+            scaling_constraints = get_scaling_constraints_str()
             mechanism_desc = f"""[KNOWN] DATASET CONTEXT:
 {dataset_desc}
 
@@ -1071,10 +1086,8 @@ MECHANISM FORMULA:
 COMPUTE prediction as: {formula}
 
 CONSTRAINTS:
-- All inputs are normalized to {scale_range_str}
-- Output must be a numeric value in {scale_range_str}
-- Use actual feature names from the dataset when referencing features
-- Clip ŷ to {scale_range_str}"""
+{scaling_constraints}
+- Use actual feature names from the dataset when referencing features"""
             
             return [mechanism_desc]
 

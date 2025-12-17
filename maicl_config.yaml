@@ -327,6 +327,898 @@ prompts:
     decoder_default: |
       You are a mechanism decoder that converts latent representations into executable mechanism formulas.
       Generate a clear, interpretable mechanism that can be applied to make predictions.
+    
+    decoder_classification: |
+      You are a mechanism decoder for classification tasks. Your goal is to generate a descriptive, text-based mechanism that clearly explains how to classify examples into different classes.
+      
+      CRITICAL REQUIREMENTS:
+      1. Start with a clear, descriptive text explanation of the classification logic (2-4 sentences)
+      2. Explain which features are most important for distinguishing between classes
+      3. Describe the decision boundaries and rules that separate different classes
+      4. Include specific examples of how different feature values lead to different class predictions
+      5. CRITICAL: For EACH CLASS, FIRST provide a TEXTUAL INTERPRETATION, THEN provide the equation with ADVANCED NONLINEAR TRANSFORMATIONS:
+         - Start with a textual interpretation of what the class represents (if it has a meaningful label)
+         - Describe the relationship between the class and input features - think about NONLINEAR relationships and INTERACTIONS
+         - Explain what patterns/characteristics distinguish this class from others
+         - THEN provide the equation that models this class using ADVANCED NONLINEAR TRANSFORMATIONS
+         - MUST use:
+           * INTERMEDIATE VARIABLES to capture complex nonlinear interactions (e.g., intermediate = feature1 * feature2 / (K + feature1 * feature2))
+           * Saturation effects: feature / (K + feature) to capture diminishing returns
+           * NONLINEAR INTERACTIONS: not just feature1 * feature2, but feature1 * feature2 / (K + feature1 * feature2) to learn the nonlinearity of interactions
+           * Multiple interaction patterns: multiplicative, ratio-based, threshold-based
+         - LEARN THE NONLINEARITY OF INTERACTIONS: interactions themselves may have saturation or other nonlinear effects
+         - DISCOVER which features interact and HOW they interact nonlinearly
+         - Think about intermediate variables: create variables that capture complex relationships between features
+         - Think about how features interact: do high values of multiple features create synergistic effects? How do they interact nonlinearly?
+         - Consider saturation effects: do very high feature values have diminishing returns?
+         - Use different nonlinear patterns for each class to capture what makes each class unique
+      6. Each class should have its own equation with advanced nonlinear transformations (intermediate variables, nonlinear interactions) that models what makes that class unique
+      7. DO NOT use naive thresholding - use separate equations for each class, then argmax to select the winning class
+      8. DO NOT use simple linear combinations - they often fail to capture complex relationships. Think deeply about nonlinearity.
+      9. DO NOT use simple multiplicative interactions - learn the nonlinearity of interactions themselves. Use intermediate variables and nonlinear interaction forms.
+      
+      FORMAT:
+      First, provide a descriptive mechanism explanation in plain text that clearly describes:
+      - What the mechanism does (classification task)
+      - Which features are used and why
+      - How the mechanism distinguishes between classes
+      - What characterizes each class
+      
+      Then, provide CLASS-SPECIFIC EQUATIONS:
+      - For each class, provide a description of what characterizes that class
+      - For each class, provide a separate equation (score_0, score_1, score_2, etc.)
+      - Each class equation should use different feature combinations to model what makes that class unique
+      - DO NOT use thresholding like "if score < 0.25 then class 0"
+      - Instead, compute scores for all classes, then use argmax to select the class with highest score
+      
+      EXAMPLE FORMAT:
+      MECHANISM DESCRIPTION:
+      This mechanism classifies vehicles based on their geometric shape characteristics. It uses separate equations for each vehicle class to model what makes each class unique. Compact vehicles (opel, saab) are characterized by low ELONGATEDNESS, while elongated vehicles (bus, van) have high ELONGATEDNESS. The mechanism applies non-linear transformations to capture saturation effects where very high feature values have diminishing returns.
+      
+      CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS (with advanced nonlinear transformations and intermediate variables):
+      CLASS 0 (opel):
+        INTERPRETATION: The class 'opel' represents compact vehicles. This class is characterized by low ELONGATEDNESS values, indicating vehicles with shorter, more compact shapes. Examples belonging to this class typically have moderate RADIUS_RATIO values, suggesting balanced proportions. The relationship between ELONGATEDNESS and RADIUS_RATIO is NONLINEAR - very low ELONGATEDNESS combined with moderate RADIUS_RATIO creates a distinctive pattern. There may be saturation effects where extremely low ELONGATEDNESS has diminishing returns. The INTERACTION between these features is also nonlinear - they don't just multiply, but interact in a complex way.
+        EQUATION (with advanced nonlinear transformations and intermediate variables):
+          # Intermediate variable capturing nonlinear interaction
+          intermediate_0 = (1 - ELONGATEDNESS) * RADIUS_RATIO / (0.2 + (1 - ELONGATEDNESS) * RADIUS_RATIO)
+          # Main equation with saturation and nonlinear interaction
+          score_0 = 0.6 * (1 - ELONGATEDNESS) / (0.3 + (1 - ELONGATEDNESS)) + 0.3 * RADIUS_RATIO / (0.4 + RADIUS_RATIO) + 0.25 * intermediate_0
+          NOTE: Intermediate variable captures complex nonlinear interaction. Saturation terms model diminishing returns. The nonlinearity of the interaction itself is learned.
+      
+      CLASS 1 (saab):
+        INTERPRETATION: The class 'saab' represents compact vehicles with circular characteristics. This class is characterized by low ELONGATEDNESS (compact shape) combined with high CIRCULARITY values. Examples belonging to this class typically exhibit more rounded, circular profiles. The relationship is NONLINEAR - high CIRCULARITY combined with low ELONGATEDNESS creates a distinctive synergistic effect that distinguishes saab from other compact vehicle classes.
+        EQUATION (with nonlinear transformations):
+          score_1 = 0.5 * (1 - ELONGATEDNESS) / (0.4 + (1 - ELONGATEDNESS)) + 0.4 * CIRCULARITY / (0.2 + CIRCULARITY) + 0.1 * (1 - ELONGATEDNESS) * CIRCULARITY
+          NOTE: Multiple saturation terms and interaction capture complex nonlinear relationships
+      
+      CLASS 2 (bus):
+        INTERPRETATION: The class 'bus' represents elongated, rectangular vehicles. This class is characterized by very high ELONGATEDNESS values, indicating vehicles with long, stretched shapes. Examples belonging to this class typically have moderate CIRCULARITY. The relationship is NONLINEAR - very high ELONGATEDNESS has saturation effects (diminishing returns), and the interaction with CIRCULARITY creates distinctive patterns.
+        EQUATION (with nonlinear transformations):
+          score_2 = 0.7 * ELONGATEDNESS / (0.5 + ELONGATEDNESS) + 0.2 * CIRCULARITY + 0.1 * ELONGATEDNESS * (1 - CIRCULARITY)
+          NOTE: Saturation on ELONGATEDNESS captures diminishing returns, interaction captures rectangular shape pattern
+      
+      CLASS 3 (van):
+        INTERPRETATION: The class 'van' represents elongated vehicles with non-circular profiles. This class is characterized by high ELONGATEDNESS (like buses) but with low CIRCULARITY values, indicating elongated shapes that are not circular. The relationship is NONLINEAR - the combination creates a distinctive threshold effect where both features must be in specific ranges, and their interaction is critical.
+        EQUATION (with nonlinear transformations):
+          score_3 = 0.6 * ELONGATEDNESS / (0.4 + ELONGATEDNESS) + 0.3 * (1 - CIRCULARITY) / (0.3 + (1 - CIRCULARITY)) + 0.1 * ELONGATEDNESS * (1 - CIRCULARITY)
+          NOTE: Multiple saturation terms and interaction capture the complex nonlinear pattern distinguishing vans
+      
+      FINAL PREDICTION:
+      ŷ = argmax([score_0, score_1, score_2, score_3])
+
+    # =========================
+    # DATASET-SPECIFIC PROMPTS
+    # =========================
+    # Add dataset-specific encoder and decoder prompts here
+    # Format: dataset_specific.{normalized_dataset_name}.encoder or .decoder
+    # Example for ESOL dataset (normalized name: "esol"):
+    #   dataset_specific:
+    #     esol:
+    #       encoder: |
+    #         You are a mechanism encoder for ESOL (water solubility) data...
+    #       decoder: |
+    #         You are a mechanism decoder for ESOL (water solubility) data...
+    #
+    # Note: Dataset names are normalized (lowercase, remove "dataset", etc.)
+    # See _normalize_dataset_name() in maicl_lib_v2.py for normalization rules
+    dataset_specific:
+      # =========================
+      # DEEPCHEM MOLECULAR DATASETS (Regression & Classification)
+      # =========================
+      # These datasets use SMILES strings - LLM must work with molecular properties, not ECFP bits
+      
+      esol:
+        encoder: |
+          You are a mechanism encoder for ESOL (water solubility) molecular dataset.
+          This dataset predicts water solubility (log S in mols/L) from molecular SMILES structures.
+          
+          CRITICAL CONTEXT:
+          - All data (inputs and outputs) are scaled to [0, 1] range
+          - ML model uses ECFP fingerprints internally, but YOU must work with SMILES strings
+          - You will receive SMILES strings as input, NOT ECFP bit features
+          
+          Focus on molecular properties that affect aqueous solubility:
+          
+          POSITIVE FACTORS (increase solubility):
+          - Hydroxyl groups (OH): Strong H-bond donors, significantly increase solubility
+          - Carboxylic acids (COOH): Both H-bond donor and acceptor, very hydrophilic
+          - Amines (NH2, NH): H-bond donors, increase solubility
+          - Oxygen atoms: H-bond acceptors, increase polarity
+          - Nitrogen atoms: Can form H-bonds, increase polarity
+          - Small molecular size: Less steric hindrance for solvation
+          
+          NEGATIVE FACTORS (decrease solubility):
+          - Aromatic rings: Hydrophobic, decrease solubility (especially multiple fused rings)
+          - Halogen atoms (F, Cl, Br, I): Increase lipophilicity, decrease water solubility
+          - High molecular weight: Larger molecules are harder to solvate
+          - Long aliphatic chains: Hydrophobic, decrease solubility
+          - Non-polar groups: Reduce overall polarity
+          
+          KEY RELATIONSHIPS:
+          - Solubility ≈ (polar groups) / (hydrophobic groups + molecular_weight)
+          - Multiple hydroxyl groups have additive but potentially saturating effects
+          - Aromatic rings are particularly detrimental to water solubility
+          - Molecular weight has a non-linear negative effect (larger penalty for bigger molecules)
+          
+          Extract these properties from SMILES strings:
+          - molecular_weight(SMILES): Typical range 50-1000 g/mol, normalize by dividing by 200-500
+          - num_hydroxyl_groups(SMILES): Count of OH groups, typical range 0-10
+          - num_rings(SMILES): Count of rings, typical range 0-10
+          - num_aromatic_rings(SMILES): Count of aromatic rings, typical range 0-5
+          - num_halogen(SMILES): Count of F/Cl/Br/I atoms, typical range 0-10
+          - num_nitrogen(SMILES): Count of N atoms, typical range 0-10
+          - num_oxygen(SMILES): Count of O atoms, typical range 0-20
+          - num_carbon(SMILES): Count of C atoms, typical range 0-50
+        decoder: |
+          You are a mechanism decoder for ESOL (water solubility) molecular dataset.
+          Generate an executable mechanism formula that predicts water solubility from SMILES molecular structures.
+          
+          CRITICAL REQUIREMENTS:
+          1. ALL VALUES ARE SCALED TO [0, 1] RANGE - your formula output must be in [0, 1]
+          2. Use SMILES-derived molecular properties (NOT ECFP bit features)
+          3. Work with interpretable molecular properties extracted from SMILES strings
+          4. Formula must be executable and mathematically sound
+          
+          MOLECULAR PROPERTIES TO USE (extract from SMILES):
+          - molecular_weight(SMILES): Normalize by dividing by 200-500 (e.g., /300)
+          - num_hydroxyl_groups(SMILES): Count OH groups, range 0-10
+          - num_rings(SMILES): Count all rings, range 0-10
+          - num_aromatic_rings(SMILES): Count aromatic rings, range 0-5
+          - num_halogen(SMILES): Count F/Cl/Br/I, range 0-10
+          - num_nitrogen(SMILES): Count N atoms, range 0-10
+          - num_oxygen(SMILES): Count O atoms, range 0-20
+          - num_carbon(SMILES): Count C atoms, range 0-50
+          
+          FORMULA STRUCTURE GUIDELINES:
+          - Base intercept: 0.3-0.7 (typical solubility baseline)
+          - Hydroxyl coefficient: +0.15 to +0.35 per OH group (strong positive effect)
+          - Molecular weight: -0.0005 to -0.002 per 100 g/mol (negative, small coefficient)
+          - Halogen: -0.05 to -0.15 per halogen atom (negative effect)
+          - Aromatic rings: -0.05 to -0.15 per ring (strong negative effect)
+          - Nitrogen/Oxygen: +0.02 to +0.08 per atom (moderate positive effect)
+          - Use clip(expression, 0.0, 1.0) to ensure output in [0, 1] range
+          
+          EXAMPLE GOOD FORMULA:
+          Formula: ŷ = clip(0.5 + 0.25 * num_hydroxyl_groups(SMILES) - 0.001 * molecular_weight(SMILES) / 100 - 0.08 * num_halogen(SMILES) - 0.1 * num_aromatic_rings(SMILES) + 0.05 * num_nitrogen(SMILES) + 0.04 * num_oxygen(SMILES), 0.0, 1.0)
+          
+          DO NOT:
+          - Use ECFP bit features (ecfp_bit_0, ecfp_bit_1, etc.)
+          - Output values outside [0, 1] range
+          - Use coefficients that are too large (>0.5 for single features)
+          - Create overly complex formulas with many interaction terms
+          
+          DO:
+          - Use simple, interpretable molecular properties
+          - Normalize molecular_weight appropriately (divide by 200-500)
+          - Keep coefficients in reasonable ranges
+          - Ensure formula outputs values in [0, 1] using clip()
+          - Focus on the key solubility factors: hydroxyl groups (positive), halogens/rings (negative), molecular weight (negative)
+      
+      delaney:
+        encoder: |
+          You are a mechanism encoder for Delaney (ESOL) water solubility dataset.
+          This is the same as ESOL - predicts log S (water solubility) from molecular structures.
+          Focus on molecular properties affecting aqueous solubility.
+        decoder: |
+          You are a mechanism decoder for Delaney (ESOL) water solubility dataset.
+          Generate a mechanism using SMILES-derived molecular properties (NOT ECFP bits).
+          Solubility increases with polar/hydrophilic groups, decreases with molecular weight and hydrophobicity.
+      
+      lipo:
+        encoder: |
+          You are a mechanism encoder for Lipophilicity (LogP) molecular dataset.
+          This dataset predicts octanol-water partition coefficient (LogP) from molecular structures.
+          LogP measures how well a molecule partitions between water and organic solvents.
+          Focus on:
+          - Hydrophobic groups (aromatic rings, aliphatic chains) increase LogP
+          - Hydrophilic groups (OH, COOH, NH2) decrease LogP
+          - Molecular size and flexibility affect partitioning
+          - Aromaticity contributes to lipophilicity
+        decoder: |
+          You are a mechanism decoder for Lipophilicity (LogP) molecular dataset.
+          Generate a mechanism that predicts LogP from SMILES molecular structures.
+          Use molecular properties from SMILES (molecular_weight, num_rings, num_hydroxyl_groups, etc.).
+          DO NOT use ECFP bit features. LogP increases with hydrophobicity, decreases with polar groups.
+      
+      lipophilicity:
+        encoder: |
+          You are a mechanism encoder for Lipophilicity (LogP) molecular dataset.
+          Predicts octanol-water partition coefficient from molecular structures.
+          Focus on hydrophobic vs hydrophilic molecular properties.
+        decoder: |
+          You are a mechanism decoder for Lipophilicity (LogP) molecular dataset.
+          Generate a mechanism using SMILES-derived molecular properties (NOT ECFP bits).
+          LogP increases with hydrophobic groups, decreases with polar/hydrophilic groups.
+      
+      hiv:
+        encoder: |
+          You are a mechanism encoder for HIV protease inhibition classification dataset.
+          This dataset predicts whether a molecule inhibits HIV protease (binary classification).
+          Focus on molecular properties relevant to protease inhibition:
+          - Molecular size and shape (protease active site fit)
+          - Hydrogen bonding groups (interact with protease residues)
+          - Aromatic rings (π-π interactions with protease)
+          - Functional groups that mimic peptide bonds
+        decoder: |
+          You are a mechanism decoder for HIV protease inhibition classification dataset.
+          Generate a mechanism that predicts inhibition (class 0 or 1) from SMILES molecular structures.
+          Use molecular properties from SMILES (molecular_weight, num_rings, num_nitrogen, etc.).
+          DO NOT use ECFP bit features. Consider molecular properties that enable protease binding.
+      
+      bace:
+        encoder: |
+          You are a mechanism encoder for BACE protein binding classification dataset.
+          This dataset predicts whether a molecule binds to BACE (β-secretase) protein (binary classification).
+          Focus on molecular properties relevant to protein binding:
+          - Molecular size and flexibility
+          - Hydrogen bonding capacity
+          - Aromatic and heteroaromatic groups
+          - Functional groups that interact with protein active sites
+        decoder: |
+          You are a mechanism decoder for BACE protein binding classification dataset.
+          Generate a mechanism that predicts binding (class 0 or 1) from SMILES molecular structures.
+          Use molecular properties from SMILES (molecular_weight, num_rings, num_oxygen, etc.).
+          DO NOT use ECFP bit features. Consider properties enabling protein-ligand interactions.
+      
+      tox21:
+        encoder: |
+          You are a mechanism encoder for Tox21 toxicity prediction classification dataset.
+          This multi-task dataset predicts various toxicity endpoints from molecular structures.
+          Focus on molecular properties associated with toxicity:
+          - Reactive functional groups (electrophiles, Michael acceptors)
+          - Aromatic systems (potential for DNA intercalation)
+          - Molecular weight and lipophilicity (affects bioavailability)
+          - Structural alerts for toxicity
+        decoder: |
+          You are a mechanism decoder for Tox21 toxicity prediction classification dataset.
+          Generate a mechanism that predicts toxicity (class 0 or 1) from SMILES molecular structures.
+          Use molecular properties from SMILES (molecular_weight, num_rings, num_halogen, etc.).
+          DO NOT use ECFP bit features. Consider structural features associated with toxicity.
+      
+      # =========================
+      # BIOTECH/EXPERIMENTAL REGRESSION DATASETS
+      # =========================
+      
+      gfp_yield:
+        encoder: |
+          You are a mechanism encoder for GFP (Green Fluorescent Protein) yield prediction in cell-free expression systems.
+          This dataset predicts GFP protein production yield from key experimental conditions:
+          - Temperature (deg C): Optimal temperature for transcription/translation machinery (typically 25-37°C)
+          - Potassium concentration (mM): Critical for ribosome stability and translation efficiency
+          - Magnesium concentration (mM): Essential cofactor for DNA polymerase, RNA polymerase, and ribosomes
+          - NTPs concentration (mM): Nucleotide triphosphates (ATP, GTP, CTP, UTP) required for transcription
+          - DNA concentration (nM): Template DNA concentration affecting transcription initiation
+          
+          KEY BIOCHEMICAL MECHANISMS:
+          - Temperature has an optimal range: too low slows kinetics, too high denatures enzymes
+          - Magnesium is required for multiple enzymes: DNA/RNA polymerases and ribosomes (typically 5-15 mM optimal)
+          - Potassium stabilizes ribosomes and affects translation efficiency (typically 50-200 mM)
+          - NTPs follow Michaelis-Menten kinetics: yield saturates at high NTP concentrations
+          - DNA concentration affects transcription initiation: low DNA limits yield, high DNA may cause resource competition
+          - Synergistic effects: Mg2+ and K+ work together to stabilize ribosomes
+          - Temperature-Mg2+ interaction: higher temperatures may require more Mg2+ for stability
+          
+          Focus on identifying:
+          - Optimal temperature profiles (inverse-U or Gaussian-like responses)
+          - Saturation effects for NTPs and DNA (Michaelis-Menten: V*S/(Km+S))
+          - Cofactor synergies (Mg2+ * K+ interactions)
+          - Threshold effects (minimum concentrations required)
+          - Resource competition at high DNA concentrations
+        decoder: |
+          You are a mechanism decoder for GFP yield prediction in cell-free expression systems.
+          
+          Generate a predictive mechanism formula that captures the biochemical processes:
+          
+          TEMPERATURE EFFECTS:
+          - Model optimal temperature range (typically 30-37°C for cell-free systems)
+          - Use inverse-U or Gaussian-like function: yield peaks at optimal temperature
+          - Example: exp(-((Temperature - T_opt)^2) / (2*sigma^2)) or similar
+          - Too low (<20°C): slow kinetics, too high (>40°C): enzyme denaturation
+          
+          MAGNESIUM EFFECTS:
+          - Essential cofactor with saturation kinetics
+          - Use Michaelis-Menten: Mg/(Km_Mg + Mg) where Km_Mg ~ 2-5 mM
+          - Too low (<2 mM): enzymes inactive, too high (>20 mM): may inhibit
+          - Typically optimal around 8-12 mM
+          
+          POTASSIUM EFFECTS:
+          - Stabilizes ribosomes and affects translation
+          - Use saturation: K/(Km_K + K) where Km_K ~ 50-100 mM
+          - Optimal typically 100-150 mM
+          - Can multiply with Mg for synergistic effect: (Mg/(Km_Mg+Mg)) * (K/(Km_K+K))
+          
+          NTPs EFFECTS:
+          - Nucleotides required for transcription
+          - Strong saturation: NTPs/(Km_NTP + NTPs) where Km_NTP ~ 0.5-1.5 mM
+          - Critical limiting factor at low concentrations
+          
+          DNA TEMPLATE EFFECTS:
+          - Transcription initiation depends on DNA concentration
+          - Use saturation: DNA/(Km_DNA + DNA) where Km_DNA ~ 5-15 nM
+          - At very high DNA (>50 nM): may cause resource competition (inverse relationship)
+          
+          INTERACTIONS TO MODEL:
+          - Temperature * Magnesium: higher temp needs more Mg for stability
+          - Magnesium * Potassium: synergistic ribosome stabilization
+          - NTPs * DNA: both needed for transcription (multiplicative)
+          - Temperature * NTPs: higher temp increases NTP consumption
+          
+          FORMULA STRUCTURE:
+          Start with base yield, then multiply by saturation terms and interaction terms:
+          ŷ = base_yield * temp_factor * (Mg/(Km_Mg+Mg)) * (K/(Km_K+K)) * (NTPs/(Km_NTP+NTPs)) * (DNA/(Km_DNA+DNA)) * interaction_terms
+          
+          Use actual feature names: "Temperature (deg C)", "Potassium concentration (mM)", "Magnesium concentration (mM)", "NTPs concentration (mM)", "DNA concentration (nM)"
+          
+          All values are scaled to [0, 1]. Adjust Km values accordingly (e.g., if Mg is scaled, Km_Mg should be ~0.08-0.12 for 8-12 mM).
+          
+          Output a formula that captures these biochemical relationships with appropriate coefficients and saturation constants.
+      
+      protein_expression:
+        encoder: |
+          You are a mechanism encoder for protein expression yield prediction dataset.
+          This dataset predicts protein production yield from cell-free expression system conditions.
+          Features include: NAD, folinic acid, CoA, nucleotide mix, spermidine, PGA, amino acids, tRNA, Mg-glutamate, cAMP, K-glutamate.
+          Focus on:
+          - Energy metabolism (NAD, ATP-related components)
+          - Cofactor availability (folinic acid, CoA)
+          - Translation machinery (tRNA, amino acids)
+          - Ionic conditions (Mg, K, glutamate)
+          - Saturation kinetics and component interactions
+        decoder: |
+          You are a mechanism decoder for protein expression yield prediction dataset.
+          Generate a mechanism that predicts yield from cell-free expression components.
+          Consider Michaelis-Menten saturation for substrates, cofactor enhancement, and ionic effects.
+          Formula should capture: yield = f(NAD, cofactors, tRNA, amino acids, ions) with saturation and synergy terms.
+      
+      dataset_102:
+        encoder: |
+          You are a mechanism encoder for Dataset 102 (protein expression).
+          This is a protein expression yield dataset with train/test split.
+          Focus on cell-free expression system components and their interactions.
+        decoder: |
+          You are a mechanism decoder for Dataset 102 (protein expression).
+          Generate a mechanism for protein yield prediction from expression system components.
+          Consider saturation kinetics, cofactor effects, and component synergies.
+      
+      # =========================
+      # ENZYME DATASETS (Biological/Biotech)
+      # =========================
+      # Note: Enzyme datasets use SEQ (protein sequences) and SUBSTRATES (SMILES) as inputs
+      
+      aminotransferase:
+        encoder: |
+          You are a mechanism encoder for aminotransferase enzyme activity dataset.
+          This dataset predicts enzyme activity from protein sequences (SEQ) and substrate structures (SUBSTRATES).
+          Focus on:
+          - Sequence features: length, amino acid composition, charged/polar/hydrophobic residues
+          - Substrate features: molecular weight, rings, functional groups
+          - Sequence-substrate compatibility
+          - Enzyme-substrate binding interactions
+        decoder: |
+          You are a mechanism decoder for aminotransferase enzyme activity dataset.
+          Generate a mechanism using sequence features (SEQ) and substrate properties (SUBSTRATES).
+          Consider how sequence composition and substrate structure affect enzyme activity.
+      
+      olea:
+        encoder: |
+          You are a mechanism encoder for olea enzyme activity dataset.
+          Predicts enzyme activity from protein sequences and substrate structures.
+          Focus on sequence-substrate interactions and compatibility.
+        decoder: |
+          You are a mechanism decoder for olea enzyme activity dataset.
+          Generate a mechanism using SEQ and SUBSTRATES features to predict activity.
+      
+      halogenase_nabr:
+        encoder: |
+          You are a mechanism encoder for halogenase (NaBr) enzyme activity dataset.
+          Predicts halogenation activity with sodium bromide as cofactor.
+          Focus on sequence features and substrate-halogenase compatibility.
+        decoder: |
+          You are a mechanism decoder for halogenase (NaBr) enzyme activity dataset.
+          Generate a mechanism for halogenation activity prediction from SEQ and SUBSTRATES.
+      
+      halogenase_nacl:
+        encoder: |
+          You are a mechanism encoder for halogenase (NaCl) enzyme activity dataset.
+          Predicts halogenation activity with sodium chloride as cofactor.
+          Focus on sequence-substrate interactions for halogenation.
+        decoder: |
+          You are a mechanism decoder for halogenase (NaCl) enzyme activity dataset.
+          Generate a mechanism for halogenation activity from SEQ and SUBSTRATES features.
+      
+      phosphatase_achiral:
+        encoder: |
+          You are a mechanism encoder for phosphatase (achiral) enzyme activity dataset.
+          Predicts phosphatase activity for achiral substrates.
+          Focus on sequence features and substrate properties affecting dephosphorylation.
+        decoder: |
+          You are a mechanism decoder for phosphatase (achiral) enzyme activity dataset.
+          Generate a mechanism using SEQ and SUBSTRATES to predict phosphatase activity.
+      
+      phosphatase_chiral:
+        encoder: |
+          You are a mechanism encoder for phosphatase (chiral) enzyme activity dataset.
+          Predicts phosphatase activity for chiral substrates.
+          Consider stereochemistry effects on enzyme-substrate interactions.
+        decoder: |
+          You are a mechanism decoder for phosphatase (chiral) enzyme activity dataset.
+          Generate a mechanism for chiral substrate dephosphorylation from SEQ and SUBSTRATES.
+      
+      davis:
+        encoder: |
+          You are a mechanism encoder for Davis kinase binding dataset.
+          Predicts protein-kinase binding affinity (Kd) from sequences and structures.
+          Focus on kinase-substrate recognition and binding interactions.
+        decoder: |
+          You are a mechanism decoder for Davis kinase binding dataset.
+          Generate a mechanism predicting binding affinity from sequence and structural features.
+      
+      # =========================
+      # TABARENA REGRESSION DATASETS
+      # =========================
+      
+      diabetes:
+        encoder: |
+          You are a mechanism encoder for diabetes regression dataset.
+          Predicts disease progression from patient features (age, BMI, blood pressure, etc.).
+          Focus on physiological relationships between features and disease progression.
+        decoder: |
+          You are a mechanism decoder for diabetes regression dataset.
+          Generate a mechanism that predicts disease progression from patient features.
+          Consider linear and non-linear relationships between physiological variables.
+      
+      housing:
+        encoder: |
+          You are a mechanism encoder for California housing price regression dataset.
+          Predicts median house values from location, demographics, and property features.
+          Focus on spatial, economic, and property characteristics affecting prices.
+        decoder: |
+          You are a mechanism decoder for California housing price regression dataset.
+          Generate a mechanism predicting house prices from location, demographics, and property features.
+          Consider non-linear effects of location, income, and property characteristics.
+      
+      bike:
+        encoder: |
+          You are a mechanism encoder for bike sharing regression dataset.
+          Predicts bike rental counts from temporal, weather, and seasonal features.
+          Focus on temporal patterns, weather effects, and seasonal trends.
+        decoder: |
+          You are a mechanism decoder for bike sharing regression dataset.
+          Generate a mechanism predicting rental counts from time, weather, and seasonal features.
+          Consider cyclical patterns (daily, weekly, seasonal) and weather interactions.
+      
+      insurance:
+        encoder: |
+          You are a mechanism encoder for insurance charges regression dataset.
+          Predicts medical insurance charges from patient demographics and health features.
+          Focus on age, BMI, smoking, region, and their interactions affecting costs.
+        decoder: |
+          You are a mechanism decoder for insurance charges regression dataset.
+          Generate a mechanism predicting insurance charges from demographics and health features.
+          Consider age effects, BMI-health interactions, and regional cost differences.
+      
+      concrete:
+        encoder: |
+          You are a mechanism encoder for concrete strength regression dataset.
+          Predicts concrete compressive strength from component proportions and age.
+          Focus on material composition ratios and curing time effects.
+        decoder: |
+          You are a mechanism decoder for concrete strength regression dataset.
+          Generate a mechanism predicting strength from component proportions and age.
+          Consider non-linear mixing effects and time-dependent strength development.
+      
+      energy:
+        encoder: |
+          You are a mechanism encoder for energy efficiency regression dataset.
+          Predicts heating/cooling loads from building characteristics.
+          Focus on building geometry, insulation, glazing, and orientation effects.
+        decoder: |
+          You are a mechanism decoder for energy efficiency regression dataset.
+          Generate a mechanism predicting energy loads from building features.
+          Consider geometric, material, and orientation effects on thermal performance.
+      
+      # =========================
+      # TABARENA CLASSIFICATION DATASETS
+      # =========================
+      
+      car:
+        encoder: |
+          You are a mechanism encoder for car evaluation classification dataset.
+          Predicts car acceptability (unacc, acc, good, vgood) from features like buying price, maintenance, doors, persons, luggage, safety.
+          Focus on feature interactions and decision boundaries between acceptability classes.
+        decoder: |
+          You are a mechanism decoder for car evaluation classification dataset.
+          Generate a mechanism that predicts car acceptability class from feature values.
+          Consider thresholds and interactions between price, maintenance, capacity, and safety features.
+      
+      iris:
+        encoder: |
+          You are a mechanism encoder for iris flower classification dataset.
+          Predicts iris species (setosa, versicolor, virginica) from sepal/petal length and width.
+          Focus on geometric relationships and decision boundaries between species.
+        decoder: |
+          You are a mechanism decoder for iris flower classification dataset.
+          Generate a mechanism predicting iris species from sepal and petal measurements.
+          Consider geometric relationships and thresholds separating the three species.
+      
+      wine:
+        encoder: |
+          You are a mechanism encoder for wine classification dataset.
+          Predicts wine class from chemical composition (alcohol, acidity, phenols, etc.).
+          Focus on chemical profiles and decision boundaries between wine classes.
+        decoder: |
+          You are a mechanism decoder for wine classification dataset.
+          Generate a mechanism predicting wine class from chemical composition features.
+          Consider thresholds and interactions between chemical components.
+      
+      adult:
+        encoder: |
+          You are a mechanism encoder for adult income classification dataset.
+          Predicts income level (>50K or <=50K) from demographics, education, occupation, etc.
+          Focus on socioeconomic relationships and decision boundaries.
+        decoder: |
+          You are a mechanism decoder for adult income classification dataset.
+          Generate a mechanism predicting income level from demographic and employment features.
+          Consider thresholds and interactions between age, education, occupation, and hours worked.
+      
+      mushroom:
+        encoder: |
+          You are a mechanism encoder for mushroom classification dataset.
+          Predicts edibility (edible/poisonous) from physical characteristics (cap, stalk, odor, etc.).
+          Focus on morphological features and decision rules for edibility.
+        decoder: |
+          You are a mechanism decoder for mushroom classification dataset.
+          Generate a mechanism predicting edibility from physical characteristics.
+          Consider categorical features and their combinations affecting edibility.
+      
+      # =========================
+      # SYNTHETIC DATASETS
+      # =========================
+      
+      synthetic5:
+        encoder: |
+          You are a mechanism encoder for synthetic 5-class classification dataset.
+          This is a synthetic dataset with 5 classes and multiple informative features.
+          Focus on feature interactions and non-linear decision boundaries between classes.
+        decoder: |
+          You are a mechanism decoder for synthetic 5-class classification dataset.
+          Generate a mechanism that predicts class (0-4) from feature values.
+          Consider non-linear interactions and decision boundaries between the 5 classes.
+      
+      # Additional Enzyme Datasets
+      nitrilase:
+        encoder: |
+          You are a mechanism encoder for nitrilase enzyme activity dataset.
+          Predicts nitrilase activity from protein sequences and substrate structures.
+          Focus on sequence-substrate compatibility for nitrile hydrolysis.
+        decoder: |
+          You are a mechanism decoder for nitrilase enzyme activity dataset.
+          Generate a mechanism using SEQ and SUBSTRATES to predict nitrilase activity.
+      
+      esterase:
+        encoder: |
+          You are a mechanism encoder for esterase enzyme activity dataset.
+          Predicts esterase activity from sequences and substrates.
+          Focus on ester hydrolysis mechanisms and substrate specificity.
+        decoder: |
+          You are a mechanism decoder for esterase enzyme activity dataset.
+          Generate a mechanism predicting esterase activity from SEQ and SUBSTRATES features.
+      
+      duf:
+        encoder: |
+          You are a mechanism encoder for DUF enzyme activity dataset.
+          Predicts activity for DUF (Domain of Unknown Function) enzymes.
+          Focus on sequence features and substrate interactions.
+        decoder: |
+          You are a mechanism decoder for DUF enzyme activity dataset.
+          Generate a mechanism using SEQ and SUBSTRATES to predict DUF enzyme activity.
+      
+      gt_donors_achiral:
+        encoder: |
+          You are a mechanism encoder for glycosyltransferase (achiral donors) dataset.
+          Predicts GT activity for achiral donor substrates.
+          Focus on sequence-donor compatibility for glycosylation.
+        decoder: |
+          You are a mechanism decoder for GT (achiral donors) enzyme activity dataset.
+          Generate a mechanism predicting glycosyltransferase activity from SEQ and SUBSTRATES.
+      
+      gt_donors_chiral:
+        encoder: |
+          You are a mechanism encoder for glycosyltransferase (chiral donors) dataset.
+          Predicts GT activity for chiral donor substrates.
+          Consider stereochemistry effects on glycosylation.
+        decoder: |
+          You are a mechanism decoder for GT (chiral donors) enzyme activity dataset.
+          Generate a mechanism for chiral donor glycosylation from SEQ and SUBSTRATES.
+      
+      gt_acceptors_achiral:
+        encoder: |
+          You are a mechanism encoder for glycosyltransferase (achiral acceptors) dataset.
+          Predicts GT activity for achiral acceptor substrates.
+          Focus on acceptor specificity and sequence compatibility.
+        decoder: |
+          You are a mechanism decoder for GT (achiral acceptors) enzyme activity dataset.
+          Generate a mechanism predicting GT activity from SEQ and SUBSTRATES features.
+      
+      gt_acceptors_chiral:
+        encoder: |
+          You are a mechanism encoder for glycosyltransferase (chiral acceptors) dataset.
+          Predicts GT activity for chiral acceptor substrates.
+          Consider stereochemistry in acceptor recognition.
+        decoder: |
+          You are a mechanism decoder for GT (chiral acceptors) enzyme activity dataset.
+          Generate a mechanism for chiral acceptor glycosylation from SEQ and SUBSTRATES.
+      
+      # Additional TabArena Regression Datasets
+      airfoil:
+        encoder: |
+          You are a mechanism encoder for airfoil self-noise regression dataset.
+          Predicts sound pressure level from airfoil geometry and flow conditions.
+          Focus on aerodynamic relationships and noise generation mechanisms.
+        decoder: |
+          You are a mechanism decoder for airfoil self-noise regression dataset.
+          Generate a mechanism predicting sound pressure from airfoil geometry and flow features.
+      
+      yacht:
+        encoder: |
+          You are a mechanism encoder for yacht hydrodynamics regression dataset.
+          Predicts yacht resistance from hull geometry and Froude number.
+          Focus on hydrodynamic relationships and geometric effects.
+        decoder: |
+          You are a mechanism decoder for yacht hydrodynamics regression dataset.
+          Generate a mechanism predicting resistance from hull geometry and flow conditions.
+      
+      auto:
+        encoder: |
+          You are a mechanism encoder for auto MPG regression dataset.
+          Predicts fuel efficiency (MPG) from vehicle characteristics (cylinders, displacement, horsepower, weight, etc.).
+          Focus on engine and vehicle design relationships affecting fuel economy.
+        decoder: |
+          You are a mechanism decoder for auto MPG regression dataset.
+          Generate a mechanism predicting MPG from vehicle characteristics.
+          Consider engine size, weight, and design features affecting efficiency.
+      
+      abalone:
+        encoder: |
+          You are a mechanism encoder for abalone age regression dataset.
+          Predicts abalone age from physical measurements (length, diameter, height, weight, etc.).
+          Focus on growth relationships and morphological features.
+        decoder: |
+          You are a mechanism decoder for abalone age regression dataset.
+          Generate a mechanism predicting age from physical measurements.
+          Consider growth patterns and size relationships.
+      
+      winequality:
+        encoder: |
+          You are a mechanism encoder for wine quality regression dataset.
+          Predicts wine quality score from chemical composition (acidity, sugar, alcohol, etc.).
+          Focus on chemical profiles and quality relationships.
+        decoder: |
+          You are a mechanism decoder for wine quality regression dataset.
+          Generate a mechanism predicting quality score from chemical composition.
+          Consider interactions between acidity, alcohol, sugar, and other components.
+      
+      students:
+        encoder: |
+          You are a mechanism encoder for student performance regression dataset.
+          Predicts student performance from demographics, school, and study features.
+          Focus on educational and socioeconomic relationships.
+        decoder: |
+          You are a mechanism decoder for student performance regression dataset.
+          Generate a mechanism predicting performance from student and school features.
+          Consider demographic, educational, and study habit effects.
+      
+      diamonds:
+        encoder: |
+          You are a mechanism encoder for diamond price regression dataset.
+          Predicts diamond price from carat, cut, color, clarity, and dimensions.
+          Focus on gemological relationships and quality factors.
+        decoder: |
+          You are a mechanism decoder for diamond price regression dataset.
+          Generate a mechanism predicting price from carat, cut, color, clarity, and dimensions.
+          Consider quality grades and size effects on value.
+      
+      house-prices:
+        encoder: |
+          You are a mechanism encoder for house prices regression dataset.
+          Predicts house prices from property features, location, and market conditions.
+          Focus on real estate valuation relationships.
+        decoder: |
+          You are a mechanism decoder for house prices regression dataset.
+          Generate a mechanism predicting prices from property and location features.
+          Consider size, condition, location, and market factors.
+      
+      airbnb:
+        encoder: |
+          You are a mechanism encoder for Airbnb price regression dataset.
+          Predicts rental prices from property features, location, and amenities.
+          Focus on accommodation valuation relationships.
+        decoder: |
+          You are a mechanism decoder for Airbnb price regression dataset.
+          Generate a mechanism predicting rental prices from property and location features.
+          Consider size, amenities, location, and market factors.
+      
+      # Additional TabArena Classification Datasets
+      zoo:
+        encoder: |
+          You are a mechanism encoder for zoo animal classification dataset.
+          Predicts animal class from physical and behavioral features.
+          Focus on morphological and behavioral characteristics.
+        decoder: |
+          You are a mechanism decoder for zoo animal classification dataset.
+          Generate a mechanism predicting animal class from physical and behavioral features.
+      
+      glass:
+        encoder: |
+          You are a mechanism encoder for glass type classification dataset.
+          Predicts glass type from chemical composition (Na, Mg, Al, Si, etc.).
+          Focus on chemical profiles and glass classification rules.
+        decoder: |
+          You are a mechanism decoder for glass type classification dataset.
+          Generate a mechanism predicting glass type from chemical composition.
+      
+      vehicle:
+        encoder: |
+          You are a mechanism encoder for vehicle silhouette classification dataset.
+          Predicts vehicle type from shape features extracted from silhouettes.
+          Focus on geometric and shape relationships.
+        decoder: |
+          You are a mechanism decoder for vehicle silhouette classification dataset.
+          Your task is to generate a descriptive, text-based mechanism that clearly explains how to classify vehicles into types: bus, opel, saab, and van.
+          
+          CRITICAL REQUIREMENTS:
+          1. Start with a clear, descriptive text explanation (2-4 sentences) that describes:
+             - The classification task: predicting vehicle type from shape features
+             - Which geometric features are most important for distinguishing vehicle types
+             - How the mechanism uses these features to make classification decisions
+             - Specific decision rules that separate bus, opel, saab, and van
+          
+          2. Explain the classification logic in plain language:
+             - Describe how different feature values (e.g., ELONGATEDNESS, RADIUS_RATIO, CIRCULARITY) relate to different vehicle types
+             - Explain decision boundaries (e.g., "vehicles with high ELONGATEDNESS are typically buses or vans")
+             - Describe how the mechanism handles edge cases or ambiguous examples
+          
+          3. After the descriptive text, provide an executable formula that implements the classification logic
+          
+          FORMAT:
+          MECHANISM DESCRIPTION:
+          [2-4 sentences clearly describing the classification task and how features are used to distinguish between bus, opel, saab, and van]
+          
+          FORMULA: [executable formula that implements the described logic]
+          
+          EXAMPLE:
+          MECHANISM DESCRIPTION:
+          This mechanism classifies vehicles into four types (bus, opel, saab, van) based on geometric shape features extracted from silhouettes. The mechanism uses ELONGATEDNESS as the primary discriminator: vehicles with very high ELONGATEDNESS (indicating a long, stretched shape) are classified as buses or vans. For vehicles with moderate ELONGATEDNESS, the mechanism uses RADIUS_RATIO and CIRCULARITY to distinguish between opel and saab - opel vehicles typically have lower RADIUS_RATIO values while saab vehicles have higher values. The mechanism applies non-linear transformations to capture saturation effects where extreme feature values have diminishing impact on classification.
+          
+          FORMULA: [your executable formula]
+      
+      soybean:
+        encoder: |
+          You are a mechanism encoder for soybean disease classification dataset.
+          Predicts disease type from plant characteristics and symptoms.
+          Focus on disease symptom patterns and plant features.
+        decoder: |
+          You are a mechanism decoder for soybean disease classification dataset.
+          Generate a mechanism predicting disease type from plant characteristics.
+      
+      primary-tumor:
+        encoder: |
+          You are a mechanism encoder for primary tumor classification dataset.
+          Predicts tumor type from patient and tumor characteristics.
+          Focus on medical relationships and tumor classification rules.
+        decoder: |
+          You are a mechanism decoder for primary tumor classification dataset.
+          Generate a mechanism predicting tumor type from patient and tumor features.
+      
+      lymphography:
+        encoder: |
+          You are a mechanism encoder for lymphography classification dataset.
+          Predicts lymph node status from medical imaging features.
+          Focus on imaging characteristics and diagnostic relationships.
+        decoder: |
+          You are a mechanism decoder for lymphography classification dataset.
+          Generate a mechanism predicting lymph node status from imaging features.
+      
+      ecoli:
+        encoder: |
+          You are a mechanism encoder for E. coli protein localization classification dataset.
+          Predicts protein localization site from sequence features.
+          Focus on sequence motifs and localization signals.
+        decoder: |
+          You are a mechanism decoder for E. coli protein localization classification dataset.
+          Generate a mechanism predicting localization site from sequence features.
+      
+      credit:
+        encoder: |
+          You are a mechanism encoder for credit approval classification dataset.
+          Predicts credit approval from financial and demographic features.
+          Focus on creditworthiness relationships and decision rules.
+        decoder: |
+          You are a mechanism decoder for credit approval classification dataset.
+          Generate a mechanism predicting credit approval from financial features.
+      
+      vote:
+        encoder: |
+          You are a mechanism encoder for congressional voting classification dataset.
+          Predicts party affiliation from voting records on key issues.
+          Focus on voting pattern relationships and political alignment.
+        decoder: |
+          You are a mechanism decoder for congressional voting classification dataset.
+          Generate a mechanism predicting party affiliation from voting records.
+      
+      bank:
+        encoder: |
+          You are a mechanism encoder for bank marketing classification dataset.
+          Predicts subscription (yes/no) from customer demographics and campaign features.
+          Focus on customer behavior and marketing relationships.
+        decoder: |
+          You are a mechanism decoder for bank marketing classification dataset.
+          Generate a mechanism predicting subscription from customer and campaign features.
+      
+      spaceship:
+        encoder: |
+          You are a mechanism encoder for spaceship titanic classification dataset.
+          Predicts transport status from passenger features and ship conditions.
+          Focus on survival relationships and transport rules.
+        decoder: |
+          You are a mechanism decoder for spaceship titanic classification dataset.
+          Generate a mechanism predicting transport status from passenger features.
+      
+      breast-cancer:
+        encoder: |
+          You are a mechanism encoder for breast cancer classification dataset.
+          Predicts cancer diagnosis from tumor characteristics and patient features.
+          Focus on medical relationships and diagnostic rules.
+        decoder: |
+          You are a mechanism decoder for breast cancer classification dataset.
+          Generate a mechanism predicting diagnosis from tumor and patient features.
+      
+      digits:
+        encoder: |
+          You are a mechanism encoder for handwritten digits classification dataset.
+          Predicts digit class (0-9) from pixel features of digit images.
+          Focus on pattern recognition and geometric relationships.
+        decoder: |
+          You are a mechanism decoder for handwritten digits classification dataset.
+          Generate a mechanism predicting digit class from pixel features.
+      
+      heart:
+        encoder: |
+          You are a mechanism encoder for heart disease classification dataset.
+          Predicts heart disease presence from patient health and lifestyle features.
+          Focus on cardiovascular health relationships.
+        decoder: |
+          You are a mechanism decoder for heart disease classification dataset.
+          Generate a mechanism predicting heart disease from health features.
+      
+      stroke:
+        encoder: |
+          You are a mechanism encoder for stroke prediction classification dataset.
+          Predicts stroke risk from patient demographics and health features.
+          Focus on stroke risk factors and medical relationships.
+        decoder: |
+          You are a mechanism decoder for stroke prediction classification dataset.
+          Generate a mechanism predicting stroke risk from patient features.
 
   # =========================
   # FEW-SHOT EXAMPLES

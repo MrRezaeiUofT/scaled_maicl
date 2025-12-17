@@ -57,13 +57,28 @@ except ImportError:
 
 class TextGrad:
     """TextGrad optimizer for textual mechanism refinement"""
-    def __init__(self, batched_llm, task_type: str = "regression", feature_cols: Optional[List[str]] = None, dataset_name: Optional[str] = None, class_names: Optional[List[str]] = None, config_path: Optional[str] = None):
+    def __init__(self, batched_llm, task_type: str = "regression", feature_cols: Optional[List[str]] = None, dataset_name: Optional[str] = None, class_names: Optional[List[str]] = None, config_path: Optional[str] = None, scale_min: Optional[float] = None, scale_max: Optional[float] = None, use_scaling: bool = True):
         self.llm = batched_llm
         self.task_type = task_type
         self.feature_cols = feature_cols
         self.dataset_name = dataset_name
         self.class_names = class_names
         self.config = self._load_config(config_path)
+        self.use_scaling = use_scaling  # Flag to indicate if scaling is enabled
+        # Store scale range for output clipping (defaults to [0, 1] if not provided)
+        # Always set scale_min and scale_max, even for classification (needed for template formatting)
+        try:
+            from maicl_config import SCALE_MIN, SCALE_MAX
+            self.scale_min = scale_min if scale_min is not None else SCALE_MIN
+            self.scale_max = scale_max if scale_max is not None else SCALE_MAX
+        except ImportError:
+            self.scale_min = scale_min if scale_min is not None else 0.0
+            self.scale_max = scale_max if scale_max is not None else 1.0
+        # Ensure they are never None (fallback to defaults)
+        if self.scale_min is None:
+            self.scale_min = 0.0
+        if self.scale_max is None:
+            self.scale_max = 1.0
     
     def _load_config(self, config_path: Optional[str] = None) -> Dict[str, Any]:
         """Load configuration from YAML file"""
@@ -262,7 +277,18 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
         
         if is_deepchem_feedback and has_smiles_feedback:
             # For DeepChem: provide molecular property guidance instead of ECFP bit correlations
-            deepchem_guidance = self.config.get('templates', {}).get('error_feedback', {}).get('deepchem_molecular_guidance', "")
+            deepchem_guidance_template = self.config.get('templates', {}).get('error_feedback', {}).get('deepchem_molecular_guidance', "")
+            # Format with scale information if placeholders are present
+            try:
+                deepchem_guidance = deepchem_guidance_template.format(
+                    scale_min=self.scale_min,
+                    scale_max=self.scale_max
+                )
+            except (KeyError, ValueError):
+                # If formatting fails, use template as-is and append scale info
+                deepchem_guidance = deepchem_guidance_template
+                if self.use_scaling:
+                    deepchem_guidance += f"\n\nCRITICAL: All outputs must be clipped to [{self.scale_min}, {self.scale_max}] using clip(expression, {self.scale_min}, {self.scale_max})"
             feedback += deepchem_guidance
         else:
             # For other datasets: show feature correlations as usual
@@ -726,20 +752,45 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
         dataset_lower = self.dataset_name.lower() if self.dataset_name else ""
         features_str = ', '.join(self.feature_cols) if self.feature_cols else 'input features'
         
+        # Get scale range information for output
+        if self.use_scaling:
+            scale_range_str = f"[{self.scale_min}, {self.scale_max}]"
+            scale_info = f"All data (inputs and outputs) are scaled to {scale_range_str} range."
+        else:
+            scale_range_str = "raw/unscaled"
+            scale_info = "Data is NOT normalized; use raw/unscaled feature and target values."
+        
         # Get dataset contexts from config
         dataset_contexts = self.config.get('templates', {}).get('dataset_contexts', {})
         
         # Match dataset name
         for key, template in dataset_contexts.items():
             if key != 'generic' and key in dataset_lower:
-                # Format template with features
+                # Format template with features and scale info
                 if key == 'enzyme':
                     features_str = ', '.join(self.feature_cols) if self.feature_cols else 'enzyme kinetic parameters'
                 elif key == 'protein':
                     features_str = ', '.join(self.feature_cols) if self.feature_cols else 'expression system parameters'
                 elif key == 'concrete':
                     features_str = ', '.join(self.feature_cols) if self.feature_cols else 'concrete composition parameters'
-                return template.format(features=features_str)
+                # Try to format with scale info, fallback if not in template
+                try:
+                    return template.format(features=features_str, scale_min=self.scale_min, scale_max=self.scale_max, scale_range=scale_range_str, scale_info=scale_info)
+                except (KeyError, ValueError) as e:
+                    # If template doesn't have all placeholders, try with just features first
+                    try:
+                        formatted = template.format(features=features_str)
+                        # Check if there are still unformatted placeholders
+                        if '{scale_min}' in formatted or '{scale_max}' in formatted:
+                            # Replace any remaining scale placeholders
+                            formatted = formatted.replace('{scale_min}', str(self.scale_min))
+                            formatted = formatted.replace('{scale_max}', str(self.scale_max))
+                            formatted = formatted.replace('{scale_range}', scale_range_str)
+                            formatted = formatted.replace('{scale_info}', scale_info)
+                        return formatted + f"\n\nCRITICAL SCALING INFORMATION:\n{scale_info}\nOutput must be clipped to {scale_range_str}."
+                    except (KeyError, ValueError):
+                        # Last resort: just append scale info
+                        return template + f"\n\nCRITICAL SCALING INFORMATION:\n{scale_info}\nOutput must be clipped to {scale_range_str}."
         
         # Generic fallback
         generic_template = dataset_contexts.get('generic', 
@@ -749,9 +800,17 @@ OPTIMIZATION GUIDANCE:
 - Use actual feature names (not generic x1, x2, etc.)
 - Model nonlinear effects (saturation, thresholds, synergies)
 - Include domain-relevant interactions
-- Ensure output stays in valid range [0, 10]
+- {scale_info}
+- Ensure output stays in valid range {scale_range}
 """)
-        return generic_template.format(dataset_name=self.dataset_name, features=features_str)
+        return generic_template.format(
+            dataset_name=self.dataset_name, 
+            features=features_str,
+            scale_min=self.scale_min,
+            scale_max=self.scale_max,
+            scale_range=scale_range_str,
+            scale_info=scale_info
+        )
     
     def optimize_batch_single_call(self, mechanisms: List[str], error_feedbacks: List[str],
                                    ml_residuals: Optional[np.ndarray] = None,
@@ -897,20 +956,58 @@ OPTIMIZATION GUIDANCE:
             # Build optimization prompt
             main_template = self.config.get('prompts', {}).get('optimization', {}).get('main_template', "")
             formula_instructions = self.config.get('formula_instructions', {})
-            formula_instruction = formula_instructions.get(
-                'classification' if self.task_type == "classification" else 'regression',
-                "- For regression: Clipped to [0, 10]"
-            )
+            if self.task_type == "classification":
+                formula_instruction = formula_instructions.get(
+                    'classification',
+                    "- For classification: Formula MUST output a CLASS INDEX (integer: 0, 1, 2, ...), NOT a probability or continuous value. Use thresholds, argmax, or conditional logic as needed."
+                )
+            else:
+                # For regression, use actual scale range instead of hardcoded [0, 10]
+                if self.use_scaling:
+                    default_regression = f"- For regression: Clipped to [{self.scale_min}, {self.scale_max}]"
+                else:
+                    default_regression = "- For regression: Output numeric values (no clipping, use raw/unscaled values)"
+                formula_instruction = formula_instructions.get('regression', default_regression)
+                # If the config has a template with {scale_min} and {scale_max}, format it
+                # This handles both old configs (hardcoded [0, 10]) and new configs (with placeholders)
+                try:
+                    if '{scale_min}' in formula_instruction or '{scale_max}' in formula_instruction:
+                        formula_instruction = formula_instruction.format(scale_min=self.scale_min, scale_max=self.scale_max)
+                except (KeyError, ValueError):
+                    # If formatting fails (e.g., old config without placeholders), use default
+                    formula_instruction = default_regression
             
-            prompt = main_template.format(
-                dataset_context=dataset_context,
-                iteration_history_context=iteration_history_context,
-                mechanism=mechanism,
-                error_feedback=error_feedback,
-                class_dist_context=class_dist_context,
-                feature_instruction=feature_instruction,
-                formula_instruction=formula_instruction
-            )
+            # Format main_template with all required placeholders
+            # Handle both old templates (without scale placeholders) and new ones (with scale placeholders)
+            # Ensure scale_min and scale_max are always set (not None)
+            scale_min_val = self.scale_min if self.scale_min is not None else 0.0
+            scale_max_val = self.scale_max if self.scale_max is not None else 1.0
+            
+            # Replace any unformatted scale placeholders in sub-strings to prevent KeyError
+            # This handles cases where dataset_context or other strings have unformatted placeholders
+            dataset_context = str(dataset_context).replace('{scale_min}', str(scale_min_val)).replace('{scale_max}', str(scale_max_val))
+            feature_instruction = str(feature_instruction).replace('{scale_min}', str(scale_min_val)).replace('{scale_max}', str(scale_max_val))
+            formula_instruction = str(formula_instruction).replace('{scale_min}', str(scale_min_val)).replace('{scale_max}', str(scale_max_val))
+            
+            format_kwargs = {
+                'dataset_context': dataset_context,
+                'iteration_history_context': iteration_history_context,
+                'mechanism': mechanism,
+                'error_feedback': error_feedback,
+                'class_dist_context': class_dist_context,
+                'feature_instruction': feature_instruction,
+                'formula_instruction': formula_instruction,
+                'scale_min': scale_min_val,
+                'scale_max': scale_max_val
+            }
+            try:
+                prompt = main_template.format(**format_kwargs)
+            except KeyError as e:
+                # If template has placeholders we don't recognize, log and re-raise
+                # This helps identify missing placeholders in templates
+                logger.warning(f"Template formatting error: {e}. Missing placeholder in main_template?")
+                logger.warning(f"Available format_kwargs keys: {list(format_kwargs.keys())}")
+                raise
             prompts.append(HumanMessage(content=prompt))
         
         gradients = self.llm.invoke_batch(prompts)

@@ -83,6 +83,8 @@ from maicl_lib_v2 import (
     OUTPUT_DIR,
     find_optimal_threshold,
     create_result_visualizations,
+    SCALE_MIN,
+    SCALE_MAX,
 )
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -126,12 +128,48 @@ def load_openml_classification(dataset_name: str, max_samples: int):
     if not _HAS_OPENML:
         raise RuntimeError("OpenML not installed. pip install openml")
     dataset_ids = {
-        "car": 22, "iris": 61, "wine": 187, "zoo": 111, "glass": 1468, "vehicle": 54,
-        "soybean": 41, "primary-tumor": 47, "lymphography": 10, "ecoli": 40,
+        "car": 22, "iris": 61, "wine": 187, "zoo": 62, "glass": 1468, "vehicle": 54,
+        "soybean": 41, "lymphography": 10, "ecoli": 40,
         "adult": 1590, "credit": 31, "vote": 56, "mushroom": 24,
+        # Datasets with many classes (10+)
+        "letter": 6,  # 26 classes - Letter Recognition
+        "mfeat": 12,  # 10 classes - Multiple Features (mfeat-factors)
+        "pendigits": 32,  # 10 classes - Pen-based recognition of handwritten digits
+        "optdigits": 28,  # 10 classes - Optical recognition of handwritten digits
+        "avila": 1459,  # 12 classes - Avila dataset
+        "amazon": 1457,  # 50 classes - Amazon dataset
+        "plant-margin": 1491,  # 100 classes - One-hundred plants margin
+        "plant-shape": 1492,  # 100 classes - One-hundred plants shape
+        "plant-texture": 1493,  # 100 classes - One-hundred plants texture
+        # Gene expression cancer datasets
+        "leukemia": 1104,  # Leukemia classification (AML vs ALL) - 72 samples, 7129 genes
+        "colon-cancer": 1100,  # Colon cancer classification (tumor vs normal) - 62 samples, 2000 genes
+        "colon": 1100,  # Alias for colon-cancer
+        # Note: primary-tumor (ID 47) is private and requires authentication
+        # Note: TCGA (The Cancer Genome Atlas) datasets require dbGaP authentication and are not directly
+        #       accessible via OpenML. To use TCGA data, download from GDC (https://portal.gdc.cancer.gov/)
+        #       or GEO (https://www.ncbi.nlm.nih.gov/geo/) and create a custom loader function.
     }
     did = dataset_ids.get(dataset_name.lower(), 22)
-    ds = openml.datasets.get_dataset(did, download_data=True, download_qualities=True)
+    try:
+        ds = openml.datasets.get_dataset(did, download_data=True, download_qualities=True)
+    except Exception as e:
+        # Check if it's a private dataset error (handle both old and new exception types)
+        error_msg = str(e).lower()
+        if "private" in error_msg or "no access" in error_msg or "access granted" in error_msg:
+            raise RuntimeError(
+                f"Dataset '{dataset_name}' (OpenML ID {did}) is private and requires authentication. "
+                f"Please use a different dataset or configure OpenML authentication. "
+                f"Available public datasets: car, iris, wine, zoo, glass, vehicle, soybean, lymphography, ecoli, adult, credit, vote, mushroom, "
+                f"letter (26 classes), mfeat (10), pendigits (10), optdigits (10), avila (12), amazon (50), "
+                f"plant-margin (100), plant-shape (100), plant-texture (100), "
+                f"leukemia (gene expression), colon-cancer/colon (gene expression)"
+            ) from e
+        else:
+            raise RuntimeError(
+                f"Failed to load OpenML dataset '{dataset_name}' (ID {did}): {e}. "
+                f"Please check your internet connection and OpenML API access."
+            ) from e
     X, y, _, _ = ds.get_data(target=ds.default_target_attribute)
     if len(X) > max_samples:
         try:
@@ -807,12 +845,16 @@ def main():
     parser = argparse.ArgumentParser(description="MA-ICL classification runner with top-K residuals")
     parser.add_argument("--dataset", default="car", 
                         help="Classification dataset name. Options:\n"
-                             "  OpenML: car, iris, wine, zoo, glass, vehicle, soybean, primary-tumor, lymphography, ecoli, adult, credit, vote, mushroom\n"
-                             "  Synthetic: synthetic5\n"
+                             "  OpenML: car (4), iris (3), wine (3), zoo (7), glass (6), vehicle (4), soybean (19), lymphography (4), ecoli (8), adult (2), credit (2), vote (2), mushroom (2)\n"
+                             "  OpenML (many classes): letter (26), mfeat (10), pendigits (10), optdigits (10), avila (12), amazon (50), plant-margin (100), plant-shape (100), plant-texture (100)\n"
+                             "  OpenML (gene expression cancer):\n"
+                             "    - leukemia (2) - Leukemia classification (AML vs ALL), 72 samples, 7129 genes\n"
+                             "    - colon-cancer (2) or colon (2) - Colon cancer classification (tumor vs normal), 62 samples, 2000 genes\n"
+                             "  Synthetic: synthetic5 (5)\n"
                              "  TabArena (HuggingFace):\n"
-                             "    - adult, bank, income, wine, spaceship, default, booking, churn\n"
-                             "    - iris, breast-cancer, digits\n"
-                             "    - mushroom, diabetes, credit, heart, stroke, employee, telecom, customer\n"
+                             "    - adult (2), bank (2), income (2), wine (3), spaceship (2), default (2), booking (3), churn (2)\n"
+                             "    - iris (3), breast-cancer (2), digits (10)\n"
+                             "    - mushroom (2), diabetes (2), credit (2), heart (2), stroke (2), employee (2), telecom (2), customer (2)\n"
                              "  DeepChem (molecular classification):\n"
                              "    - hiv (HIV protease inhibition, binary)\n"
                              "    - bace (BACE protein binding, binary)\n"
@@ -838,14 +880,16 @@ def main():
                              "    - gt_acceptors_chiral_categorical")
     parser.add_argument("--model_name", default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash"),
                         help="Gemini model name, e.g., gemini-2.0-flash, gemini-2.0-pro")
-    parser.add_argument("--ml_mech", default="logreg", help="ML mechanism: logreg|xgboost|tabicl")
+    parser.add_argument("--ml_mech", default="linear", help="ML mechanism: logreg|xgboost|tabicl")
     parser.add_argument("--use_ml", type=int, default=1, choices=[0,1], help="Include ML mechanism in ensemble")
     parser.add_argument("--max_samples", type=int, default=200)
     parser.add_argument("--top_k", type=int, default=100, help="-1 to use full dataset")
     parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--use_test_for_acceptance", action="store_true",
-                        help="Use test set for acceptance evaluation instead of validation set. "
-                             "This helps ensure optimization generalizes to test set, but risks overfitting to test.")
+    parser.add_argument("--acceptance_set", type=str, default="test",
+                        choices=["test", "validation", "train"],
+                        help="Dataset to use for acceptance evaluation during training. "
+                             "Options: 'test' (risks overfitting to test), 'validation' (default), "
+                             "or 'train' (may overfit to training data).")
     parser.add_argument("--topk_strategy", choices=["residual", "residual_balanced"], default="residual_balanced",
                         help="Top-K selection: 'residual' = global highest | 'residual_balanced' = highest within class bins (default for classification)")
     parser.add_argument("--relax_eval", type=int, default=0, choices=[0,1],
@@ -856,9 +900,11 @@ def main():
                         help="Classification loss metric: 'f1' (F1 score) or 'acc'/'accuracy' (accuracy). Default: f1")
     parser.add_argument("--evaluate_individual_mechanisms", action="store_true",
                         help="After training, evaluate each mechanism individually on train/test sets")
-    parser.add_argument("--num_mechanisms_unknown", type=int, default=None,
+    parser.add_argument("--num_mechanisms_unknown", type=int, default=1,
                         help="Number of unknown mechanisms to generate (default: 1). "
                              "This controls how many LLM-based mechanisms are created to complement the ML mechanism.")
+    parser.add_argument("--no_scaling", action="store_true",
+                        help="If set, disables all feature scaling. Data will be used in its original range.")
     args = parser.parse_args()
 
     # Note: Classification loss metric is now configurable via --classification_loss argument
@@ -867,10 +913,36 @@ def main():
     # Resolve dataset
     ds_name = str(args.dataset).lower()
     
-    # Include ML baseline model name in output directory
-    ml_model_suffix = f"_ml{args.ml_mech}"
+    # Build comprehensive run name with all important arguments
+    # Start with base components
+    run_name_parts = [
+        "class",
+        ds_name,
+        f"ml{args.ml_mech}" if args.use_ml else "noML",
+        f"topk{args.top_k}",
+        f"iter{args.iterations}",
+        f"model{args.model_name.replace('-', '_').replace('.', '_')}",  # Sanitize model name for filesystem
+        f"loss{args.classification_loss}",
+        f"accept{args.acceptance_set}",
+        f"topkstrat{args.topk_strategy}",
+    ]
     
-    run_name = f"class_{ds_name}{ml_model_suffix}_topk{args.top_k}"
+    # Add optional flags and non-default values
+    if args.relax_eval:
+        run_name_parts.append("relax")
+    if args.num_mechanisms_unknown is not None and args.num_mechanisms_unknown > 1:
+        run_name_parts.append(f"nmech{args.num_mechanisms_unknown}")
+    if args.no_scaling:
+        run_name_parts.append("noscale")
+    if args.val_size != 0.2:  # Only include if non-default
+        run_name_parts.append(f"val{args.val_size:.2f}".replace('.', '_'))
+    if args.max_samples != 200:  # Only include if non-default
+        run_name_parts.append(f"maxsamp{args.max_samples}")
+    if args.evaluate_individual_mechanisms:
+        run_name_parts.append("evalindiv")
+    
+    # Join all parts with underscores
+    run_name = "_".join(run_name_parts)
     output_dir = set_output_dir(run_name)
     logger.info(f"Output directory: {output_dir}")
 
@@ -955,12 +1027,19 @@ def main():
     X_original_val = [X_original[i] for i in idx_va]
     X_original_test = [X_original[i] for i in idx_te]
 
-    # Scale features to [0,1]
-    scaler = MinMaxScaler010()
-    X_train_s = scaler.fit_transform(X_train)
-    X_val_s = scaler.transform(X_val)
-    X_test_s = scaler.transform(X_test)
-    validate_scaled_data(X_train_s, feature_cols, scaler=scaler)
+    # Conditionally scale features based on --no_scaling flag
+    if not args.no_scaling:
+        # Scale features to [0,1]
+        scaler = MinMaxScaler010()
+        X_train_s = scaler.fit_transform(X_train)
+        X_val_s = scaler.transform(X_val)
+        X_test_s = scaler.transform(X_test)
+        validate_scaled_data(X_train_s, feature_cols, scaler=scaler)
+        logger.info(f"Features scaled to [{SCALE_MIN}, {SCALE_MAX}] range (X min={X_train_s.min():.3f}, max={X_train_s.max():.3f})")
+    else:
+        logger.info("Scaling disabled: Using original feature values.")
+        scaler = None
+        X_train_s, X_val_s, X_test_s = X_train, X_val, X_test
 
     mech_map = {"logreg": "LogisticRegression", "xgboost": "XGBoost", "tabicl": "TabICL"}
     model_name = mech_map.get(args.ml_mech.lower(), "LogisticRegression")
@@ -1081,33 +1160,34 @@ def main():
             X_original_topk = X_original_train
             logger.info(f"Using full training set: {len(X_topk)} samples")
     
-    # CRITICAL: Ensure ML baseline and MA-ICL train on the SAME dataset and size
-    # Optionally retrain ML model on the same subset that MA-ICL will train on
-    # This ensures both models train on the same data for fair comparison
+    # ML model is FROZEN after initial training on full training set
+    # Compute residuals on the top-K subset using the frozen model (for MA-ICL training)
     if args.top_k != -1:
-        # Final validation before retraining: ensure at least 2 classes
+        # ML model stays frozen - trained once on full training set and never retrained
+        logger.info(f"[Data Alignment] ML model is FROZEN (trained on full training set: {len(X_train_s)} samples)")
+        logger.info(f"[Data Alignment] MA-ICL will train on {len(X_topk)} top-K samples, but ML model remains frozen")
+        
+        # Validate that selected subset has at least 2 classes (for classification)
         unique_classes_final = np.unique(y_topk)
         if len(unique_classes_final) < 2:
             raise ValueError(
-                f"Cannot retrain ML model: selected {len(X_topk)} samples contain only {len(unique_classes_final)} class(es): {unique_classes_final}. "
+                f"Selected {len(X_topk)} samples contain only {len(unique_classes_final)} class(es): {unique_classes_final}. "
                 f"Need at least 2 classes for classification. Try: (1) increasing --top_k, (2) using --topk_strategy residual_balanced, "
                 f"or (3) using --top_k -1 to use full training set."
             )
-        logger.info(f"[Data Alignment] Retraining ML model on the same {len(X_topk)} samples that MA-ICL will train on...")
-        logger.info(f"[Data Alignment] ML training set size: {len(X_topk)}, MA-ICL training set size: {len(X_topk)}")
         logger.info(f"[Data Alignment] Classes in selected set: {len(unique_classes_final)} classes: {unique_classes_final}")
-        pretrained_ml.train(X_topk, y_topk, feature_cols, y_scaler=None)
-        # Recompute residuals on the subset
+        
+        # Compute residuals on the subset using the frozen model (trained on full set)
         sorted_idx, residuals_topk, ml_preds, ml_proba = compute_ml_residuals(
             pretrained_ml, X_topk, y_topk, feature_cols, class_names, task_type="classification"
         )
-        logger.info(f"[Data Alignment] ✓ ML model and MA-ICL now train on the same {len(X_topk)} samples")
-        logger.info(f"[Data Alignment] Training data match: ML={len(X_topk)} samples, MA-ICL={len(X_topk)} samples")
+        logger.info(f"[Data Alignment] ✓ Computed residuals on top-K subset using frozen ML model (trained on full set)")
+        logger.info(f"[Data Alignment] Training data: ML=frozen on {len(X_train_s)} samples, MA-ICL={len(X_topk)} samples")
     else:
         # Both train on full set, use original residuals
         residuals_topk = residuals
-        logger.info(f"[Data Alignment] Both ML model and MA-ICL train on the same full training set ({len(X_topk)} samples)")
-        logger.info(f"[Data Alignment] Training data match: ML={len(X_train_s)} samples, MA-ICL={len(X_topk)} samples")
+        logger.info(f"[Data Alignment] Using full training set ({len(X_topk)} samples) - residuals already computed")
+        logger.info(f"[Data Alignment] Training data: ML=frozen on {len(X_train_s)} samples, MA-ICL={len(X_topk)} samples")
     
     # Compute ML baseline metrics on TRAINING set (for comparison with MA-ICL training performance)
     # WARNING: This evaluates on the same data the model was trained on, so high accuracy (often 1.0) 
@@ -1156,7 +1236,7 @@ def main():
     except Exception as e:
         logger.warning(f"Failed to compute ML baseline metrics on training set: {e}")
     
-    # Compute ML baseline metrics on test set (after potential retraining)
+    # Compute ML baseline metrics on test set (using frozen model)
     ml_baseline_metrics: Dict[str, Any] = {}
     try:
         is_multiclass = class_names is not None and len(class_names) > 2
@@ -1189,12 +1269,12 @@ def main():
                 "acc@0.5": acc_05, "f1@0.5": f1_05,
                 "predictions": y_pred_opt.tolist()
             }
-            logger.info(f"ML baseline (trained on {'subset' if args.top_k != -1 else 'full set'}): ACC={acc_opt:.4f} F1={f1_opt:.4f} (thr_opt={thr_opt:.2f})")
+            logger.info(f"ML baseline (frozen, trained on full set: {len(X_train_s)} samples): ACC={acc_opt:.4f} F1={f1_opt:.4f} (thr_opt={thr_opt:.2f})")
     except Exception as e:
         logger.warning(f"Failed to compute ML baseline metrics: {e}")
 
     maicl = TrainableMAICL(
-        llm, feature_cols, scaler,
+        llm, feature_cols, scaler,  # Pass scaler (can be None)
         use_ml_mechanism=bool(args.use_ml),
         dataset_name=ds_name,  # Use actual dataset name (e.g., "car", "iris") for proper context
         y_scaler=None,
@@ -1203,7 +1283,8 @@ def main():
         task_type="classification",
         class_names=class_names,
         classification_loss_metric=args.classification_loss,
-        num_mechanisms_unknown=args.num_mechanisms_unknown
+        num_mechanisms_unknown=args.num_mechanisms_unknown,
+        use_scaling=not args.no_scaling  # Pass the new flag
     )
     if ml_baseline_metrics:
         try:
@@ -1244,22 +1325,38 @@ def main():
     if hasattr(maicl, 'mechanism_performance_snapshot'):
         pre_mechanism_performance = maicl.mechanism_performance_snapshot.copy()
         logger.info(f"Pre-training mechanism performance: {pre_mechanism_performance}")
+    
+    # Evaluate with only LLM mechanisms (excluding ML) to assess LLM learning BEFORE training
+    logger.info("\n[LLM-only Evaluation (Pre-training)] Evaluating MA-ICL with only LLM mechanisms (excluding ML)...")
+    llm_only_pre_metrics = None
+    try:
+        llm_only_pre_metrics = maicl.evaluate_llm_only(X_test_s, y_test, X_train_s, y_train, return_details=True)
+        llm_only_pre_acc = float(llm_only_pre_metrics.get('accuracy', 0.0))
+        llm_only_pre_f1 = float(llm_only_pre_metrics.get('f1', 0.0))
+        llm_only_pre_loss = float(llm_only_pre_metrics.get('loss', 1.0))
+        logger.info(f"LLM-only (Pre-training, no ML): ACC={llm_only_pre_acc:.4f} F1={llm_only_pre_f1:.4f} Loss={llm_only_pre_loss:.4f}")
+    except Exception as e:
+        logger.warning(f"Failed to evaluate LLM-only pre-training: {e}")
+        import traceback
+        logger.warning(f"Traceback: {traceback.format_exc()}")
 
     # Train on top-K residuals; TextGrad/evaluation will use selected loss metric (F1 or accuracy)
     logger.info("=" * 80)
     logger.info("TRAINING MA-ICL")
     logger.info("=" * 80)
     logger.info(f"Training on {len(X_topk)} top-K residual samples for {args.iterations} iterations")
-    if args.use_test_for_acceptance:
+    if args.acceptance_set == "test":
         logger.info(f"Using TEST set ({len(X_test_s)} samples) for acceptance evaluation")
+    elif args.acceptance_set == "train":
+        logger.info(f"Using TRAIN set ({len(X_topk)} samples) for acceptance evaluation")
     else:
-        logger.info(f"Using full validation set ({len(X_val_s)} samples) for acceptance evaluation")
-    # Use validation or test set for acceptance; pass only TRAIN residuals to LLM
+        logger.info(f"Using VALIDATION set ({len(X_val_s)} samples) for acceptance evaluation")
+    # Use selected set (test/validation/train) for acceptance; pass only TRAIN residuals to LLM
     # accept_eval_max=None means use full acceptance set
     # Use residuals_topk to ensure consistency with training data (X_topk)
     maicl.train(X_topk, y_topk, X_val_s, y_val, iterations=args.iterations, ml_residuals=residuals_topk,
                 accept_eval_max=None, X_test=X_test_s, y_test=y_test,
-                use_test_for_acceptance=args.use_test_for_acceptance, output_dir=output_dir)
+                acceptance_set=args.acceptance_set, output_dir=output_dir)
     
     # Ensure training artifacts (training progress plots) are exported
     logger.info("\n[Training Artifacts] Exporting training history and progress plots...")
@@ -1282,8 +1379,11 @@ def main():
     logger.info("Using relaxed routing for final evaluation (same as training)")
     logger.info("  Note: Training uses relax_routing=True, so final evaluation uses the same for consistency")
     logger.info("  Note: Iteration metrics are on validation set, final evaluation is on test set")
-    logger.info("  Note: Mechanism performance will be re-computed on test set for appropriate routing")
-    post = maicl.evaluate(X_test_s, y_test, X_train_s, y_train, return_details=True, relax_routing=final_relax_routing)
+    logger.info("  Note: Mechanism performance will be PRESERVED from best snapshot (not recalculated) to ensure consistent routing")
+    # CRITICAL: Explicitly preserve mechanism performance from best snapshot to ensure consistent routing
+    # This ensures final evaluation uses the same routing weights as the best iteration during training
+    post = maicl.evaluate(X_test_s, y_test, X_train_s, y_train, return_details=True, relax_routing=final_relax_routing, 
+                          preserve_mechanism_performance=True)
     post_acc = float(post.get('accuracy', 0.0))
     post_f1 = float(post.get('f1', 0.0))
     post_loss = float(post.get('loss', 1.0))
@@ -1355,7 +1455,8 @@ def main():
             task_type="classification",
             class_names=class_names,
             output_dir=output_dir,
-            llm_only_metrics=llm_only_metrics
+            llm_only_metrics=llm_only_metrics,
+            llm_only_pre_metrics=llm_only_pre_metrics
         )
         logger.info("  ✓ Performance comparison plot saved")
         logger.info("  ✓ Confusion matrices saved (ML baseline, MA-ICL pre, MA-ICL post, MA-ICL LLM-only)")
@@ -1394,6 +1495,7 @@ def main():
             "loss": post_loss,
             "mechanism_performance": post_mechanism_performance
         },
+        "llm_only_pre_training": llm_only_pre_metrics if llm_only_pre_metrics is not None else None,
         "llm_only_post_training": llm_only_metrics if llm_only_metrics is not None else None,
         "mechanism_info": {
             "total_mechanisms": len(maicl.mechanisms),
@@ -1438,11 +1540,15 @@ def main():
         ml_train_f1 = ml_baseline_train_metrics.get('f1', 0.0)
         logger.info(f"  ML Baseline (TRAIN):  ACC={ml_train_acc:.4f}, F1={ml_train_f1:.4f}")
     logger.info(f"  Pre-training:  ACC={pre_acc:.4f}, F1={pre_f1:.4f}")
+    if llm_only_pre_metrics is not None:
+        llm_only_pre_acc = float(llm_only_pre_metrics.get('accuracy', 0.0))
+        llm_only_pre_f1 = float(llm_only_pre_metrics.get('f1', 0.0))
+        logger.info(f"  LLM-only (Pre, no ML): ACC={llm_only_pre_acc:.4f}, F1={llm_only_pre_f1:.4f}")
     logger.info(f"  Post-training: ACC={post_acc:.4f}, F1={post_f1:.4f}")
     if llm_only_metrics is not None:
         llm_only_acc = float(llm_only_metrics.get('accuracy', 0.0))
         llm_only_f1 = float(llm_only_metrics.get('f1', 0.0))
-        logger.info(f"  LLM-only (no ML):     ACC={llm_only_acc:.4f}, F1={llm_only_f1:.4f}")
+        logger.info(f"  LLM-only (Post, no ML): ACC={llm_only_acc:.4f}, F1={llm_only_f1:.4f}")
     logger.info("")
     logger.info("Training Improvement (Post vs Pre):")
     logger.info(f"  ΔACC={final_results['improvements']['training_improvement']['acc_delta']:+.4f}, "

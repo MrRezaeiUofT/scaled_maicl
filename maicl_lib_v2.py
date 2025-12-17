@@ -91,7 +91,7 @@ from visualization import (
 # Import from refactored modules
 from maicl_config import (
     SCALE_MIN, SCALE_MAX, MAX_BATCH_SIZE, BATCH_TIMEOUT, EVAL_BATCH_SIZE, GRADIENT_BATCH_SIZE,
-    LLM_GROUP_SIZE, LLM_COMBINE_MECHANISMS, K_SHOT_PER_TARGET, ATTENTION_TEMP, RANDOM_STATE,
+    LLM_GROUP_SIZE, LLM_COMBINE_MECHANISMS, ATTENTION_TEMP, RANDOM_STATE,
     IMPROVEMENT_THRESHOLD_CLASSIFICATION, ML_HIGH_CONFIDENCE_THRESHOLD, ML_LOW_CONFIDENCE_THRESHOLD,
     MIN_ML_WEIGHT, MAX_ML_WEIGHT, HARD_ML_GATE_THRESHOLD, OUTPUT_ROOT, RUN_FOLDER_NAME, OUTPUT_DIR,
     MAX_TOP_FEATURES, MAX_TOP_FEATURES_DISPLAY, MAX_TOP_ERROR_FEATURES, MAX_TOP_ERROR_FEATURES_CHECK,
@@ -130,7 +130,8 @@ class MultiAgentPredictor:
                  attention_temp: float, task_type: str = "regression", class_names: Optional[List[str]] = None,
                  hard_ml_gate_threshold: Optional[float] = None,
                  min_ml_weight: Optional[float] = None,
-                 max_ml_weight: Optional[float] = None):
+                 max_ml_weight: Optional[float] = None,
+                 use_scaling: bool = True):
         self.llm = batched_llm
         self.mechanisms = mechanisms
         self.mechanism_types = mechanism_types
@@ -140,6 +141,7 @@ class MultiAgentPredictor:
         self.attention_temp = attention_temp
         self.task_type = task_type
         self.class_names = class_names
+        self.use_scaling = use_scaling  # Flag to indicate if scaling is enabled
         # Allow LLM mechanisms to contribute in regression by default (disable full ML routing)
         # Set MAICL_REGRESSION_PREFER_ML=1 to force 100% ML routing
         self.prefer_ml_for_regression = os.environ.get("MAICL_REGRESSION_PREFER_ML", "0") != "0"
@@ -153,8 +155,17 @@ class MultiAgentPredictor:
     
     def _scaled_range_from(self, scaler):
         """Get the actual scaling range from scaler or use defaults"""
-        if scaler is not None and hasattr(scaler, "feature_range"):
-            return tuple(float(x) for x in scaler.feature_range)
+        if scaler is not None:
+            # Check for feature_range (without underscore) first - used by MinMaxScaler010
+            if hasattr(scaler, "feature_range"):
+                feature_range = scaler.feature_range
+                if hasattr(feature_range, '__iter__') and not isinstance(feature_range, str):
+                    return tuple(float(x) for x in feature_range)
+                else:
+                    return (float(feature_range), float(feature_range))
+            # Check for feature_range_ (with underscore) - used by sklearn MinMaxScaler
+            elif hasattr(scaler, "feature_range_"):
+                return tuple(float(x) for x in scaler.feature_range_)
         return (SCALE_MIN, SCALE_MAX)  # fallback
     
     def _init_attention_prompt(self) -> str:
@@ -175,8 +186,11 @@ class MultiAgentPredictor:
                                           example_class_1=example_class_1,
                                           example_class_2=example_class_2)
         else:
-            # Regression: use numeric scalar in scaled range
-            y_hat_desc = "Predicted numeric output (float in the target's scaled range)"
+            # Regression: use numeric scalar (scaled or raw based on use_scaling flag)
+            if self.use_scaling:
+                y_hat_desc = "Predicted numeric output (float in the target's scaled range)"
+            else:
+                y_hat_desc = "Predicted numeric output (float, use raw/unscaled target values)"
             self.agent_format = get_prompt('prediction.format_instructions.regression',
                                           y_hat_desc=y_hat_desc)
         self.agent_parser = None
@@ -218,11 +232,21 @@ class MultiAgentPredictor:
                                                class_mapping=class_mapping,
                                                allowed_classes=allowed)
                 else:
-                    # Regression: use actual scaling range
-                    scale_min, scale_max = self._scaled_range_from(self.scaler)
-                    task_instr = get_prompt('prediction.task_instructions.regression',
-                                          scale_min=scale_min,
-                                          scale_max=scale_max)
+                    # Regression: use actual scaling range if scaling is enabled
+                    if self.use_scaling:
+                        scale_min, scale_max = self._scaled_range_from(self.scaler)
+                        task_instr = get_prompt('prediction.task_instructions.regression',
+                                              scale_min=scale_min,
+                                              scale_max=scale_max)
+                    else:
+                        # No scaling: use raw values - create prompt without scaling mentions
+                        task_instr = """Regression Task: Predict a numeric scalar value.
+
+IMPORTANT: Data is NOT normalized; use raw/unscaled feature and target values.
+Apply the mechanism as math; do not output text.
+Return confidence (0-10).
+
+Format: {"y_hat": <float (raw/unscaled value)>, "confidence": <number>}"""
                 
                 # Build prompt with mechanism, few-shot examples, and format instructions
                 prompt = f"""{task_instr}
@@ -367,10 +391,17 @@ Please provide your prediction in the format specified above."""
             task_instr = get_prompt('prediction.task_instructions.classification_batch',
                                     allowed_classes=allowed)
         else:
-            # Regression: use actual scaling range
-            ymin, ymax = self._scaled_range_from(self.scaler)
-            task_instr = get_prompt('prediction.task_instructions.regression_batch',
-                                    ymin=ymin, ymax=ymax)
+            # Regression: use actual scaling range if scaling is enabled
+            if self.use_scaling:
+                ymin, ymax = self._scaled_range_from(self.scaler)
+                task_instr = get_prompt('prediction.task_instructions.regression_batch',
+                                        ymin=ymin, ymax=ymax)
+            else:
+                # No scaling: use raw values - create prompt without scaling mentions
+                task_instr = """Regression Task: Predict a numeric scalar value.
+
+IMPORTANT: Data is NOT normalized; use raw/unscaled feature and target values.
+Apply the mechanism's mathematical description to compute the output value from the input features."""
         
         # Grouped predictions: combine mechanisms per input group to reduce calls by factor M
         all_mechanism_responses: Dict[int, List[Tuple[float, float]]] = {idx: [None] * len(x_dicts) for idx in llm_indices}
@@ -445,17 +476,26 @@ Please provide your prediction in the format specified above."""
                                     y_hat = 0.0
                                     conf = min(conf, 2.0)
                             else:
-                                # Regression: parse numeric and clip to actual range
-                                ymin, ymax = self._scaled_range_from(self.scaler)
-                                try:
-                                    y_hat = float(y_hat_raw)
-                                    y_hat = float(np.clip(y_hat, ymin, ymax))
-                                    # SAFETY: If prediction is NaN or extreme, mark for ML fallback
-                                    if not np.isfinite(y_hat) or abs(y_hat - (ymin + ymax) / 2) > (ymax - ymin) * 0.49:
-                                        # Will use ML fallback later if available
-                                        pass
-                                except:
-                                    y_hat = (ymin + ymax) / 2
+                                # Regression: parse numeric and clip to actual range if scaling is enabled
+                                if self.use_scaling:
+                                    ymin, ymax = self._scaled_range_from(self.scaler)
+                                    try:
+                                        y_hat = float(y_hat_raw)
+                                        y_hat = float(np.clip(y_hat, ymin, ymax))
+                                        # SAFETY: If prediction is NaN or extreme, mark for ML fallback
+                                        if not np.isfinite(y_hat) or abs(y_hat - (ymin + ymax) / 2) > (ymax - ymin) * 0.49:
+                                            # Will use ML fallback later if available
+                                            pass
+                                    except:
+                                        y_hat = (ymin + ymax) / 2
+                                else:
+                                    # No scaling: use raw value without clipping
+                                    try:
+                                        y_hat = float(y_hat_raw)
+                                        if not np.isfinite(y_hat):
+                                            y_hat = 0.0  # Fallback for NaN/inf
+                                    except:
+                                        y_hat = 0.0
                             conf = max(0.1, min(10.0, conf))
                             mech_idx = llm_indices[mcol]
                             all_mechanism_responses[mech_idx][start + row_idx] = (y_hat, conf)
@@ -544,17 +584,26 @@ Please provide your prediction in the format specified above."""
                                     y_hat = 0.0
                                     conf = min(conf, 2.0)
                             else:
-                                # Regression: parse numeric and clip to actual range
-                                ymin, ymax = self._scaled_range_from(self.scaler)
-                                try:
-                                    y_hat = float(y_hat_raw)
-                                    y_hat = float(np.clip(y_hat, ymin, ymax))
-                                    # SAFETY: If prediction is NaN or extreme, mark for ML fallback
-                                    if not np.isfinite(y_hat) or abs(y_hat - (ymin + ymax) / 2) > (ymax - ymin) * 0.49:
-                                        # Will use ML fallback later if available
-                                        pass
-                                except:
-                                    y_hat = (ymin + ymax) / 2
+                                # Regression: parse numeric and clip to actual range if scaling is enabled
+                                if self.use_scaling:
+                                    ymin, ymax = self._scaled_range_from(self.scaler)
+                                    try:
+                                        y_hat = float(y_hat_raw)
+                                        y_hat = float(np.clip(y_hat, ymin, ymax))
+                                        # SAFETY: If prediction is NaN or extreme, mark for ML fallback
+                                        if not np.isfinite(y_hat) or abs(y_hat - (ymin + ymax) / 2) > (ymax - ymin) * 0.49:
+                                            # Will use ML fallback later if available
+                                            pass
+                                    except:
+                                        y_hat = (ymin + ymax) / 2
+                                else:
+                                    # No scaling: use raw value without clipping
+                                    try:
+                                        y_hat = float(y_hat_raw)
+                                        if not np.isfinite(y_hat):
+                                            y_hat = 0.0  # Fallback for NaN/inf
+                                    except:
+                                        y_hat = 0.0
                             conf = max(0.1, min(10.0, conf))
                             all_mechanism_responses[mech_idx][start + offset] = (y_hat, conf)
                     except:
@@ -580,10 +629,13 @@ Please provide your prediction in the format specified above."""
                                           self.class_names is not None and 
                                           len(self.class_names) > 2)
                         y_hat = self.ml_mechanism.predict(x_dict, return_class_index=return_class_idx)
-                        # For regression, clip to actual scaling range
-                        if self.task_type == "regression":
+                        # For regression, clip to actual scaling range if scaling is enabled
+                        if self.task_type == "regression" and self.use_scaling:
                             ymin, ymax = self._scaled_range_from(self.scaler)
                             y_hat = float(np.clip(y_hat, ymin, ymax))
+                        elif self.task_type == "regression" and not self.use_scaling:
+                            # No scaling: ensure value is finite
+                            y_hat = float(y_hat) if np.isfinite(y_hat) else 0.0
                         if hasattr(self.ml_mechanism, 'get_confidence_heuristic_with_boost'):
                             conf = self.ml_mechanism.get_confidence_heuristic_with_boost(x_dict)
                         else:
@@ -630,6 +682,20 @@ Please provide your prediction in the format specified above."""
                 perf_scores = [self.mechanism_performance.get(i, 1.0) for i in range(len(results))]
                 perf_array = np.array(perf_scores)
                 
+                # CRITICAL FIX: Exclude mechanisms with very low performance (likely failing)
+                # This prevents bad mechanisms from dragging down the ensemble
+                MIN_PERFORMANCE_THRESHOLD = 0.1  # Mechanisms below this are excluded
+                max_perf = max(perf_scores) if perf_scores else 1.0
+                
+                # If max performance is good (>0.5), exclude mechanisms that are much worse
+                if max_perf > 0.5:
+                    # Exclude mechanisms that are more than 5x worse than the best
+                    exclusion_threshold = max(MIN_PERFORMANCE_THRESHOLD, max_perf / 5.0)
+                    for i in range(len(perf_array)):
+                        if perf_scores[i] < exclusion_threshold:
+                            perf_array[i] = 0.0  # Zero weight for very bad mechanisms
+                            logger.debug(f"  Excluding mechanism {i} (perf={perf_scores[i]:.3f} < threshold={exclusion_threshold:.3f})")
+                
                 # Check if ML mechanism is significantly better
                 ml_indices_list = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "ml"]
                 llm_indices_list = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "llm"]
@@ -642,7 +708,7 @@ Please provide your prediction in the format specified above."""
                     # If ML is significantly better, use higher temperature for sharper weighting
                     if perf_ratio > 1.2:
                         # High temperature: exp(score / temp) with temp < 1 makes differences more pronounced
-                        temperature = 0.5  # Lower temp = sharper differences
+                        temperature = 0.3  # Lower temp = sharper differences (was 0.5)
                         perf_array = np.exp(perf_array / temperature - np.max(perf_array / temperature))
                     else:
                         # Similar performance: use standard softmax
@@ -651,7 +717,21 @@ Please provide your prediction in the format specified above."""
                     # Standard softmax
                     perf_array = np.exp(perf_array - np.max(perf_array))
                 
-                weights = perf_array / np.sum(perf_array)
+                # Normalize weights (zero weights stay zero)
+                if np.sum(perf_array) > 0:
+                    weights = perf_array / np.sum(perf_array)
+                else:
+                    # Fallback: if all mechanisms were excluded, use ML mechanism only
+                    ml_indices_list = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "ml"]
+                    if len(ml_indices_list) > 0:
+                        logger.warning(f"  All mechanisms excluded by performance threshold, falling back to ML-only (indices: {ml_indices_list})")
+                        weights = np.zeros(len(results))
+                        for ml_idx in ml_indices_list:
+                            weights[ml_idx] = 1.0 / len(ml_indices_list)
+                    else:
+                        # No ML mechanism: use uniform weights as last resort
+                        logger.warning("  All mechanisms excluded and no ML mechanism available, using uniform weights")
+                        weights = np.ones(len(results)) / len(results)
             else:
                 ml_indices_list = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "ml"]
                 if len(ml_indices_list) > 0 and self.ml_mechanism is not None and self.ml_mechanism.is_trained:
@@ -696,9 +776,11 @@ Please provide your prediction in the format specified above."""
                             class_scores[cls] += float(w)
                         else:
                             # Continuous value: map to class using thresholds
-                            # Divide [0, 10] range into num_classes bins
+                            # Divide scaling range into num_classes bins
                             # This handles mechanisms that output continuous scores
-                            cls = int(np.clip(np.round(pred_val * (num_classes - 1) / 10.0), 0, num_classes - 1))
+                            # Use configured scaling range (default: [0.0, 1.0])
+                            scale_range = SCALE_MAX - SCALE_MIN
+                            cls = int(np.clip(np.round((pred_val - SCALE_MIN) * (num_classes - 1) / scale_range), 0, num_classes - 1))
                             class_scores[cls] += float(w)
                     except Exception:
                         pass
@@ -777,7 +859,8 @@ class VariationalMechanismGenerator:
                  class_names: List[str] = None, pretrained_ml_mechanism: Optional[Any] = None,
                  data_insights: Optional[Dict[str, Any]] = None,
                  diversity_ngram_n: int = 3, diversity_min_jaccard: float = 0.35,
-                 scaler: Any = None, num_mechanisms_unknown: Optional[int] = None):
+                 scaler: Any = None, num_mechanisms_unknown: Optional[int] = None,
+                 use_scaling: bool = True):
         self.llm = batched_llm
         self.feature_cols = feature_cols
         self.use_ml_mechanism = use_ml_mechanism
@@ -786,12 +869,13 @@ class VariationalMechanismGenerator:
         self.class_names = class_names
         self.data_insights = data_insights or {}
         self.scaler = scaler
+        self.use_scaling = use_scaling  # Flag to indicate if scaling is enabled
         # Number of unknown mechanisms to generate (defaults to 1 if not provided)
         self.num_mechanisms_unknown = num_mechanisms_unknown if num_mechanisms_unknown is not None else 1
         self.known_mechanisms = self._init_known_mechanisms()
         self.unknown_mechanisms = self._init_unknown_mechanisms()
         self.encoder_prompt = self._init_encoder_prompt()
-        self.decoder_prompt = get_prompt('mechanism_generation.decoder_default')
+        self.decoder_prompt = self._init_decoder_prompt()
         self.ml_mechanism = None
         self.predictor = None  # Will be set by TrainableMAICL
         # Diversity checking parameters
@@ -846,14 +930,87 @@ class VariationalMechanismGenerator:
         return []
     
     def _init_encoder_prompt(self) -> str:
-        """Initialize encoder prompt"""
-        dataset_name_clean = self.dataset_name.lower().replace(" dataset", "").strip()
+        """Initialize encoder prompt - checks for dataset-specific prompts first"""
+        dataset_name_clean = self._normalize_dataset_name(self.dataset_name)
         
+        # Try dataset-specific encoder prompt first (suppress warning if not found)
+        dataset_specific_key = f'mechanism_generation.dataset_specific.{dataset_name_clean}.encoder'
+        config = load_maicl_config()
+        prompts = config.get('prompts', {})
+        dataset_specific_prompt = None
+        
+        # Navigate through nested keys without warnings
+        try:
+            keys = dataset_specific_key.split('.')
+            value = prompts
+            for key in keys:
+                value = value.get(key, {})
+            if value and isinstance(value, str):
+                dataset_specific_prompt = value.format(dataset_name=dataset_name_clean.upper()) if '{dataset_name}' in value else value
+        except (KeyError, AttributeError):
+            pass
+        
+        if dataset_specific_prompt:
+            logger.info(f"Using dataset-specific encoder prompt for '{dataset_name_clean}'")
+            return dataset_specific_prompt
+        
+        # Fall back to general task-type prompts
+        logger.debug(f"No dataset-specific encoder prompt found for '{dataset_name_clean}', using general {self.task_type} prompt")
         if self.task_type == "classification":
             return get_prompt('mechanism_generation.encoder.classification',
                              dataset_name=dataset_name_clean.upper())
         
         return get_prompt('mechanism_generation.encoder.regression')
+    
+    def _init_decoder_prompt(self) -> str:
+        """Initialize decoder prompt - checks for dataset-specific prompts first"""
+        dataset_name_clean = self._normalize_dataset_name(self.dataset_name)
+        
+        # Try dataset-specific decoder prompt first (suppress warning if not found)
+        dataset_specific_key = f'mechanism_generation.dataset_specific.{dataset_name_clean}.decoder'
+        config = load_maicl_config()
+        prompts = config.get('prompts', {})
+        dataset_specific_prompt = None
+        
+        # Navigate through nested keys without warnings
+        try:
+            keys = dataset_specific_key.split('.')
+            value = prompts
+            for key in keys:
+                value = value.get(key, {})
+            if value and isinstance(value, str):
+                dataset_specific_prompt = value
+        except (KeyError, AttributeError):
+            pass
+        
+        if dataset_specific_prompt:
+            logger.info(f"Using dataset-specific decoder prompt for '{dataset_name_clean}'")
+            return dataset_specific_prompt
+        
+        # Fall back to task-type-specific decoder prompt
+        logger.debug(f"No dataset-specific decoder prompt found for '{dataset_name_clean}', using general {self.task_type} decoder prompt")
+        if self.task_type == "classification":
+            return get_prompt('mechanism_generation.decoder_classification')
+        return get_prompt('mechanism_generation.decoder_default')
+    
+    def _normalize_dataset_name(self, dataset_name: str) -> str:
+        """Normalize dataset name for prompt lookup (handles variations)"""
+        # Remove common prefixes/suffixes and convert to lowercase
+        name = dataset_name.lower()
+        # Remove common patterns
+        name = name.replace(" dataset", "").replace(" (", " ").replace(")", "")
+        # Remove task type indicators
+        name = name.replace(" classification", "").replace(" regression", "")
+        # Remove extra whitespace
+        name = name.strip()
+        # Handle specific dataset name variations
+        name_mappings = {
+            "esol (water solubility)": "esol",
+            "delaney": "esol",  # Delaney is ESOL
+            "lipophilicity": "lipo",
+            "logp": "lipo",
+        }
+        return name_mappings.get(name, name)
     
     def train_ml_mechanism(self, X_train: np.ndarray, y_train: np.ndarray, y_scaler: Any = None):
         """Train the ML mechanism"""
@@ -881,11 +1038,13 @@ class VariationalMechanismGenerator:
         
         if is_deepchem and has_smiles:
             features_desc = "SMILES strings (molecular structures) - ML model uses ECFP fingerprints internally"
+            deepchem_note = "\n\nCRITICAL: This is a DeepChem molecular dataset. The LLM mechanism MUST work with SMILES strings and molecular properties (molecular_weight, num_rings, num_hydroxyl_groups, etc.), NOT ECFP bit features (ecfp_bit_0, ecfp_bit_1, etc.)."
         else:
             features_desc = str(self.feature_cols) if self.feature_cols else "features"
+            deepchem_note = ""
         
         data_summary = f"""Dataset statistics:
-- Features: {features_desc}
+- Features: {features_desc}{deepchem_note}
 - X mean: {stats['X_mean'].tolist()}
 - Sample size: {len(X_sample)}
 - Prediction errors (MAE): {np.mean(prediction_errors):.3f}"""
@@ -894,7 +1053,16 @@ class VariationalMechanismGenerator:
             ml_mech_name = self.ml_mechanism.model_name if hasattr(self.ml_mechanism, 'model_name') else "ML"
             # Include detailed ML mechanism description
             ml_mech_description = self.ml_mechanism.get_description()
-            data_summary += f"\n- ML baseline mechanism: {ml_mech_description}"
+            # For DeepChem datasets, add a note that ML uses ECFP internally but LLM should use SMILES
+            if is_deepchem and has_smiles:
+                # Remove ECFP bit details from description to avoid confusion
+                # The LLM should focus on SMILES-based molecular properties, not ECFP bits
+                ml_mech_description_clean = ml_mech_description.split("Trained model:")[0] if "Trained model:" in ml_mech_description else ml_mech_description
+                ml_mech_description_clean = ml_mech_description_clean.rstrip()
+                ml_mech_description_clean += ". NOTE: The ML model uses ECFP fingerprints internally, but your LLM mechanism MUST use SMILES strings and molecular properties instead."
+                data_summary += f"\n- ML baseline mechanism: {ml_mech_description_clean}"
+            else:
+                data_summary += f"\n- ML baseline mechanism: {ml_mech_description}"
         
         if ml_residuals is not None and len(ml_residuals) > 0:
             data_summary += f"\n- ML baseline mean|residual|: {float(np.mean(np.abs(ml_residuals))):.3f}"
@@ -902,7 +1070,10 @@ class VariationalMechanismGenerator:
         if self.task_type == "classification":
             task_desc = "Task: Infer a latent mechanism for classification explaining decision boundaries and class separation."
         else:
-            task_desc = "Task: Infer a latent mechanism explaining smooth curved tendencies. IMPORTANT: Data is normalized to [0, 1] range for both inputs and outputs."
+            if self.use_scaling:
+                task_desc = "Task: Infer a latent mechanism explaining smooth curved tendencies. IMPORTANT: Data is normalized to [0, 1] range for both inputs and outputs."
+            else:
+                task_desc = "Task: Infer a latent mechanism explaining smooth curved tendencies. IMPORTANT: Data is NOT normalized - use raw feature and target values as provided."
         
         prompt = get_prompt('mechanism_generation.encoder_with_data',
                            encoder_prompt=self.encoder_prompt,
@@ -987,7 +1158,7 @@ class VariationalMechanismGenerator:
                             
                             if self.task_type == "regression":
                                 y_pred = ml_residuals[idx] + y_train[idx] if ml_residuals is not None else y_train[idx]
-                                logger.info(f"    {rank}. Sample {idx}: {feat_display} → pred={y_pred:.2f}, true={y_train[idx]:.2f}, residual={ml_residuals[idx]:+.2f}")
+                                logger.info(f"    {rank}. Sample {idx}: {feat_display} → ML-pred={y_pred:.2f}, true={y_train[idx]:.2f}, residual={ml_residuals[idx]:+.2f}")
                             else:
                                 # Classification: show predicted vs true, and residual (1.0=mismatched, 0.0=matched)
                                 true_idx = int(y_train[idx])
@@ -1033,7 +1204,8 @@ class VariationalMechanismGenerator:
                 # Only 1 mechanism needed: use non-linear variant (variant 2)
                 variant = 2
                 mech = generate_ml_guided_mechanism(
-                    ml_knowledge, self.feature_cols, self.task_type, self.class_names, variant
+                    ml_knowledge, self.feature_cols, self.task_type, self.class_names, variant,
+                    use_scaling=getattr(self, 'use_scaling', True)
                 )
                 mechanisms.append(mech)
             else:
@@ -1059,8 +1231,176 @@ class VariationalMechanismGenerator:
     
     def decode_latent_space(self, latent_z: str) -> str:
         """Decode latent representation into executable mechanism"""
+        # Check if this is a DeepChem dataset and add specific instructions
+        is_deepchem = (self.feature_cols and len(self.feature_cols) > 0 and 
+                      all(feat.startswith('ecfp_bit_') for feat in self.feature_cols[:10]))
+        has_smiles = False
+        if is_deepchem:
+            X_original_check = None
+            if hasattr(self, 'X_train_original') and self.X_train_original is not None:
+                X_original_check = self.X_train_original
+            elif hasattr(self, 'predictor') and hasattr(self.predictor, 'X_train_original'):
+                X_original_check = self.predictor.X_train_original
+            
+            if X_original_check and len(X_original_check) > 0:
+                if isinstance(X_original_check[0], dict) and 'SMILES' in X_original_check[0]:
+                    has_smiles = True
+        
+        # Add task-type-specific instructions to decoder prompt
+        decoder_prompt_enhanced = self.decoder_prompt
+        
+        # Add classification-specific instructions
+        if self.task_type == "classification":
+            class_names_str = ""
+            if hasattr(self, 'class_names') and self.class_names:
+                class_names_str = ", ".join(self.class_names)
+            
+            classification_instruction = f"""
+
+CRITICAL FOR CLASSIFICATION TASKS:
+1. Start with a clear MECHANISM DESCRIPTION section (2-4 sentences) that explains:
+   - The classification task: what you are classifying and into which classes{f" ({class_names_str})" if class_names_str else ""}
+   - Which features are most important for distinguishing between classes
+   - How the mechanism uses these features to make classification decisions
+   - Specific decision rules or boundaries that separate different classes
+
+2. Use descriptive, plain language to explain the classification logic:
+   - Describe how different feature values relate to different classes
+   - Explain decision boundaries (e.g., "examples with high FEATURE_X are typically class A")
+   - Describe how the mechanism handles edge cases or ambiguous examples
+
+3. CRITICAL: For EACH CLASS, FIRST provide a TEXTUAL INTERPRETATION, THEN provide the equation with ADVANCED NONLINEAR TRANSFORMATIONS:
+   - Start with a textual interpretation of what the class represents (if it has a meaningful label)
+   - Describe the relationship between the class and input features - think about NONLINEAR relationships and INTERACTIONS
+   - Explain what patterns/characteristics distinguish this class from others
+   - THEN provide the equation (score_0, score_1, score_2, etc.) with ADVANCED NONLINEAR TRANSFORMATIONS
+   - Each class equation MUST use:
+     * INTERMEDIATE VARIABLES to capture complex nonlinear interactions (e.g., intermediate = feature1 * feature2 / (K + feature1 * feature2))
+     * Saturation effects: feature / (K + feature) to capture diminishing returns
+     * NONLINEAR INTERACTIONS: not just feature1 * feature2, but feature1 * feature2 / (K + feature1 * feature2) to learn the nonlinearity of interactions
+     * Multiple interaction patterns: multiplicative, ratio-based, threshold-based
+   - LEARN THE NONLINEARITY OF INTERACTIONS: interactions themselves may have saturation or other nonlinear effects
+   - DISCOVER which features interact and HOW they interact nonlinearly
+   - Think about intermediate variables: create variables that capture complex relationships between features
+   - Think about how features interact: do high values of multiple features create synergistic effects? How do they interact nonlinearly?
+   - Consider saturation effects: do very high feature values have diminishing returns?
+   - Use different nonlinear patterns for each class to capture what makes each class unique
+   - DO NOT use naive thresholding (e.g., "if score < 0.25 then class 0")
+   - DO NOT use simple linear combinations - they often fail to capture complex relationships
+   - DO NOT use simple multiplicative interactions - learn the nonlinearity of interactions themselves
+   - Instead, compute a score for each class independently using advanced nonlinear transformations and intermediate variables, then use argmax to select the class
+
+4. After the descriptive text, provide the executable FORMULA that implements the classification logic
+
+FORMAT:
+MECHANISM DESCRIPTION:
+[2-4 sentences clearly describing the classification task and how features are used to distinguish between classes]
+
+CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS:
+CLASS 0 ({class_names[0] if class_names and len(class_names) > 0 else 'class0'}):
+  INTERPRETATION: [Textual description of what this class represents, its relationship to input features, and what patterns characterize it. If the class has a meaningful label, interpret what that label means in the context of the features.]
+  EQUATION:
+    score_0 = [equation using features that are important for this class]
+
+CLASS 1 ({class_names[1] if class_names and len(class_names) > 1 else 'class1'}):
+  INTERPRETATION: [Textual description of what this class represents, its relationship to input features, and what patterns characterize it. If the class has a meaningful label, interpret what that label means in the context of the features.]
+  EQUATION:
+    score_1 = [equation using features that are important for this class]
+
+[Continue for all classes...]
+
+FINAL PREDICTION:
+ŷ = argmax([score_0, score_1, ...])
+
+EXAMPLE FORMAT:
+MECHANISM DESCRIPTION:
+This mechanism classifies examples into {len(class_names) if class_names else 'N'} classes: {class_names_str if class_names_str else '[class names]'}. Each class has distinct characteristics that can be identified through different feature combinations.
+
+CLASS-SPECIFIC EQUATIONS:
+CLASS 0 ({class_names[0] if class_names and len(class_names) > 0 else 'class0'}): This class is characterized by high values of [feature1] and low values of [feature2]. Examples with [specific pattern] tend to belong to this class.
+  score_0 = 0.5*feature1 + 0.3*feature2 - 0.2*feature3
+
+CLASS 1 ({class_names[1] if class_names and len(class_names) > 1 else 'class1'}): This class is characterized by moderate [feature1] and high [feature3]. Examples with [specific pattern] tend to belong to this class.
+  score_1 = 0.3*feature1 + 0.6*feature3 + 0.1*feature4
+
+[Continue for all classes...]
+
+FINAL PREDICTION:
+ŷ = argmax([score_0, score_1, ...])
+
+"""
+            decoder_prompt_enhanced = decoder_prompt_enhanced + classification_instruction
+        
+        if is_deepchem and has_smiles:
+            deepchem_instruction = """
+
+CRITICAL: This is a molecular dataset (DeepChem). You will receive SMILES strings as input, NOT ECFP bit features.
+
+DO NOT use ECFP bit features (ecfp_bit_0, ecfp_bit_1, etc.) in your mechanism formula.
+INSTEAD, work with molecular properties that can be derived from SMILES strings:
+- Molecular weight: molecular_weight(SMILES) - TYPICAL RANGE: 50-1000 g/mol, MUST NORMALIZE by dividing by 100-500
+- Number of rings: num_rings(SMILES) - TYPICAL RANGE: 0-10, use small coefficients (0.01-0.2)
+- Number of hydroxyl groups: num_hydroxyl_groups(SMILES) - TYPICAL RANGE: 0-10, use coefficients (0.05-0.3)
+- Number of halogen atoms: num_halogen(SMILES) - TYPICAL RANGE: 0-10, use negative coefficients (-0.05 to -0.2)
+- Number of nitrogen atoms: num_nitrogen(SMILES) - TYPICAL RANGE: 0-10, use small coefficients (0.01-0.2)
+- Number of oxygen atoms: num_oxygen(SMILES) - TYPICAL RANGE: 0-20, use small coefficients (0.01-0.15)
+
+FORMULA FORMAT REQUIREMENTS:
+- Output a SIMPLE, DIRECT FORMULA (not full Python code)"""
+            if self.use_scaling:
+                # Get actual scaling range from config/scaler
+                scale_min, scale_max = self._get_scaling_range()
+                # Fallback to config defaults if None (shouldn't happen when use_scaling=True, but safe)
+                if scale_min is None or scale_max is None:
+                    scale_min, scale_max = SCALE_MIN, SCALE_MAX
+                deepchem_instruction += f"""
+- Format: Formula: ŷ = clip(expression, {scale_min:.1f}, {scale_max:.1f})
+- All outputs must be clipped to [{scale_min:.1f}, {scale_max:.1f}] range"""
+            else:
+                deepchem_instruction += """
+- Format: Formula: ŷ = expression (no clipping, use raw/unscaled values)
+- Output can be any numeric value (no scaling/clipping constraints)"""
+            deepchem_instruction += """
+- NORMALIZE molecular_weight: divide by 100-500 (e.g., molecular_weight(SMILES) / 200)
+- Use realistic coefficients: intercept 0.3-0.7, feature coefficients 0.001-0.3
+- Water solubility domain knowledge:
+  * Hydroxyl groups INCREASE solubility (positive coefficient: +0.1 to +0.3)
+  * Halogens DECREASE solubility (negative coefficient: -0.05 to -0.2)
+  * Molecular weight DECREASES solubility (negative coefficient: -0.001 to -0.01 per 100 g/mol)
+  * Rings DECREASE solubility (negative coefficient: -0.01 to -0.1)
+  * Nitrogen/Oxygen atoms INCREASE solubility (positive coefficient: +0.01 to +0.15)
+
+EXAMPLE GOOD FORMULA:"""
+            if self.use_scaling:
+                # Use the same scale_min and scale_max from earlier in the method
+                # (already computed above when building the format requirements)
+                deepchem_instruction += f"""
+Formula: ŷ = clip(0.5 + 0.002 * molecular_weight(SMILES) / 100 + 0.15 * num_hydroxyl_groups(SMILES) - 0.08 * num_halogen(SMILES) - 0.02 * num_rings(SMILES) + 0.05 * num_nitrogen(SMILES), {scale_min:.1f}, {scale_max:.1f})"""
+            else:
+                deepchem_instruction += """
+Formula: ŷ = 0.5 + 0.002 * molecular_weight(SMILES) / 100 + 0.15 * num_hydroxyl_groups(SMILES) - 0.08 * num_halogen(SMILES) - 0.02 * num_rings(SMILES) + 0.05 * num_nitrogen(SMILES)"""
+            deepchem_instruction += """
+
+DO NOT output:
+- Full Python function definitions with def statements
+- Helper function implementations
+- Long code blocks
+
+DO output:"""
+            if self.use_scaling:
+                deepchem_instruction += """
+- A single-line formula starting with "Formula: ŷ = clip(...)"
+- Brief explanation (1-2 sentences) of the mechanism
+"""
+            else:
+                deepchem_instruction += """
+- A single-line formula starting with "Formula: ŷ = ..." (no clip function)
+- Brief explanation (1-2 sentences) of the mechanism
+"""
+            decoder_prompt_enhanced = decoder_prompt_enhanced + deepchem_instruction
+        
         prompt = get_prompt('mechanism_generation.decoder',
-                           decoder_prompt=self.decoder_prompt,
+                           decoder_prompt=decoder_prompt_enhanced,
                            latent_z=latent_z)
         mechanism = self.llm.invoke_single(HumanMessage(content=prompt))
         return mechanism
@@ -1084,13 +1424,21 @@ class VariationalMechanismGenerator:
         """Get descriptions of all mechanisms"""
         return [f"Mechanism {i+1}: {mech}" for i, mech in enumerate(self.get_all_mechanisms())]
     
-    def _get_scaling_range(self) -> Tuple[float, float]:
-        """Get scaling range from scaler"""
+    def _get_scaling_range(self) -> Tuple[Optional[float], Optional[float]]:
+        """Get scaling range from scaler. Returns (None, None) if scaling is disabled."""
+        # If scaling is disabled, return None to indicate no scaling constraints
+        if not self.use_scaling:
+            return (None, None)
+        
         if hasattr(self, 'scaler') and self.scaler is not None:
-            if hasattr(self.scaler, 'feature_range_'):
+            # Check for feature_range (without underscore) first - used by MinMaxScaler010
+            if hasattr(self.scaler, 'feature_range'):
+                return tuple(self.scaler.feature_range) if hasattr(self.scaler.feature_range, '__iter__') else (self.scaler.feature_range, self.scaler.feature_range)
+            # Check for feature_range_ (with underscore) - used by sklearn MinMaxScaler
+            elif hasattr(self.scaler, 'feature_range_'):
                 return self.scaler.feature_range_
             elif hasattr(self.scaler, 'scale_') and hasattr(self.scaler, 'min_'):
-                # MinMaxScaler
+                # MinMaxScaler - compute from min/max (this is a fallback, not ideal)
                 return (self.scaler.min_[0] if hasattr(self.scaler.min_, '__len__') else self.scaler.min_,
                         self.scaler.max_[0] if hasattr(self.scaler.max_, '__len__') else self.scaler.max_)
         return (SCALE_MIN, SCALE_MAX)
@@ -1129,11 +1477,13 @@ class TrainableMAICL:
                  min_ml_weight: Optional[float] = None,
                  max_ml_weight: Optional[float] = None,
                  hard_ml_gate_threshold: Optional[float] = None,
-                 num_mechanisms_unknown: Optional[int] = None):
+                 num_mechanisms_unknown: Optional[int] = None,
+                 use_scaling: bool = True):
         self.llm = batched_llm
         self.feature_cols = feature_cols
         self.scaler = scaler
         self.y_scaler = y_scaler
+        self.use_scaling = use_scaling  # Flag to indicate if scaling is enabled
         self.use_ml_mechanism = use_ml_mechanism
         self.dataset_name = dataset_name
         self.task_type = task_type
@@ -1181,16 +1531,19 @@ class TrainableMAICL:
             pretrained_ml_mechanism=pretrained_ml_mechanism,
             data_insights=data_insights,
             scaler=scaler,
-            num_mechanisms_unknown=num_mechanisms_unknown
+            num_mechanisms_unknown=num_mechanisms_unknown,
+            use_scaling=use_scaling
         )
         
-        self.textgrad = TextGrad(batched_llm, task_type=task_type, feature_cols=feature_cols, dataset_name=dataset_name, class_names=class_names)
+        # Get scale range from y_scaler (for target/output range) to pass to TextGrad
+        scale_min, scale_max = self._scaled_range_from(y_scaler) if y_scaler is not None else (SCALE_MIN, SCALE_MAX)
+        self.textgrad = TextGrad(batched_llm, task_type=task_type, feature_cols=feature_cols, dataset_name=dataset_name, class_names=class_names, scale_min=scale_min, scale_max=scale_max, use_scaling=use_scaling)
         # Routing parameters (can be overridden)
         self.attention_temp = attention_temp if attention_temp is not None else ATTENTION_TEMP
         self.min_ml_weight = min_ml_weight if min_ml_weight is not None else MIN_ML_WEIGHT
         self.max_ml_weight = max_ml_weight if max_ml_weight is not None else MAX_ML_WEIGHT
         self.hard_ml_gate_threshold = hard_ml_gate_threshold if hard_ml_gate_threshold is not None else HARD_ML_GATE_THRESHOLD
-        self.k_shot = K_SHOT_PER_TARGET  # Default: use K_SHOT_PER_TARGET (can be overridden via train() or evaluate())
+        self.k_shot = 0  # Default: use 0 (can be overridden via train() or evaluate())
         self.mechanisms = self.mech_generator.get_all_mechanisms()
         self.mechanism_types = self.mech_generator.get_mechanism_types()
         self.predictor = None
@@ -1207,7 +1560,11 @@ class TrainableMAICL:
             "val_accuracy": [],
             "val_f1": [],
             "val_r2": [],
-            "val_mae": []
+            "val_mae": [],
+            "llm_only_r2": [],
+            "llm_only_mae": [],
+            "llm_only_accuracy": [],
+            "llm_only_f1": []
         }
         
         self.ml_baseline_performance = None
@@ -1227,12 +1584,13 @@ class TrainableMAICL:
             logger.info(f"  ✓ Total mechanisms: {len(self.mechanisms)}")
     
     def _verify_unified_scaling(self, X_train, y_train, X_val, y_val):
-        """Verify all data uses unified [0, 10] scaling
+        """Verify all data uses unified scaling (configured via SCALE_MIN and SCALE_MAX)
         
         Note: For classification tasks, y values are class labels and should NOT be scaled.
         Only X (features) are validated for classification. For regression, both X and y are validated.
         """
-        scale_min, scale_max = 0.0, 10.0
+        # Use configured scaling range (default: [0.0, 1.0])
+        scale_min, scale_max = SCALE_MIN, SCALE_MAX
         is_classification = getattr(self, 'task_type', 'regression') == 'classification'
         
         logger.info("\n[Scaling Verification]")
@@ -1356,7 +1714,7 @@ class TrainableMAICL:
         
         Performance Metrics:
             - Classification: F1 score (range [0, 1], higher is better)
-            - Regression: 1/(0.01 + MAE) (range (0, 100], higher is better)
+            - Regression: 1/(0.01 + MAE) (range (0, 100), higher is better)
         
         Note: This is called automatically during evaluate() to keep performance scores current.
         """
@@ -1433,8 +1791,10 @@ class TrainableMAICL:
                         # Normalize MAE relative to a baseline (e.g., mean of all MAEs or a fixed threshold)
                         # Use a more stable formula: exp(-mae/scale) where scale is adaptive
                         # First, compute a reference MAE (mean of all mechanism MAEs or use a fixed scale)
-                        # For now, use a scale based on the target range (typically [0, 10] for scaled data)
-                        scale = 2.0  # Scale factor: MAE of 2.0 gives ~0.37, MAE of 1.0 gives ~0.61
+                        # Use a scale based on the target range (configured via SCALE_MIN and SCALE_MAX)
+                        # Default range is [0.0, 1.0], so use scale factor appropriate for that range
+                        scale_range = SCALE_MAX - SCALE_MIN
+                        scale = scale_range * 0.2  # Scale factor: MAE of 20% of range gives ~0.37
                         performance_score = np.exp(-mae / scale)  # Range: (0, 1], higher is better
                         # Clamp to reasonable range
                         performance_score = max(0.01, min(1.0, float(performance_score)))
@@ -1536,6 +1896,7 @@ class TrainableMAICL:
                  hard_ml_gate_threshold: Optional[float] = None,
                  k_shot: Optional[int] = None,
                  preserve_mechanism_performance: bool = False,
+                 preserved_few_shot_examples: Optional[List[Dict[str, Any]]] = None,
                  **kwargs) -> Dict:
         """
         Evaluate the MA-ICL system
@@ -1556,6 +1917,17 @@ class TrainableMAICL:
         
         Note: X_pool and y_pool MUST be from the training set only to avoid data leakage.
         """
+        # CRITICAL: Auto-enable preservation if flag is set (after training restoration)
+        # This ensures evaluate() calls after training use the best snapshot's routing weights
+        # FIX: Don't reset flag - keep it persistent across multiple evaluate() calls
+        if hasattr(self, '_use_best_snapshot_for_evaluation') and self._use_best_snapshot_for_evaluation:
+            if not preserve_mechanism_performance:
+                preserve_mechanism_performance = True
+                logger.info(f"  [Evaluate] Auto-enabled preserve_mechanism_performance=True (using best snapshot's routing weights)")
+            # FIX: Keep flag persistent - don't reset after first use
+            # This allows multiple evaluate() calls (e.g., validation check, then test) to all use preservation
+            # self._use_best_snapshot_for_evaluation = False  # REMOVED: Keep flag persistent
+        
         # Use provided k_shot or instance default
         if k_shot is not None:
             self.k_shot = k_shot
@@ -1575,7 +1947,8 @@ class TrainableMAICL:
             self.llm, self.mechanisms, self.mechanism_types,
             self.mech_generator.ml_mechanism, self.feature_cols, self.scaler, att_temp,
             task_type=self.task_type, class_names=self.class_names,
-            hard_ml_gate_threshold=hard_gate, min_ml_weight=min_w, max_ml_weight=max_w
+            hard_ml_gate_threshold=hard_gate, min_ml_weight=min_w, max_ml_weight=max_w,
+            use_scaling=getattr(self, 'use_scaling', True)  # Pass use_scaling flag
         )
         
         # Transfer mechanism performance scores
@@ -1652,11 +2025,32 @@ class TrainableMAICL:
             if X_original is not None:
                 logger.warning(f"[Evaluate] X_original length ({len(X_original) if X_original else 0}) doesn't match X length ({len(X)}), using vectorized features")
         
-        # Get k_shot from instance if available, otherwise default to K_SHOT_PER_TARGET
-        k_shot = getattr(self, 'k_shot', K_SHOT_PER_TARGET) if hasattr(self, 'k_shot') else K_SHOT_PER_TARGET
+        # Get k_shot from instance if available, otherwise default to 
+        k_shot = getattr(self, 'k_shot', 0) if hasattr(self, 'k_shot') else 0
         # Retrieve few-shot examples if k_shot > 0
         # IMPORTANT: X_pool and y_pool MUST be training data only (not validation/test)
-        if k_shot > 0:
+        # CRITICAL: If preserve_mechanism_performance is True, use preserved few-shot examples from best iteration
+        # This ensures final evaluation uses the exact same few-shot examples as the best iteration
+        # First, check if we should use preserved examples from best iteration
+        if preserve_mechanism_performance and hasattr(self, '_best_few_shot_examples') and self._best_few_shot_examples is not None:
+            preserved_few_shot_examples = self._best_few_shot_examples
+            logger.info(f"  [Evaluate] Using preserved few-shot examples from best iteration (ensuring consistency)")
+        elif preserved_few_shot_examples is None:
+            # If not provided and not in instance, set to None
+            preserved_few_shot_examples = None
+        
+        # CRITICAL: If preserved_few_shot_examples are provided (e.g., from best iteration), use them
+        # This ensures final evaluation uses the exact same few-shot examples as the best iteration
+        # CRITICAL FIX: Handle empty list explicitly (when k_shot=0) to ensure consistency
+        if preserved_few_shot_examples is not None:
+            # Use preserved examples even if empty (k_shot=0 case)
+            few_shot_examples = preserved_few_shot_examples
+            few_shot_list = [few_shot_examples] * len(x_dicts)
+            if len(few_shot_examples) > 0:
+                logger.info(f"[Few-shot] Using preserved {len(few_shot_examples)} examples from best iteration (ensuring consistency with best performance)")
+            else:
+                logger.info(f"[Few-shot] Using preserved empty few-shot examples (k_shot=0) from best iteration (ensuring consistency with best performance)")
+        elif k_shot > 0:
             if len(X_pool) == 0 or len(y_pool) == 0:
                 logger.warning(f"[Few-shot] Training pool is empty (X_pool: {len(X_pool)}, y_pool: {len(y_pool)}), skipping few-shot examples")
                 few_shot_list = [[]] * len(x_dicts)
@@ -1694,29 +2088,36 @@ class TrainableMAICL:
             few_shot_list = [[]] * len(x_dicts)
         
         # Track individual mechanism performance for adaptive weighting
-        # CRITICAL FIX: If we're in pre-training mode, preserve the snapshot to maintain baseline performance.
-        # Otherwise, recalculate mechanism performance for accurate routing.
+        # CRITICAL FIX: Check preserve_mechanism_performance FIRST before relax_routing
+        # This ensures preservation works even when relax_routing=False (final evaluation)
         if is_pre_training:
             # Pre-training: preserve snapshot to maintain baseline performance
             # This ensures MA-ICL starts at ML baseline (not dragged down by LLM mechanisms)
             should_recalculate = False
             should_update_snapshot = False
             logger.info(f"  [Evaluate] Preserving pre-training performance snapshot to maintain baseline accuracy")
-        elif relax_routing and preserve_mechanism_performance:
-            # During training with explicit preservation: recalculate for accuracy but don't update snapshot
-            # This ensures accurate routing while maintaining consistency with training logs
-            should_recalculate = True
-            should_update_snapshot = False  # Don't update snapshot to match training behavior
-            logger.info(f"  [Evaluate] Recalculating mechanism performance on evaluation set (preserving snapshot for consistency)")
+        elif preserve_mechanism_performance:
+            # CRITICAL: When preserve_mechanism_performance=True, DO NOT recalculate
+            # This ensures final evaluation uses the exact same routing as the best iteration
+            # Recalculating would change routing and thus change performance, defeating the purpose
+            # of preserving the best snapshot's performance scores
+            should_recalculate = False
+            should_update_snapshot = False  # Don't update snapshot
+            logger.info(f"  [Evaluate] Preserving mechanism performance scores from best snapshot (NOT recalculating)")
+            best_iter = getattr(self, '_best_iteration', None)
+            if best_iter is not None:
+                logger.info(f"  [Evaluate] This ensures final evaluation uses the same routing as iteration {best_iter} (best performance)")
+            else:
+                logger.info(f"  [Evaluate] This ensures final evaluation uses the same routing as the best iteration")
             if hasattr(self, 'mechanism_performance_snapshot') and self.mechanism_performance_snapshot:
-                logger.debug(f"  [Evaluate] Snapshot exists but will be recalculated: {self.mechanism_performance_snapshot}")
-        elif relax_routing and not preserve_mechanism_performance:
-            # During training without explicit preservation: recalculate and update snapshot
+                logger.info(f"  [Evaluate] Using snapshot scores: {self.mechanism_performance_snapshot}")
+        elif relax_routing:
+            # During training (relax_routing=True) without explicit preservation: recalculate and update snapshot
             should_recalculate = True
             should_update_snapshot = True
             logger.debug(f"  [Evaluate] Recalculating mechanism performance scores (training mode, updating snapshot)")
         else:
-            # Final evaluation (test set): always recalculate for accuracy
+            # Final evaluation (test set) without preservation: recalculate for accuracy
             should_recalculate = True
             should_update_snapshot = True
             logger.info(f"  [Evaluate] Recalculating mechanism performance scores on test set (final evaluation)")
@@ -1735,18 +2136,26 @@ class TrainableMAICL:
             # Recalculate mechanism performance based on initial predictions
             self._evaluate_mechanism_performance(initial_all_agent_preds, initial_true_values, predictor)
             
-            # Update snapshot with new performance scores only if we should update
-            if should_update_snapshot and hasattr(predictor, 'mechanism_performance'):
-                for mech_idx, perf in predictor.mechanism_performance.items():
-                    if not hasattr(self, 'mechanism_performance_snapshot'):
-                        self.mechanism_performance_snapshot = {}
-                    self.mechanism_performance_snapshot[mech_idx] = perf
-            
             # Second pass: Re-make predictions with correct routing weights
             batch_outputs = predictor.predict_batch(x_dicts, few_shot_list=few_shot_list)
             predictions = [out[0] for out in batch_outputs]
             all_agent_preds = [out[1] for out in batch_outputs]
             true_values = [float(y[i]) for i in range(len(y))]
+            
+            # CRITICAL FIX: Update snapshot AFTER second pass completes
+            # The second pass uses the recalculated performance scores, and this is where the best performance occurs
+            # We must capture the predictor's final mechanism_performance state, not the intermediate state
+            if should_update_snapshot and hasattr(predictor, 'mechanism_performance'):
+                for mech_idx, perf in predictor.mechanism_performance.items():
+                    if not hasattr(self, 'mechanism_performance_snapshot'):
+                        self.mechanism_performance_snapshot = {}
+                    self.mechanism_performance_snapshot[mech_idx] = perf
+                # Also update mechanism_metrics_snapshot if available
+                if hasattr(predictor, 'mechanism_metrics') and predictor.mechanism_metrics:
+                    if not hasattr(self, 'mechanism_metrics_snapshot'):
+                        self.mechanism_metrics_snapshot = {}
+                    for mech_idx, mech_metrics in predictor.mechanism_metrics.items():
+                        self.mechanism_metrics_snapshot[mech_idx] = copy.deepcopy(mech_metrics)
         else:
             # Not recalculating: make predictions once with snapshot scores
             batch_outputs = predictor.predict_batch(x_dicts, few_shot_list=few_shot_list)
@@ -1803,6 +2212,17 @@ class TrainableMAICL:
             if return_details:
                 result["recall"] = recall_score(y_true, y_pred, zero_division=0, average='weighted' if len(self.class_names) > 2 else 'binary')
             
+            # Store few-shot examples used in this evaluation (for preservation)
+            if len(few_shot_list) > 0 and len(few_shot_list[0]) > 0:
+                result["few_shot_examples"] = few_shot_list[0]  # All samples use same few-shot examples
+            
+            # CRITICAL FIX: Include predictor's final mechanism_performance in returned metrics
+            # This ensures snapshot captures the routing weights that achieved the best performance (after second pass)
+            if hasattr(predictor, 'mechanism_performance') and predictor.mechanism_performance:
+                result["predictor_mechanism_performance"] = copy.deepcopy(predictor.mechanism_performance)
+            if hasattr(predictor, 'mechanism_metrics') and predictor.mechanism_metrics:
+                result["predictor_mechanism_metrics"] = copy.deepcopy(predictor.mechanism_metrics)
+            
             return result
         else:
             # Regression task: use regression_loss_metric (MAE or R2)
@@ -1823,7 +2243,7 @@ class TrainableMAICL:
                 # Default to MAE (or if regression_loss_metric is None, use MAE)
                 loss = mae
             
-            return {
+            result = {
                 "r2": r2,
                 "mae": mae,
                 "rmse": rmse,
@@ -1831,6 +2251,18 @@ class TrainableMAICL:
                 "predictions": predictions,
                 "true_values": true_values
             }
+            # Store few-shot examples used in this evaluation (for preservation)
+            if len(few_shot_list) > 0 and len(few_shot_list[0]) > 0:
+                result["few_shot_examples"] = few_shot_list[0]  # All samples use same few-shot examples
+            
+            # CRITICAL FIX: Include predictor's final mechanism_performance in returned metrics
+            # This ensures snapshot captures the routing weights that achieved the best performance (after second pass)
+            if hasattr(predictor, 'mechanism_performance') and predictor.mechanism_performance:
+                result["predictor_mechanism_performance"] = copy.deepcopy(predictor.mechanism_performance)
+            if hasattr(predictor, 'mechanism_metrics') and predictor.mechanism_metrics:
+                result["predictor_mechanism_metrics"] = copy.deepcopy(predictor.mechanism_metrics)
+            
+            return result
     
     def evaluate_llm_only(self, X: np.ndarray, y: np.ndarray, X_pool: np.ndarray, y_pool: np.ndarray,
                           return_details: bool = False, k_shot: Optional[int] = None,
@@ -1878,7 +2310,8 @@ class TrainableMAICL:
             self.feature_cols, self.scaler, att_temp,
             task_type=self.task_type, class_names=self.class_names,
             hard_ml_gate_threshold=0.0,  # No ML routing needed
-            min_ml_weight=0.0, max_ml_weight=0.0
+            min_ml_weight=0.0, max_ml_weight=0.0,
+            use_scaling=getattr(self, 'use_scaling', True)  # Pass use_scaling flag
         )
         
         # Transfer mechanism performance scores for LLM mechanisms only
@@ -1915,7 +2348,7 @@ class TrainableMAICL:
             if X_original is not None:
                 logger.warning(f"[LLM-only Evaluate] X_original length ({len(X_original) if X_original else 0}) doesn't match X length ({len(X)}), using vectorized features")
         
-        k_shot = getattr(self, 'k_shot', K_SHOT_PER_TARGET) if hasattr(self, 'k_shot') else K_SHOT_PER_TARGET
+        k_shot = getattr(self, 'k_shot', 0) if hasattr(self, 'k_shot') else 0
         
         # Retrieve few-shot examples if k_shot > 0
         if k_shot > 0:
@@ -2034,19 +2467,33 @@ class TrainableMAICL:
               iterations: int = 3, ml_residuals: Optional[np.ndarray] = None,
               accept_eval_max: Optional[int] = None, accept_eval_min: Optional[int] = None,
               k_shot: int = 0, X_test: Optional[np.ndarray] = None, y_test: Optional[np.ndarray] = None,
-              use_test_for_acceptance: bool = False, X_train_original: Optional[List[Dict]] = None,
+              acceptance_set: Optional[str] = None, X_train_original: Optional[List[Dict]] = None,
               X_val_original: Optional[List[Dict]] = None, X_test_original: Optional[List[Dict]] = None,
-              output_dir: Optional[str] = None):
+              output_dir: Optional[str] = None, use_test_for_acceptance: Optional[bool] = None, **kwargs):
         """Train the MA-ICL system
         
         Args:
-            accept_eval_max: Maximum samples for acceptance evaluation. If None, uses full validation set.
+            accept_eval_max: Maximum samples for acceptance evaluation. If None, uses full acceptance set.
             accept_eval_min: Minimum samples for acceptance evaluation. If None, uses accept_max // 4 or full set.
-            X_test: Optional test set features. Used if use_test_for_acceptance=True.
-            y_test: Optional test set targets. Used if use_test_for_acceptance=True.
-            use_test_for_acceptance: If True, use test set for acceptance evaluation instead of validation set.
-                                    This helps ensure optimization generalizes to test set, but risks overfitting to test.
+            X_test: Optional test set features. Used if acceptance_set="test".
+            y_test: Optional test set targets. Used if acceptance_set="test".
+            acceptance_set: Which dataset to use for acceptance evaluation. Options: "test", "validation" (default), or "train".
+                           "test" helps ensure optimization generalizes to test set, but risks overfitting to test.
+                           "train" may overfit to training data but can be useful for debugging.
+            use_test_for_acceptance: (Deprecated) Boolean flag for backward compatibility. If provided, converts to acceptance_set.
         """
+        # Backward compatibility: convert old boolean parameter to new string parameter
+        if use_test_for_acceptance is not None:
+            if acceptance_set is not None:
+                logger.warning("Both 'acceptance_set' and 'use_test_for_acceptance' provided. Using 'acceptance_set'.")
+            else:
+                acceptance_set = "test" if use_test_for_acceptance else "validation"
+                logger.info(f"Converted deprecated 'use_test_for_acceptance={use_test_for_acceptance}' to 'acceptance_set={acceptance_set}'")
+        
+        # Default to validation if neither is provided
+        if acceptance_set is None:
+            acceptance_set = "validation"
+        
         logger.info(f"\n[Training] Starting {iterations} iterations...")
         
         # Store output_dir for artifact persistence
@@ -2078,14 +2525,19 @@ class TrainableMAICL:
             logger.info(f"  [K-shot] Using {k_shot} few-shot examples per prediction")
         
         # Choose which set to use for acceptance evaluation
-        if use_test_for_acceptance:
+        if acceptance_set == "test":
             if X_test is None or y_test is None:
-                raise ValueError("use_test_for_acceptance=True requires X_test and y_test to be provided")
+                raise ValueError("acceptance_set='test' requires X_test and y_test to be provided")
             X_accept = X_test
             y_accept = y_test
             set_name = "test"
             logger.info(f"  [AcceptEval] Using TEST set for acceptance evaluation (n={len(X_test)} samples)")
-        else:
+        elif acceptance_set == "train":
+            X_accept = X_train
+            y_accept = y_train
+            set_name = "train"
+            logger.info(f"  [AcceptEval] Using TRAIN set for acceptance evaluation (n={len(X_train)} samples)")
+        else:  # default: "validation"
             X_accept = X_val
             y_accept = y_val
             set_name = "validation"
@@ -2200,15 +2652,22 @@ class TrainableMAICL:
         
         initial_metrics = self.evaluate(X_accept_consistent, y_accept_consistent, X_train, y_train, relax_routing=True,
                                       k_shot=self.k_shot, **routing_kwargs)
-        initial_loss = initial_metrics['loss']
-        logger.info(f"  [Initial Checkpoint] Pre-training loss: {initial_loss:.4f}")
+        initial_loss = initial_metrics.get('loss', None)
+        logger.info(f"  [Initial Checkpoint] Pre-training evaluation completed")
         
         # Initialize best_snapshot with pre-training state
-        best_loss = float(initial_loss)
-        best_mechanisms = copy.deepcopy(self.mechanisms)
-        # Track best metrics across all iterations (not just loss)
-        best_acc = initial_metrics.get('accuracy', 0.0) if self.task_type == "classification" else None
-        best_f1 = initial_metrics.get('f1', 0.0) if self.task_type == "classification" else None
+        # Track best metrics across all iterations (ONLY performance metrics, not loss)
+        # Store as instance attributes for restoration logic
+        if self.task_type == "classification":
+            self._best_acc = initial_metrics.get('accuracy', 0.0)
+            self._best_f1 = initial_metrics.get('f1', 0.0)
+            best_acc = self._best_acc
+            best_f1 = self._best_f1
+        else:
+            self._best_acc = None
+            self._best_f1 = None
+            best_acc = None
+            best_f1 = None
         # For regression: track best R2 and MAE (initialize early to avoid AttributeError)
         if self.task_type == "regression":
             self._best_r2 = initial_metrics.get('r2', None)
@@ -2216,17 +2675,63 @@ class TrainableMAICL:
         else:
             self._best_r2 = None
             self._best_mae = None
+        
+        # CRITICAL: Store overall_metrics in initial snapshot for proper restoration comparison
+        # ONLY store performance metrics (R2, MAE, ACC, F1), NOT loss
+        overall_metrics = {}
+        if self.task_type == "regression":
+            if self._best_r2 is not None:
+                overall_metrics['r2'] = float(self._best_r2)
+            if self._best_mae is not None:
+                overall_metrics['mae'] = float(self._best_mae)
+        elif self.task_type == "classification":
+            if best_acc is not None:
+                overall_metrics['accuracy'] = float(best_acc)
+            if best_f1 is not None:
+                overall_metrics['f1'] = float(best_f1)
+        
+        # Capture few-shot examples from initial evaluation (for consistency in final evaluation)
+        # CRITICAL: These few-shot examples must be preserved to ensure final evaluation matches training performance
+        few_shot_examples_from_initial = initial_metrics.get('few_shot_examples', None)
+        if few_shot_examples_from_initial is not None and len(few_shot_examples_from_initial) > 0:
+            logger.info(f"  [Initial Checkpoint] Captured {len(few_shot_examples_from_initial)} few-shot examples from initial evaluation")
+        else:
+            # CRITICAL FIX: When k_shot=0, explicitly save empty list to indicate no few-shot examples were used
+            if self.k_shot == 0:
+                few_shot_examples_from_initial = []  # Explicitly save empty list when k_shot=0
+                logger.info(f"  [Initial Checkpoint] Captured empty few-shot examples (k_shot=0) to ensure consistency")
+            else:
+                logger.warning(f"  [Initial Checkpoint] WARNING: No few-shot examples found in initial_metrics! k_shot={self.k_shot}")
+                if self.k_shot > 0:
+                    logger.warning(f"  [Initial Checkpoint] Few-shot examples should have been retrieved (k_shot={self.k_shot}). This may cause final evaluation to differ.")
+        
+        # Store routing config for exact restoration
+        routing_config = {
+            'relax_routing': True,  # Training always uses relax_routing=True
+            'min_ml_weight': routing_kwargs.get('min_ml_weight', getattr(self, 'min_ml_weight', None)),
+            'max_ml_weight': routing_kwargs.get('max_ml_weight', getattr(self, 'max_ml_weight', None)),
+            'attention_temp': routing_kwargs.get('attention_temp', getattr(self, 'attention_temp', None)),
+            'hard_ml_gate_threshold': routing_kwargs.get('hard_ml_gate_threshold', getattr(self, 'hard_ml_gate_threshold', None))
+        }
+        
         best_snapshot = {
             "iteration": 0,
-            "loss": float(initial_loss),
+            "overall_metrics": overall_metrics,  # Store overall metrics for performance comparison (ONLY performance metrics)
             "mechanisms": copy.deepcopy(self.mechanisms),
             "mechanism_types": copy.deepcopy(self.mechanism_types),
             "mechanism_performance": copy.deepcopy(getattr(self, 'mechanism_performance_snapshot', {})),
-            "mechanism_metrics": copy.deepcopy(getattr(self, 'mechanism_metrics_snapshot', {}))
+            "mechanism_metrics": copy.deepcopy(getattr(self, 'mechanism_metrics_snapshot', {})),
+            "few_shot_examples": copy.deepcopy(few_shot_examples_from_initial) if few_shot_examples_from_initial is not None else [],  # Always save list (empty if k_shot=0)
+            "k_shot": self.k_shot,  # CRITICAL: Save k_shot value to ensure final evaluation uses same value
+            "routing_config": routing_config  # Store routing config for exact restoration
         }
-        logger.info(f"  [Initial Checkpoint] Saved pre-training state with {len(best_mechanisms)} mechanisms")
+        logger.info(f"  [Initial Checkpoint] Saved pre-training state with {len(self.mechanisms)} mechanisms")
         if self.task_type == "classification":
-            logger.info(f"  [Best Metrics] Initial: ACC={best_acc:.4f}, F1={best_f1:.4f}, Loss={best_loss:.4f}")
+            logger.info(f"  [Best Metrics] Initial: ACC={best_acc:.4f}, F1={best_f1:.4f}")
+        elif self.task_type == "regression":
+            r2_str = f"{self._best_r2:.4f}" if self._best_r2 is not None else "N/A"
+            mae_str = f"{self._best_mae:.4f}" if self._best_mae is not None else "N/A"
+            logger.info(f"  [Best Metrics] Initial: R2={r2_str}, MAE={mae_str}")
         
         for i in range(iterations):
             logger.info(f"\nIteration {i+1}/{iterations}")
@@ -2239,6 +2744,7 @@ class TrainableMAICL:
             # Track if mechanisms were rejected during initial generation phase
             # (This happens before TextGrad, so we need to track it separately)
             mechanisms_rejected_at_generation = False
+            new_mechanisms_generated_and_accepted = False  # Track if new mechanisms were generated and accepted
             
             # Generate new mechanisms if needed
             if len(self.mech_generator.unknown_mechanisms) == 0:
@@ -2258,6 +2764,14 @@ class TrainableMAICL:
                 self.mechanisms = self.mech_generator.get_all_mechanisms()
                 self.mechanism_types = self.mech_generator.get_mechanism_types()
                 logger.info(f"  ✓ Generated {len(new_mechanisms)} mechanisms")
+                # Log the generated mechanisms to verify they use the new format
+                for idx, mech in enumerate(new_mechanisms):
+                    logger.info(f"  [Generated Mechanism {idx+1}] Preview (first 500 chars): {mech[:500]}...")
+                    # Check if it contains the new format indicators
+                    if "INTERPRETATION" in mech or "intermediate" in mech.lower() or "saturation" in mech.lower():
+                        logger.info(f"  ✓ Mechanism {idx+1} uses new format (nonlinear transformations, intermediate variables)")
+                    else:
+                        logger.warning(f"  ⚠️  Mechanism {idx+1} may not be using the new format - check generation code")
                 
                 # CRITICAL: Evaluate newly generated LLM mechanisms in isolation first to get initial performance scores
                 # This prevents them from dragging down the full system evaluation due to poor initial routing
@@ -2289,7 +2803,8 @@ class TrainableMAICL:
                             self.feature_cols, self.scaler, self.attention_temp,
                             task_type=self.task_type, class_names=self.class_names,
                             hard_ml_gate_threshold=0.0,
-                            min_ml_weight=0.0, max_ml_weight=0.0
+                            min_ml_weight=0.0, max_ml_weight=0.0,
+                            use_scaling=getattr(self, 'use_scaling', True)  # Pass use_scaling flag
                         )
                         
                         # Get predictions from new mechanisms
@@ -2391,17 +2906,56 @@ class TrainableMAICL:
                 
                 new_mech_metrics = self.evaluate(X_accept_consistent, y_accept_consistent, X_train, y_train, 
                                                 relax_routing=True, k_shot=self.k_shot, **routing_kwargs_temp)
-                new_mech_loss = new_mech_metrics['loss']
                 
-                # For regression: allow mechanisms that degrade by up to 0.7 vs best-seen
+                # Check performance metrics (ONLY performance metrics, NOT loss)
+                # For regression: allow mechanisms that degrade by up to 0.1 R2 or 0.1 MAE vs best-seen
                 # This gives TextGrad a chance to optimize them (they might improve after optimization)
                 # The key is that we'll use STRICT criteria when accepting TextGrad-optimized versions
-                # For classification: allow mechanisms that degrade by up to 0.3 vs best-seen
+                # For classification: allow mechanisms that degrade by up to 0.1 ACC or 0.1 F1 vs best-seen
                 # We'll use stricter criteria when accepting TextGrad updates
-                max_degradation_for_new_mech = 0.7 if self.task_type == "regression" else 0.3
-                if new_mech_loss > best_loss + max_degradation_for_new_mech:
-                    logger.warning(f"  ⚠️  Newly generated mechanisms degrade performance significantly (loss={new_mech_loss:.4f} vs best={best_loss:.4f}, diff={new_mech_loss - best_loss:+.4f})")
+                should_reject_new_mech = False
+                if self.task_type == "regression":
+                    new_mech_r2 = new_mech_metrics.get('r2', None)
+                    new_mech_mae = new_mech_metrics.get('mae', None)
+                    best_r2 = getattr(self, '_best_r2', None)
+                    best_mae = getattr(self, '_best_mae', None)
+                    max_r2_degradation = 0.1
+                    max_mae_degradation = 0.1
+                    if (best_r2 is not None and new_mech_r2 is not None and new_mech_r2 < best_r2 - max_r2_degradation) or \
+                       (best_mae is not None and new_mech_mae is not None and new_mech_mae > best_mae + max_mae_degradation):
+                        should_reject_new_mech = True
+                        logger.warning(f"  ⚠️  Newly generated mechanisms degrade performance significantly (R2: {new_mech_r2:.4f} vs best={best_r2:.4f}, MAE: {new_mech_mae:.4f} vs best={best_mae:.4f})")
+                elif self.task_type == "classification":
+                    new_mech_acc = new_mech_metrics.get('accuracy', None)
+                    new_mech_f1 = new_mech_metrics.get('f1', None)
+                    best_acc_val = self._best_acc if hasattr(self, '_best_acc') and self._best_acc is not None else 0.0
+                    best_f1_val = self._best_f1 if hasattr(self, '_best_f1') and self._best_f1 is not None else 0.0
+                    max_acc_degradation = 0.1
+                    max_f1_degradation = 0.1
+                    if (new_mech_acc is not None and new_mech_acc < best_acc_val - max_acc_degradation) or \
+                       (new_mech_f1 is not None and new_mech_f1 < best_f1_val - max_f1_degradation):
+                        should_reject_new_mech = True
+                        logger.warning(f"  ⚠️  Newly generated mechanisms degrade performance significantly (ACC: {new_mech_acc:.4f} vs best={best_acc_val:.4f}, F1: {new_mech_f1:.4f} vs best={best_f1_val:.4f})")
+                
+                if should_reject_new_mech:
                     logger.warning(f"  ⚠️  Rejecting new mechanisms and keeping best state to stay close to ML baseline")
+                    # Log rejected mechanisms for debugging (save to a separate file)
+                    if output_dir:
+                        try:
+                            rejected_mech_path = os.path.join(output_dir, f"rejected_mechanisms_iter_{i+1}.txt")
+                            with open(rejected_mech_path, 'w', encoding='utf-8') as f:
+                                f.write("=" * 80 + "\n")
+                                f.write(f"REJECTED MECHANISMS FROM ITERATION {i+1}\n")
+                                f.write("=" * 80 + "\n\n")
+                                f.write(f"Reason: Performance degraded significantly\n")
+                                f.write(f"Generated {len(new_mechanisms)} mechanism(s) but rejected due to poor performance\n\n")
+                                for idx, mech in enumerate(new_mechanisms):
+                                    f.write(f"[REJECTED LLM MECHANISM {idx+1}]\n")
+                                    f.write("-" * 80 + "\n")
+                                    f.write(f"{mech}\n\n")
+                            logger.info(f"  ✓ Saved rejected mechanisms to {rejected_mech_path} for inspection")
+                        except Exception as e:
+                            logger.warning(f"  Failed to save rejected mechanisms: {e}")
                     # Remove the newly generated mechanisms
                     self.mech_generator.unknown_mechanisms = []
                     self.mechanisms = self.mech_generator.get_all_mechanisms()
@@ -2410,11 +2964,8 @@ class TrainableMAICL:
                     # Track rejection (will be used to update counter later)
                     mechanisms_rejected_at_generation = True
                 else:
-                    if new_mech_loss > best_loss:
-                        logger.info(f"  ✓ New mechanisms accepted (loss={new_mech_loss:.4f} vs best={best_loss:.4f}, diff={new_mech_loss - best_loss:+.4f})")
-                        logger.info(f"  ✓ Will allow TextGrad to optimize them - using stricter acceptance criteria for optimized versions")
-                    else:
-                        logger.info(f"  ✓ New mechanisms acceptable (loss={new_mech_loss:.4f} vs best={best_loss:.4f})")
+                    logger.info(f"  ✓ New mechanisms accepted - will allow TextGrad to optimize them using stricter acceptance criteria for optimized versions")
+                    new_mechanisms_generated_and_accepted = True  # Mark that new mechanisms were accepted
             
             # CRITICAL: Ensure mechanisms are synced with generator before evaluation
             # This ensures current_loss is computed on the correct state
@@ -2436,27 +2987,34 @@ class TrainableMAICL:
             
             # For DeepChem datasets, pass X_original for acceptance evaluation
             eval_kwargs = dict(routing_kwargs)
-            if hasattr(self, 'X_val_original') and hasattr(self, 'X_test_original'):
-                # Determine which X_original to use based on which set is used for acceptance
-                if use_test_for_acceptance and self.X_test_original is not None:
-                    # Use consistent subset of X_test_original matching accept_idx
-                    if len(accept_idx) == len(X_accept):
-                        X_accept_original = self.X_test_original
-                    else:
-                        X_accept_original = [self.X_test_original[i] for i in accept_idx] if len(accept_idx) <= len(self.X_test_original) else None
-                    if X_accept_original is not None:
-                        eval_kwargs['X_original'] = X_accept_original
-                elif not use_test_for_acceptance and self.X_val_original is not None:
-                    # Use consistent subset of X_val_original matching accept_idx
-                    if len(accept_idx) == len(X_accept):
-                        X_accept_original = self.X_val_original
-                    else:
-                        X_accept_original = [self.X_val_original[i] for i in accept_idx] if len(accept_idx) <= len(self.X_val_original) else None
-                    if X_accept_original is not None:
-                        eval_kwargs['X_original'] = X_accept_original
-                # Always use X_train_original as pool for few-shot examples
-                if self.X_train_original is not None:
-                    eval_kwargs['X_pool_original'] = self.X_train_original
+            # Determine which X_original to use based on which set is used for acceptance
+            if acceptance_set == "test" and hasattr(self, 'X_test_original') and self.X_test_original is not None:
+                # Use consistent subset of X_test_original matching accept_idx
+                if len(accept_idx) == len(X_accept):
+                    X_accept_original = self.X_test_original
+                else:
+                    X_accept_original = [self.X_test_original[i] for i in accept_idx] if len(accept_idx) <= len(self.X_test_original) else None
+                if X_accept_original is not None:
+                    eval_kwargs['X_original'] = X_accept_original
+            elif acceptance_set == "validation" and hasattr(self, 'X_val_original') and self.X_val_original is not None:
+                # Use consistent subset of X_val_original matching accept_idx
+                if len(accept_idx) == len(X_accept):
+                    X_accept_original = self.X_val_original
+                else:
+                    X_accept_original = [self.X_val_original[i] for i in accept_idx] if len(accept_idx) <= len(self.X_val_original) else None
+                if X_accept_original is not None:
+                    eval_kwargs['X_original'] = X_accept_original
+            elif acceptance_set == "train" and hasattr(self, 'X_train_original') and self.X_train_original is not None:
+                # Use consistent subset of X_train_original matching accept_idx
+                if len(accept_idx) == len(X_accept):
+                    X_accept_original = self.X_train_original
+                else:
+                    X_accept_original = [self.X_train_original[i] for i in accept_idx] if len(accept_idx) <= len(self.X_train_original) else None
+                if X_accept_original is not None:
+                    eval_kwargs['X_original'] = X_accept_original
+            # Always use X_train_original as pool for few-shot examples
+            if self.X_train_original is not None:
+                eval_kwargs['X_pool_original'] = self.X_train_original
             
             metrics = self.evaluate(X_accept_consistent, y_accept_consistent, X_train, y_train, relax_routing=True, 
                                      k_shot=self.k_shot, **eval_kwargs)
@@ -2472,24 +3030,25 @@ class TrainableMAICL:
             current_r2 = metrics.get('r2', None) if self.task_type == "regression" else None
             current_mae = metrics.get('mae', None) if self.task_type == "regression" else None
             
-            # CRITICAL FIX: Update best_loss and best metrics if current state is better
+            # CRITICAL FIX: Update best metrics if current state is better
             # This ensures acceptance logic always compares against the true best seen so far
-            # We update best_loss/metrics here for comparison purposes, but best_snapshot is updated after TextGrad
-            if current_loss < best_loss:
-                best_loss = float(current_loss)
-                if self.task_type == "classification":
-                    if current_acc is not None and (best_acc is None or current_acc > best_acc):
-                        best_acc = current_acc
-                    if current_f1 is not None and (best_f1 is None or current_f1 > best_f1):
-                        best_f1 = current_f1
-                else:
-                    # Regression: update best R2 and MAE
-                    if current_r2 is not None:
-                        if not hasattr(self, '_best_r2') or self._best_r2 is None or current_r2 > self._best_r2:
-                            self._best_r2 = current_r2
-                    if current_mae is not None:
-                        if not hasattr(self, '_best_mae') or self._best_mae is None or current_mae < self._best_mae:
-                            self._best_mae = current_mae
+            # We update best metrics here for comparison purposes, but best_snapshot is updated after TextGrad
+            # ONLY use performance metrics (R2, MAE, ACC, F1), NOT loss
+            if self.task_type == "classification":
+                if current_acc is not None and (self._best_acc is None or current_acc > self._best_acc):
+                    self._best_acc = current_acc
+                    best_acc = self._best_acc
+                if current_f1 is not None and (self._best_f1 is None or current_f1 > self._best_f1):
+                    self._best_f1 = current_f1
+                    best_f1 = self._best_f1
+            else:
+                # Regression: update best R2 and MAE
+                if current_r2 is not None:
+                    if not hasattr(self, '_best_r2') or self._best_r2 is None or current_r2 > self._best_r2:
+                        self._best_r2 = current_r2
+                if current_mae is not None:
+                    if not hasattr(self, '_best_mae') or self._best_mae is None or current_mae < self._best_mae:
+                        self._best_mae = current_mae
             
             # NOTE: Don't update best_snapshot here - wait until after TextGrad updates
             # This ensures the checkpoint reflects the actual accepted state, not a pre-TextGrad state
@@ -2623,7 +3182,7 @@ class TrainableMAICL:
                             
                             if self.task_type == "regression":
                                 y_pred = ml_residuals_for_feedback[idx] + y_train[idx]
-                                logger.info(f"    {rank}. {key_feats} → pred={y_pred:.2f}, true={y_train[idx]:.2f}, residual={ml_residuals_for_feedback[idx]:+.2f}")
+                                logger.info(f"    {rank}. {key_feats} → ML-pred={y_pred:.2f}, true={y_train[idx]:.2f}, residual={ml_residuals_for_feedback[idx]:+.2f}")
                             else:
                                 # For classification: use stored predictions directly
                                 if ml_predictions_for_display is not None:
@@ -2641,9 +3200,9 @@ class TrainableMAICL:
                                 if class_names:
                                     pred_name = class_names[pred_idx] if 0 <= pred_idx < len(class_names) else str(pred_idx)
                                     true_name = class_names[true_idx] if 0 <= true_idx < len(class_names) else str(true_idx)
-                                    logger.info(f"    {rank}. {key_feats} → pred={pred_name}, true={true_name}, {match_status}")
+                                    logger.info(f"    {rank}. {key_feats} → ML-pred={pred_name}, true={true_name}, {match_status}")
                                 else:
-                                    logger.info(f"    {rank}. {key_feats} → pred={pred_idx}, true={true_idx}, {match_status}")
+                                    logger.info(f"    {rank}. {key_feats} → ML-pred={pred_idx}, true={true_idx}, {match_status}")
                     else:
                         # ML is disabled - show training samples without prediction/residual information
                         # Select diverse samples from training set
@@ -2699,6 +3258,43 @@ class TrainableMAICL:
                 except Exception as e:
                     logger.warning(f"  [TextGrad] Failed to build enhanced error feedback: {e}, using simple feedback")
                     error_feedback_full = f"Current loss: {current_loss:.4f}. Improve predictions."
+                
+                # Add LLM-only performance information to error feedback
+                # This helps LLM mechanisms learn to work independently, not just complement ML
+                try:
+                    llm_only_kwargs_feedback = {}
+                    if hasattr(self, 'X_train_original'):
+                        llm_only_kwargs_feedback['X_pool_original'] = self.X_train_original
+                    if hasattr(self, 'X_val_original') and X_accept_consistent is X_val:
+                        llm_only_kwargs_feedback['X_original'] = self.X_val_original
+                        if len(accept_idx) < len(self.X_val_original):
+                            llm_only_kwargs_feedback['X_original'] = [self.X_val_original[j] for j in accept_idx]
+                    elif hasattr(self, 'X_test_original') and X_accept_consistent is X_test:
+                        llm_only_kwargs_feedback['X_original'] = self.X_test_original
+                        if len(accept_idx) < len(self.X_test_original):
+                            llm_only_kwargs_feedback['X_original'] = [self.X_test_original[j] for j in accept_idx]
+                    
+                    llm_only_metrics_feedback = self.evaluate_llm_only(
+                        X_accept_consistent, y_accept_consistent, X_train, y_train,
+                        return_details=True, k_shot=self.k_shot, **llm_only_kwargs_feedback
+                    )
+                    
+                    if self.task_type == "regression":
+                        llm_only_r2_fb = llm_only_metrics_feedback.get('r2', -1.0)
+                        llm_only_mae_fb = llm_only_metrics_feedback.get('mae', 1e9)
+                        llm_only_info = f"\n\n[LLM-ONLY PERFORMANCE] Your mechanisms evaluated independently (without ML): R²={llm_only_r2_fb:.4f}, MAE={llm_only_mae_fb:.4f}. "
+                        llm_only_info += f"While you should complement the ML model, also aim to improve your independent performance. "
+                        llm_only_info += f"Current ensemble performance: R²={metrics.get('r2', -1.0):.4f}, MAE={metrics.get('mae', 1e9):.4f}."
+                    else:
+                        llm_only_acc_fb = llm_only_metrics_feedback.get('accuracy', 0.0)
+                        llm_only_f1_fb = llm_only_metrics_feedback.get('f1', 0.0)
+                        llm_only_info = f"\n\n[LLM-ONLY PERFORMANCE] Your mechanisms evaluated independently (without ML): ACC={llm_only_acc_fb:.4f}, F1={llm_only_f1_fb:.4f}. "
+                        llm_only_info += f"While you should complement the ML model, also aim to improve your independent performance. "
+                        llm_only_info += f"Current ensemble performance: ACC={metrics.get('accuracy', 0.0):.4f}, F1={metrics.get('f1', 0.0):.4f}."
+                    
+                    error_feedback_full = error_feedback_full + llm_only_info
+                except Exception as e:
+                    logger.debug(f"Failed to add LLM-only performance to feedback: {e}")
                 
                 error_feedbacks = [error_feedback_full] * len(llm_mechanisms)
                 # Use single-call optimization per mechanism
@@ -2782,9 +3378,9 @@ class TrainableMAICL:
                 
                 # CRITICAL FIX: Compare against BEST-SEEN metrics, not just current iteration start
                 # This prevents accepting updates that degrade from the best we've seen
-                best_acc_for_comparison = best_acc if self.task_type == "classification" and best_acc is not None else current_acc
-                best_f1_for_comparison = best_f1 if self.task_type == "classification" and best_f1 is not None else current_f1
-                best_loss_for_comparison = best_loss
+                # ONLY use performance metrics (R2, MAE, ACC, F1), NOT loss
+                best_acc_for_comparison = self._best_acc if self.task_type == "classification" and hasattr(self, '_best_acc') and self._best_acc is not None else current_acc
+                best_f1_for_comparison = self._best_f1 if self.task_type == "classification" and hasattr(self, '_best_f1') and self._best_f1 is not None else current_f1
                 
                 # ADAPTIVE acceptance threshold
                 # IMPROVED: More lenient threshold for regression to allow mechanism improvements
@@ -2796,30 +3392,10 @@ class TrainableMAICL:
                 accepted = 0
                 rejected = 0
                 
-                improvement = current_loss - new_loss
-                # Also compute improvement vs best-seen loss
-                improvement_vs_best = best_loss_for_comparison - new_loss
-                
-                # Dynamic threshold based on iteration (more lenient early on)
-                # For very poor initial mechanisms (loss > 0.5 for classification), be slightly more lenient
-                # BUT: Only allow very small degradation (0.01-0.02) to prevent accepting clearly worse updates
-                if self.task_type == "classification" and current_loss > 0.5 and i < 3:
-                    # Only in first 3 iterations, allow tiny degradation (0.01) for exploration
-                    # This prevents getting stuck but doesn't accept clearly worse updates
-                    max_degradation = 0.01  # Allow only 0.01 worse loss (very small)
-                    if new_loss <= current_loss + max_degradation:
-                        adaptive_threshold = -max_degradation  # Accept only tiny degradation
-                    else:
-                        adaptive_threshold = base_threshold * (1.0 - 0.1 * i)  # Too much degradation, use normal threshold
-                else:
-                    adaptive_threshold = base_threshold * (1.0 - 0.1 * i)  # Decreases over iterations
-                
-                # Multiple acceptance criteria
+                # SIMPLIFIED: Only check if performance metrics improved vs best-seen
                 accept = False
                 reason = ""
                 
-                # PRIORITY: Check performance metrics FIRST (R²/MAE for regression, ACC/F1 for classification)
-                # Only use loss as a secondary criterion
                 if self.task_type == "regression":
                     # For regression: prioritize R² and MAE
                     current_r2 = metrics.get('r2', None)
@@ -2841,275 +3417,45 @@ class TrainableMAICL:
                     
                     r2_improvement_vs_best_val = (new_r2 - best_r2) if (new_r2 is not None and best_r2 is not None) else 0.0
                     mae_improvement_vs_best_val = (best_mae - new_mae) if (best_mae is not None and new_mae is not None) else 0.0
-                    r2_improvement_vs_current_val = (new_r2 - current_r2) if (new_r2 is not None and current_r2 is not None) else 0.0
-                    mae_improvement_vs_current_val = (current_mae - new_mae) if (current_mae is not None and new_mae is not None) else 0.0
                     
-                    # CRITICAL: Accept if metrics improve vs best OR vs current (whichever is better)
-                    # This ensures we accept improvements even if current state is better than best-seen
-                    if (r2_improvement_vs_best_val >= metric_improvement_threshold_r2 or 
-                        mae_improvement_vs_best_val >= metric_improvement_threshold_mae or
-                        r2_improvement_vs_current_val >= metric_improvement_threshold_r2 or
-                        mae_improvement_vs_current_val >= metric_improvement_threshold_mae):
+                    # Accept ONLY if metrics improve vs best-seen
+                    if r2_improvement_vs_best_val >= metric_improvement_threshold_r2 or mae_improvement_vs_best_val >= metric_improvement_threshold_mae:
                         accept = True
-                        # Prefer logging vs best if both improve, otherwise log vs current
                         if r2_improvement_vs_best_val >= metric_improvement_threshold_r2 and mae_improvement_vs_best_val >= metric_improvement_threshold_mae:
-                            reason = f"PRIMARY: metric improvement vs best (R2: {best_r2:.4f} → {new_r2:.4f} (+{r2_improvement_vs_best_val:.4f}), MAE: {best_mae:.4f} → {new_mae:.4f} (-{mae_improvement_vs_best_val:.4f}))"
+                            reason = f"Metrics improved vs best (R2: {best_r2:.4f} → {new_r2:.4f} (+{r2_improvement_vs_best_val:.4f}), MAE: {best_mae:.4f} → {new_mae:.4f} (-{mae_improvement_vs_best_val:.4f}))"
                         elif r2_improvement_vs_best_val >= metric_improvement_threshold_r2:
-                            reason = f"PRIMARY: R2 improvement vs best (R2: {best_r2:.4f} → {new_r2:.4f} (+{r2_improvement_vs_best_val:.4f}))"
-                        elif mae_improvement_vs_best_val >= metric_improvement_threshold_mae:
-                            reason = f"PRIMARY: MAE improvement vs best (MAE: {best_mae:.4f} → {new_mae:.4f} (-{mae_improvement_vs_best_val:.4f}))"
-                        elif r2_improvement_vs_current_val >= metric_improvement_threshold_r2 and mae_improvement_vs_current_val >= metric_improvement_threshold_mae:
-                            reason = f"PRIMARY: metric improvement vs current (R2: {current_r2:.4f} → {new_r2:.4f} (+{r2_improvement_vs_current_val:.4f}), MAE: {current_mae:.4f} → {new_mae:.4f} (-{mae_improvement_vs_current_val:.4f}))"
-                        elif r2_improvement_vs_current_val >= metric_improvement_threshold_r2:
-                            reason = f"PRIMARY: R2 improvement vs current (R2: {current_r2:.4f} → {new_r2:.4f} (+{r2_improvement_vs_current_val:.4f}))"
+                            reason = f"R2 improved vs best (R2: {best_r2:.4f} → {new_r2:.4f} (+{r2_improvement_vs_best_val:.4f}))"
                         else:
-                            reason = f"PRIMARY: MAE improvement vs current (MAE: {current_mae:.4f} → {new_mae:.4f} (-{mae_improvement_vs_current_val:.4f}))"
+                            reason = f"MAE improved vs best (MAE: {best_mae:.4f} → {new_mae:.4f} (-{mae_improvement_vs_best_val:.4f}))"
+                    else:
+                        accept = False
+                        reason = f"Rejected: no metric improvement vs best (R2: {best_r2:.4f} → {new_r2:.4f} ({r2_improvement_vs_best_val:+.4f}), MAE: {best_mae:.4f} → {new_mae:.4f} ({mae_improvement_vs_best_val:+.4f}))"
                 
                 elif self.task_type == "classification":
-                    # For classification: prioritize Accuracy and F1
+                    # For classification: check Accuracy and F1 vs best-seen
                     acc_improvement_vs_best = new_acc - best_acc_for_comparison
                     f1_improvement_vs_best = new_f1 - best_f1_for_comparison
-                    acc_improvement_vs_current = new_acc - current_acc
-                    f1_improvement_vs_current = new_f1 - current_f1
                     
                     metric_improvement_threshold = 0.005  # Require at least 0.5% improvement
                     
-                    # CRITICAL: Accept if metrics improve vs best OR vs current (whichever is better)
-                    # This ensures we accept improvements even if current state is better than best-seen
-                    if (acc_improvement_vs_best >= metric_improvement_threshold or 
-                        f1_improvement_vs_best >= metric_improvement_threshold or
-                        acc_improvement_vs_current >= metric_improvement_threshold or
-                        f1_improvement_vs_current >= metric_improvement_threshold):
+                    # Accept ONLY if metrics improve vs best-seen
+                    if acc_improvement_vs_best >= metric_improvement_threshold or f1_improvement_vs_best >= metric_improvement_threshold:
                         accept = True
-                        # Prefer logging vs best if both improve, otherwise log vs current
                         if acc_improvement_vs_best >= metric_improvement_threshold and f1_improvement_vs_best >= metric_improvement_threshold:
-                            reason = f"PRIMARY: metric improvement vs best (ACC: {best_acc_for_comparison:.4f} → {new_acc:.4f} (+{acc_improvement_vs_best:.4f}), F1: {best_f1_for_comparison:.4f} → {new_f1:.4f} (+{f1_improvement_vs_best:.4f}))"
+                            reason = f"Metrics improved vs best (ACC: {best_acc_for_comparison:.4f} → {new_acc:.4f} (+{acc_improvement_vs_best:.4f}), F1: {best_f1_for_comparison:.4f} → {new_f1:.4f} (+{f1_improvement_vs_best:.4f}))"
                         elif acc_improvement_vs_best >= metric_improvement_threshold:
-                            reason = f"PRIMARY: accuracy improvement vs best (ACC: {best_acc_for_comparison:.4f} → {new_acc:.4f} (+{acc_improvement_vs_best:.4f}))"
-                        elif f1_improvement_vs_best >= metric_improvement_threshold:
-                            reason = f"PRIMARY: F1 improvement vs best (F1: {best_f1_for_comparison:.4f} → {new_f1:.4f} (+{f1_improvement_vs_best:.4f}))"
-                        elif acc_improvement_vs_current >= metric_improvement_threshold and f1_improvement_vs_current >= metric_improvement_threshold:
-                            reason = f"PRIMARY: metric improvement vs current (ACC: {current_acc:.4f} → {new_acc:.4f} (+{acc_improvement_vs_current:.4f}), F1: {current_f1:.4f} → {new_f1:.4f} (+{f1_improvement_vs_current:.4f}))"
-                        elif acc_improvement_vs_current >= metric_improvement_threshold:
-                            reason = f"PRIMARY: accuracy improvement vs current (ACC: {current_acc:.4f} → {new_acc:.4f} (+{acc_improvement_vs_current:.4f}))"
+                            reason = f"Accuracy improved vs best (ACC: {best_acc_for_comparison:.4f} → {new_acc:.4f} (+{acc_improvement_vs_best:.4f}))"
                         else:
-                            reason = f"PRIMARY: F1 improvement vs current (F1: {current_f1:.4f} → {new_f1:.4f} (+{f1_improvement_vs_current:.4f}))"
-                
-                # Criterion 1 (SECONDARY): Significant improvement or acceptable degradation in loss
-                # Only check if metrics didn't improve
-                if not accept and improvement >= adaptive_threshold:
-                    # Check if metrics degraded significantly for classification (compared to BEST-SEEN)
-                    if self.task_type == "classification":
-                        # Compare against best-seen metrics, not just current iteration start
-                        acc_degradation_vs_best = best_acc_for_comparison - new_acc
-                        f1_degradation_vs_best = best_f1_for_comparison - new_f1
-                        acc_degradation_vs_current = current_acc - new_acc
-                        f1_degradation_vs_current = current_f1 - new_f1
-                        max_metric_degradation = 0.05  # Reject if accuracy or F1 drops by more than 5% vs best
-                        max_metric_degradation_current = 0.10  # Allow more degradation vs current (exploration)
-                        
-                        # Reject if metrics degrade significantly vs best-seen OR vs current (if current is close to best)
-                        if (acc_degradation_vs_best > max_metric_degradation or f1_degradation_vs_best > max_metric_degradation or
-                            (acc_degradation_vs_current > max_metric_degradation_current or f1_degradation_vs_current > max_metric_degradation_current)):
-                            # Reject: metrics degraded too much
-                            accept = False
-                            reason = f"rejected: metric degradation vs best (ACC: {best_acc_for_comparison:.4f} → {new_acc:.4f} ({acc_degradation_vs_best:+.4f}), F1: {best_f1_for_comparison:.4f} → {new_f1:.4f} ({f1_degradation_vs_best:+.4f}))"
-                        else:
-                            accept = True
-                            if improvement >= 0:
-                                reason = f"improvement {improvement:.4f} >= threshold {adaptive_threshold:.4f}"
-                            else:
-                                reason = f"acceptable degradation {improvement:.4f} (within threshold {adaptive_threshold:.4f}, exploring from poor state)"
+                            reason = f"F1 improved vs best (F1: {best_f1_for_comparison:.4f} → {new_f1:.4f} (+{f1_improvement_vs_best:.4f}))"
                     else:
-                        # Regression: use loss-based acceptance, but also check R2 and MAE
-                        current_r2 = metrics.get('r2', None)
-                        current_mae = metrics.get('mae', None)
-                        new_r2 = new_metrics.get('r2', None)
-                        new_mae = new_metrics.get('mae', None)
-                        
-                        # Check if metrics improved
-                        r2_improved = (new_r2 is not None and current_r2 is not None and new_r2 > current_r2)
-                        mae_improved = (new_mae is not None and current_mae is not None and new_mae < current_mae)
-                        
-                        # Also compare against best-seen metrics
-                        best_r2 = getattr(self, '_best_r2', current_r2)
-                        best_mae = getattr(self, '_best_mae', current_mae)
-                        r2_improved_vs_best = (new_r2 is not None and best_r2 is not None and new_r2 > best_r2)
-                        mae_improved_vs_best = (new_mae is not None and best_mae is not None and new_mae < best_mae)
-                        
-                        # Reject if metrics degrade significantly vs best-seen
-                        # Stricter thresholds: reject if R2 drops by more than 0.02 or MAE increases by more than 0.05
-                        max_r2_degradation = 0.02  # Reject if R2 drops by more than 0.02 vs best
-                        max_mae_degradation = 0.05  # Reject if MAE increases by more than 0.05 vs best
-                        
-                        r2_degradation_vs_best = (best_r2 - new_r2) if (best_r2 is not None and new_r2 is not None) else 0.0
-                        mae_degradation_vs_best = (new_mae - best_mae) if (best_mae is not None and new_mae is not None) else 0.0
-                        
-                        if (r2_degradation_vs_best > max_r2_degradation or mae_degradation_vs_best > max_mae_degradation):
-                            accept = False
-                            reason = f"rejected: metric degradation vs best (R2: {best_r2:.4f} → {new_r2:.4f} ({r2_degradation_vs_best:+.4f}), MAE: {best_mae:.4f} → {new_mae:.4f} ({mae_degradation_vs_best:+.4f}))"
-                        else:
-                            # For regression, check both overall improvement AND mechanism-level improvements
-                            # IMPROVED: Also check if LLM mechanisms improved individually, even if overall loss didn't improve much
-                            # This is important when LLM mechanisms have low routing weight - they can improve without affecting overall loss much
-                            llm_improved = False
-                            if hasattr(self, 'mechanism_metrics_snapshot') and self.mechanism_metrics_snapshot:
-                                llm_indices = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "llm"]
-                                for llm_idx in llm_indices:
-                                    old_metrics = self.mechanism_metrics_snapshot.get(llm_idx, {})
-                                    # Re-evaluate new mechanism metrics (will be updated after acceptance)
-                                    # For now, check if mechanism performance score improved
-                                    old_perf = self.mechanism_performance_snapshot.get(llm_idx, 0.5)
-                                    # We'll check new performance after re-evaluation, but for now accept if overall improvement
-                            
-                            # CRITICAL FIX: Reject if new_loss is significantly worse than current_loss OR best_loss
-                            # This prevents accepting updates that degrade from the current state or best we've seen
-                            # Allow small degradation (0.01 vs current, 0.05 vs best) only if metrics improve significantly
-                            max_loss_degradation_vs_current = 0.01  # Reject if loss is more than 0.01 worse than current
-                            max_loss_degradation_vs_best = 0.05  # Reject if loss is more than 0.05 worse than best
-                            loss_degradation_vs_current = new_loss - current_loss
-                            loss_degradation_vs_best = new_loss - best_loss_for_comparison
-                            
-                            # Calculate actual improvement values vs best
-                            r2_improvement_vs_best_val = (new_r2 - best_r2) if (new_r2 is not None and best_r2 is not None) else 0.0
-                            mae_improvement_vs_best_val = (best_mae - new_mae) if (best_mae is not None and new_mae is not None) else 0.0
-                            
-                            # First check: reject if loss degraded significantly vs current (even if metrics improved)
-                            if loss_degradation_vs_current > max_loss_degradation_vs_current:
-                                # Loss degraded vs current - reject unless metrics improved VERY significantly vs best
-                                # Require larger metric improvements to justify degrading from current state
-                                if (r2_improved_vs_best and r2_improvement_vs_best_val >= 0.05) or (mae_improved_vs_best and mae_improvement_vs_best_val >= 0.05):
-                                    # Metrics improved very significantly vs best - allow even if loss degraded vs current
-                                    accept = True
-                                    reason = f"loss degraded vs current ({loss_degradation_vs_current:+.4f}) but metrics improved very significantly vs best (R2: {best_r2:.4f}→{new_r2:.4f} (+{r2_improvement_vs_best_val:.4f}), MAE: {best_mae:.4f}→{new_mae:.4f} (-{mae_improvement_vs_best_val:.4f}))"
-                                else:
-                                    # Reject: loss degraded too much vs current and metrics didn't improve enough
-                                    accept = False
-                                    reason = f"rejected: loss degraded vs current ({loss_degradation_vs_current:+.4f} > {max_loss_degradation_vs_current:.4f}, current={current_loss:.4f}, new={new_loss:.4f})"
-                            elif loss_degradation_vs_best > max_loss_degradation_vs_best:
-                                # New loss is significantly worse than best - reject unless metrics improved significantly vs best
-                                if (r2_improved_vs_best and r2_improvement_vs_best_val >= 0.02) or (mae_improved_vs_best and mae_improvement_vs_best_val >= 0.02):
-                                    # Metrics improved significantly vs best - allow even if loss degraded
-                                    accept = True
-                                    reason = f"loss degraded vs best ({loss_degradation_vs_best:+.4f}) but metrics improved significantly vs best (R2: {best_r2:.4f}→{new_r2:.4f} (+{r2_improvement_vs_best_val:.4f}), MAE: {best_mae:.4f}→{new_mae:.4f} (-{mae_improvement_vs_best_val:.4f}))"
-                                else:
-                                    # Reject: loss degraded too much vs best and metrics didn't improve enough
-                                    accept = False
-                                    reason = f"rejected: loss degraded vs best ({loss_degradation_vs_best:+.4f} > {max_loss_degradation_vs_best:.4f}, best={best_loss_for_comparison:.4f}, new={new_loss:.4f})"
-                            elif improvement > 0:
-                                accept = True
-                                reason = f"improvement {improvement:.4f} >= threshold {adaptive_threshold:.4f}"
-                            elif improvement >= -0.01 and (r2_improved or mae_improved):
-                                # Allow tiny degradation (0.01) if R2 or MAE improved - mechanism is getting better
-                                accept = True
-                                reason = f"tiny degradation {improvement:.4f} but metrics improved (R2: {current_r2:.4f}→{new_r2:.4f}, MAE: {current_mae:.4f}→{new_mae:.4f})"
-                            else:
-                                # Reject significant degradation for regression
-                                accept = False
-                                reason = f"rejected: degradation {improvement:.4f} (regression requires improvement or tiny degradation with metric improvement)"
+                        accept = False
+                        reason = f"Rejected: no metric improvement vs best (ACC: {best_acc_for_comparison:.4f} → {new_acc:.4f} ({acc_improvement_vs_best:+.4f}), F1: {best_f1_for_comparison:.4f} → {new_f1:.4f} ({f1_improvement_vs_best:+.4f}))"
                 
-                # Criterion 2: Wilcoxon test (if small sample)
-                elif len(X_accept_consistent) < 50 and improvement > 0:
-                    try:
-                        from scipy.stats import wilcoxon
-                        old_preds = metrics.get('predictions', [])
-                        new_preds = new_metrics.get('predictions', [])
-                        y_vals = y_accept_consistent
-                        
-                        if len(old_preds) == len(new_preds) == len(y_vals):
-                            if self.task_type == "classification":
-                                old_losses = np.array([1.0 if int(np.round(old_preds[j])) != int(y_vals[j]) else 0.0 for j in range(len(y_vals))])
-                                new_losses = np.array([1.0 if int(np.round(new_preds[j])) != int(y_vals[j]) else 0.0 for j in range(len(y_vals))])
-                            else:
-                                old_losses = np.abs(np.array(old_preds) - np.array(y_vals))
-                                new_losses = np.abs(np.array(new_preds) - np.array(y_vals))
-                            
-                            try:
-                                stat, p_value = wilcoxon(new_losses, old_losses, zero_method="wilcox", alternative="less")
-                                if p_value < 0.15:  # More lenient p-value
-                                    accept = True
-                                    reason = f"Wilcoxon p={p_value:.4f} < 0.15"
-                            except Exception:
-                                pass
-                    except ImportError:
-                        pass
-                    except Exception:
-                        pass
-                
-                # Criterion 3: Any improvement in first 2 iterations (exploration)
-                elif i < 2 and improvement > 0:
-                    accept = True
-                    reason = f"early exploration (iter {i+1}, improvement={improvement:.4f})"
-                
-                # Criterion 4: For regression, accept if R2 or MAE improve vs BEST-SEEN (even if loss doesn't)
-                # This is important because loss might not capture all aspects of regression performance
-                if not accept and self.task_type == "regression":
-                    metric_improvement_threshold_r2 = 0.01  # Require at least 0.01 improvement in R2
-                    metric_improvement_threshold_mae = 0.01  # Require at least 0.01 improvement in MAE
-                    
-                    current_r2 = metrics.get('r2', None)
-                    current_mae = metrics.get('mae', None)
-                    new_r2 = new_metrics.get('r2', None)
-                    new_mae = new_metrics.get('mae', None)
-                    best_r2 = getattr(self, '_best_r2', current_r2)
-                    best_mae = getattr(self, '_best_mae', current_mae)
-                    
-                    r2_improvement_vs_best = (new_r2 - best_r2) if (new_r2 is not None and best_r2 is not None) else 0.0
-                    mae_improvement_vs_best = (best_mae - new_mae) if (best_mae is not None and new_mae is not None) else 0.0
-                    r2_improvement_vs_current = (new_r2 - current_r2) if (new_r2 is not None and current_r2 is not None) else 0.0
-                    mae_improvement_vs_current = (current_mae - new_mae) if (current_mae is not None and new_mae is not None) else 0.0
-                    
-                    # Accept if metrics improve vs best-seen OR vs current (if significant)
-                    if (r2_improvement_vs_best >= metric_improvement_threshold_r2 or 
-                        mae_improvement_vs_best >= metric_improvement_threshold_mae or
-                        r2_improvement_vs_current >= metric_improvement_threshold_r2 * 2 or 
-                        mae_improvement_vs_current >= metric_improvement_threshold_mae * 2):
-                        accept = True
-                        if r2_improvement_vs_best >= metric_improvement_threshold_r2 and mae_improvement_vs_best >= metric_improvement_threshold_mae:
-                            reason = f"metric improvement vs best (R2: {best_r2:.4f} → {new_r2:.4f} (+{r2_improvement_vs_best:.4f}), MAE: {best_mae:.4f} → {new_mae:.4f} (-{mae_improvement_vs_best:.4f}))"
-                        elif r2_improvement_vs_best >= metric_improvement_threshold_r2:
-                            reason = f"R2 improvement vs best (R2: {best_r2:.4f} → {new_r2:.4f} (+{r2_improvement_vs_best:.4f}))"
-                        elif mae_improvement_vs_best >= metric_improvement_threshold_mae:
-                            reason = f"MAE improvement vs best (MAE: {best_mae:.4f} → {new_mae:.4f} (-{mae_improvement_vs_best:.4f}))"
-                        else:
-                            reason = f"metric improvement vs current (R2: {current_r2:.4f} → {new_r2:.4f} (+{r2_improvement_vs_current:.4f}), MAE: {current_mae:.4f} → {new_mae:.4f} (-{mae_improvement_vs_current:.4f}))"
-                
-                # Criterion 5: For classification, accept if accuracy or F1 improve vs BEST-SEEN (even if loss doesn't)
-                # This is important because loss might not capture all aspects of classification performance
-                if not accept and self.task_type == "classification":
-                    metric_improvement_threshold = 0.01  # Require at least 1% improvement in accuracy or F1
-                    acc_improvement_vs_best = new_acc - best_acc_for_comparison
-                    f1_improvement_vs_best = new_f1 - best_f1_for_comparison
-                    acc_improvement_vs_current = new_acc - current_acc
-                    f1_improvement_vs_current = new_f1 - current_f1
-                    
-                    # Accept if metrics improve vs best-seen OR vs current (if significant)
-                    if (acc_improvement_vs_best >= metric_improvement_threshold or f1_improvement_vs_best >= metric_improvement_threshold or
-                        acc_improvement_vs_current >= metric_improvement_threshold * 2 or f1_improvement_vs_current >= metric_improvement_threshold * 2):
-                        accept = True
-                        if acc_improvement_vs_best >= metric_improvement_threshold and f1_improvement_vs_best >= metric_improvement_threshold:
-                            reason = f"metric improvement vs best (ACC: {best_acc_for_comparison:.4f} → {new_acc:.4f} (+{acc_improvement_vs_best:.4f}), F1: {best_f1_for_comparison:.4f} → {new_f1:.4f} (+{f1_improvement_vs_best:.4f}))"
-                        elif acc_improvement_vs_best >= metric_improvement_threshold:
-                            reason = f"accuracy improvement vs best (ACC: {best_acc_for_comparison:.4f} → {new_acc:.4f} (+{acc_improvement_vs_best:.4f}))"
-                        elif f1_improvement_vs_best >= metric_improvement_threshold:
-                            reason = f"F1 improvement vs best (F1: {best_f1_for_comparison:.4f} → {new_f1:.4f} (+{f1_improvement_vs_best:.4f}))"
-                        else:
-                            reason = f"metric improvement vs current (ACC: {current_acc:.4f} → {new_acc:.4f} (+{acc_improvement_vs_current:.4f}), F1: {current_f1:.4f} → {new_f1:.4f} (+{f1_improvement_vs_current:.4f}))"
-                
-                # Criterion 5: For very poor mechanisms in early iterations, accept tiny degradation only if metrics don't degrade
-                # This allows minimal exploration but prevents accepting clearly worse updates
-                if not accept and self.task_type == "classification" and current_loss > 0.5 and i < 3:
-                    # Only in first 3 iterations, allow tiny degradation (0.01) if metrics don't degrade
-                    max_allowed_degradation = 0.01  # Allow only 0.01 worse loss (very small)
-                    acc_degradation = current_acc - new_acc
-                    f1_degradation = current_f1 - new_f1
-                    if (new_loss <= current_loss + max_allowed_degradation and 
-                        acc_degradation <= 0.01 and f1_degradation <= 0.01):
-                        accept = True
-                        reason = f"early exploration (iter {i+1}, tiny degradation {new_loss - current_loss:.4f} <= {max_allowed_degradation}, metrics stable)"
+                # All other criteria removed - only check metrics vs best
                 
                 if accept:
-                    logger.info(f"  ✓ Accepted update: loss {current_loss:.4f} → {new_loss:.4f} ({reason})")
+                    # Log acceptance with metrics (not loss)
+                    logger.info(f"  ✓ Accepted update: {reason}")
                     accepted = 1
                     current_loss = new_loss
                     
@@ -3190,14 +3536,10 @@ class TrainableMAICL:
                         r2_improved = (new_r2 is not None and best_r2 is not None and new_r2 > best_r2 + r2_threshold)
                         mae_improved = (new_mae is not None and best_mae is not None and new_mae < best_mae - mae_threshold)
                         
-                        # PRIORITY: Update if metrics improved (even if loss didn't)
+                        # Update ONLY if performance metrics improved (R2 or MAE)
                         if r2_improved or mae_improved:
                             is_new_best = True
                             logger.info(f"  [Best Performance] Metrics improved: R2 {best_r2:.4f}→{new_r2:.4f}, MAE {best_mae:.4f}→{new_mae:.4f}")
-                        # Also update if loss improved significantly (secondary priority)
-                        elif new_loss < best_loss - 0.01:  # Require at least 0.01 improvement in loss
-                            is_new_best = True
-                            logger.info(f"  [Best Performance] Loss improved: {best_loss:.4f}→{new_loss:.4f}")
                     
                     elif self.task_type == "classification":
                         # For classification: PRIORITIZE Accuracy and F1 over loss
@@ -3208,20 +3550,18 @@ class TrainableMAICL:
                         acc_improved = (new_acc > best_acc_for_comparison + acc_threshold)
                         f1_improved = (new_f1 > best_f1_for_comparison + f1_threshold)
                         
-                        # PRIORITY: Update if metrics improved (even if loss didn't)
+                        # Update ONLY if performance metrics improved (Accuracy or F1)
                         if acc_improved or f1_improved:
                             is_new_best = True
                             logger.info(f"  [Best Performance] Metrics improved: ACC {best_acc_for_comparison:.4f}→{new_acc:.4f}, F1 {best_f1_for_comparison:.4f}→{new_f1:.4f}")
-                        # Also update if loss improved significantly (secondary priority)
-                        elif new_loss < best_loss - 0.01:  # Require at least 0.01 improvement in loss
-                            is_new_best = True
-                            logger.info(f"  [Best Performance] Loss improved: {best_loss:.4f}→{new_loss:.4f}")
                     
                     if is_new_best:
-                        best_loss = float(new_loss)
+                        # Update best metrics (ONLY performance metrics, NOT loss)
                         if self.task_type == "classification":
-                            best_acc = float(new_acc)
-                            best_f1 = float(new_f1)
+                            self._best_acc = float(new_acc)
+                            self._best_f1 = float(new_f1)
+                            best_acc = self._best_acc
+                            best_f1 = self._best_f1
                         elif self.task_type == "regression":
                             new_r2 = new_metrics.get('r2', None)
                             new_mae = new_metrics.get('mae', None)
@@ -3230,18 +3570,28 @@ class TrainableMAICL:
                             if new_mae is not None:
                                 self._best_mae = float(new_mae)
                         best_mechanisms = copy.deepcopy(self.mechanisms)
-                        # CRITICAL: Capture mechanism performance scores IMMEDIATELY after the evaluation
-                        # that produced the best metrics. The snapshot should be from the same evaluation
-                        # that produced new_metrics, not from a stale state.
-                        # The evaluate() method updates mechanism_performance_snapshot after recalculating
-                        # performance, so at this point it should be current.
-                        perf_snapshot = copy.deepcopy(getattr(self, 'mechanism_performance_snapshot', {}))
-                        metrics_snapshot = copy.deepcopy(getattr(self, 'mechanism_metrics_snapshot', {}))
+                        # CRITICAL FIX: Capture mechanism performance scores from the predictor that achieved best performance
+                        # The evaluate() method returns predictor_mechanism_performance which contains the final state
+                        # after the second pass completes. This is the routing state that produced the best metrics.
+                        # Use predictor's final state if available, otherwise fall back to snapshot
+                        if new_metrics.get('predictor_mechanism_performance') is not None:
+                            perf_snapshot = copy.deepcopy(new_metrics['predictor_mechanism_performance'])
+                            logger.debug(f"  [Best Snapshot] Using predictor's final mechanism_performance from evaluation (after second pass)")
+                        else:
+                            # Fallback to snapshot (shouldn't happen if evaluate() is working correctly)
+                            perf_snapshot = copy.deepcopy(getattr(self, 'mechanism_performance_snapshot', {}))
+                            logger.warning(f"  [Best Snapshot] WARNING: predictor_mechanism_performance not in metrics, using snapshot (may be stale)")
+                        
+                        # Similarly for mechanism_metrics
+                        if new_metrics.get('predictor_mechanism_metrics') is not None:
+                            metrics_snapshot = copy.deepcopy(new_metrics['predictor_mechanism_metrics'])
+                            logger.debug(f"  [Best Snapshot] Using predictor's final mechanism_metrics from evaluation (after second pass)")
+                        else:
+                            metrics_snapshot = copy.deepcopy(getattr(self, 'mechanism_metrics_snapshot', {}))
                         
                         # CRITICAL: Store overall metrics in snapshot for performance-based restoration
-                        overall_metrics = {
-                            'loss': float(new_loss)
-                        }
+                        # ONLY store performance metrics (R2, MAE, ACC, F1), NOT loss
+                        overall_metrics = {}
                         if self.task_type == "regression":
                             new_r2 = new_metrics.get('r2', None)
                             new_mae = new_metrics.get('mae', None)
@@ -3255,21 +3605,81 @@ class TrainableMAICL:
                             if new_f1 is not None:
                                 overall_metrics['f1'] = float(new_f1)
                         
+                        # Capture few-shot examples used in this evaluation (for consistency in final evaluation)
+                        # CRITICAL: These few-shot examples must be preserved to ensure final evaluation matches training performance
+                        few_shot_examples_from_eval = new_metrics.get('few_shot_examples', None)
+                        if few_shot_examples_from_eval is not None and len(few_shot_examples_from_eval) > 0:
+                            logger.info(f"  [Best Snapshot] Captured {len(few_shot_examples_from_eval)} few-shot examples from acceptance evaluation")
+                        else:
+                            # CRITICAL FIX: When k_shot=0, explicitly save empty list to indicate no few-shot examples were used
+                            # This ensures final evaluation knows to use the same (empty) few-shot examples
+                            if self.k_shot == 0:
+                                few_shot_examples_from_eval = []  # Explicitly save empty list when k_shot=0
+                                logger.info(f"  [Best Snapshot] Captured empty few-shot examples (k_shot=0) to ensure consistency")
+                            else:
+                                logger.warning(f"  [Best Snapshot] WARNING: No few-shot examples found in new_metrics! This may cause final evaluation to differ from training.")
+                                # Try to get from current metrics as fallback
+                                few_shot_examples_from_eval = metrics.get('few_shot_examples', None)
+                                if few_shot_examples_from_eval is not None and len(few_shot_examples_from_eval) > 0:
+                                    logger.info(f"  [Best Snapshot] Using few-shot examples from current metrics as fallback ({len(few_shot_examples_from_eval)} examples)")
+                                elif self.k_shot == 0:
+                                    few_shot_examples_from_eval = []  # Explicitly save empty list when k_shot=0
+                                    logger.info(f"  [Best Snapshot] Using empty few-shot examples (k_shot=0) to ensure consistency")
+                        
+                        # Store routing config for exact restoration
+                        routing_config = {
+                            'relax_routing': True,  # Training always uses relax_routing=True
+                            'min_ml_weight': routing_kwargs.get('min_ml_weight', getattr(self, 'min_ml_weight', None)),
+                            'max_ml_weight': routing_kwargs.get('max_ml_weight', getattr(self, 'max_ml_weight', None)),
+                            'attention_temp': routing_kwargs.get('attention_temp', getattr(self, 'attention_temp', None)),
+                            'hard_ml_gate_threshold': routing_kwargs.get('hard_ml_gate_threshold', getattr(self, 'hard_ml_gate_threshold', None))
+                        }
+                        
                         best_snapshot = {
                             "iteration": i + 1,
-                            "loss": float(new_loss),
-                            "overall_metrics": overall_metrics,  # Store overall metrics for performance comparison
+                            "overall_metrics": overall_metrics,  # Store overall metrics for performance comparison (ONLY performance metrics)
                             "mechanisms": copy.deepcopy(self.mechanisms),
                             "mechanism_types": copy.deepcopy(self.mechanism_types),
                             "mechanism_performance": perf_snapshot,
-                            "mechanism_metrics": metrics_snapshot
+                            "mechanism_metrics": metrics_snapshot,
+                            "few_shot_examples": copy.deepcopy(few_shot_examples_from_eval) if few_shot_examples_from_eval is not None else [],  # Always save list (empty if k_shot=0)
+                            "k_shot": self.k_shot,  # CRITICAL: Save k_shot value to ensure final evaluation uses same value
+                            "routing_config": routing_config  # Store routing config for exact restoration
                         }
                         if self.task_type == "classification":
-                            logger.info(f"  [Best Snapshot] Updated best-performing model: ACC={best_acc:.4f}, F1={best_f1:.4f}, Loss={best_loss:.4f}")
+                            logger.info(f"  [Best Snapshot] Updated best-performing model: ACC={best_acc:.4f}, F1={best_f1:.4f}")
                         elif self.task_type == "regression":
-                            logger.info(f"  [Best Snapshot] Updated best-performing model: R2={self._best_r2:.4f}, MAE={self._best_mae:.4f}, Loss={best_loss:.4f}")
+                            logger.info(f"  [Best Snapshot] Updated best-performing model: R2={self._best_r2:.4f}, MAE={self._best_mae:.4f}")
                 else:
-                    logger.info(f"  ✗ Rejected update: loss {current_loss:.4f} → {new_loss:.4f}")
+                    # Log rejection with metrics (not loss)
+                    if self.task_type == "regression":
+                        current_r2 = metrics.get('r2', None)
+                        current_mae = metrics.get('mae', None)
+                        new_r2 = new_metrics.get('r2', None)
+                        new_mae = new_metrics.get('mae', None)
+                        if current_r2 is not None and new_r2 is not None:
+                            logger.info(f"  ✗ Rejected update: {reason}")
+                            if current_mae is not None and new_mae is not None:
+                                logger.info(f"     Metrics: R2 {current_r2:.4f} → {new_r2:.4f} ({new_r2 - current_r2:+.4f}), MAE {current_mae:.4f} → {new_mae:.4f} ({new_mae - current_mae:+.4f})")
+                            else:
+                                logger.info(f"     Metrics: R2 {current_r2:.4f} → {new_r2:.4f} ({new_r2 - current_r2:+.4f})")
+                        else:
+                            logger.info(f"  ✗ Rejected update: {reason}")
+                    elif self.task_type == "classification":
+                        current_acc = metrics.get('accuracy', None)
+                        current_f1 = metrics.get('f1', None)
+                        new_acc = new_metrics.get('accuracy', None)
+                        new_f1 = new_metrics.get('f1', None)
+                        if current_acc is not None and new_acc is not None:
+                            logger.info(f"  ✗ Rejected update: {reason}")
+                            if current_f1 is not None and new_f1 is not None:
+                                logger.info(f"     Metrics: ACC {current_acc:.4f} → {new_acc:.4f} ({new_acc - current_acc:+.4f}), F1 {current_f1:.4f} → {new_f1:.4f} ({new_f1 - current_f1:+.4f})")
+                            else:
+                                logger.info(f"     Metrics: ACC {current_acc:.4f} → {new_acc:.4f} ({new_acc - current_acc:+.4f})")
+                        else:
+                            logger.info(f"  ✗ Rejected update: {reason}")
+                    else:
+                        logger.info(f"  ✗ Rejected update: {reason}")
                     self.mechanisms = prev_mechanisms
                     rejected = 1
                     
@@ -3346,10 +3756,8 @@ class TrainableMAICL:
                         r2_improved = (current_r2 is not None and best_r2 is not None and current_r2 > best_r2 + r2_threshold)
                         mae_improved = (current_mae is not None and best_mae is not None and current_mae < best_mae - mae_threshold)
                         
+                        # Update ONLY if performance metrics improved (R2 or MAE)
                         if r2_improved or mae_improved:
-                            is_current_best = True
-                        # Also check if loss improved significantly (secondary priority)
-                        elif current_loss < best_loss - 0.01:
                             is_current_best = True
                     
                     elif self.task_type == "classification":
@@ -3360,20 +3768,34 @@ class TrainableMAICL:
                         acc_improved = (current_acc is not None and best_acc is not None and current_acc > best_acc + acc_threshold)
                         f1_improved = (current_f1 is not None and best_f1 is not None and current_f1 > best_f1 + f1_threshold)
                         
+                        # Update ONLY if performance metrics improved (Accuracy or F1)
                         if acc_improved or f1_improved:
                             is_current_best = True
-                        # Also check if loss improved significantly (secondary priority)
-                        elif current_loss < best_loss - 0.01:
-                            is_current_best = True
+                    
+                    # CRITICAL: Also update snapshot if new mechanisms were generated and accepted (even if metrics don't improve)
+                    # This ensures newly generated mechanisms are preserved for restoration
+                    # CLASSIFICATION ONLY: This is especially important for classification tasks where initial mechanisms may not improve F1/ACC immediately
+                    if (not is_current_best and new_mechanisms_generated_and_accepted and not mechanisms_rejected_at_generation 
+                        and self.task_type == "classification"):
+                        # Check if we have more LLM mechanisms than the best snapshot
+                        current_llm_count = sum(1 for t in self.mechanism_types if t == "llm")
+                        best_snapshot_llm_count = sum(1 for t in best_snapshot.get("mechanism_types", []) if t == "llm")
+                        if current_llm_count > best_snapshot_llm_count:
+                            is_current_best = True  # Update snapshot to preserve new mechanisms
+                            acc_str = f"{current_acc:.4f}" if current_acc is not None else "N/A"
+                            f1_str = f"{current_f1:.4f}" if current_f1 is not None else "N/A"
+                            logger.info(f"  [Best Checkpoint] Updating snapshot after TextGrad rejection to preserve {current_llm_count - best_snapshot_llm_count} newly generated LLM mechanism(s) (classification task: ACC={acc_str}, F1={f1_str})")
                     
                     if is_current_best:
-                        best_loss = float(current_loss)
+                        # Update best metrics (ONLY performance metrics, NOT loss)
                         best_mechanisms = copy.deepcopy(self.mechanisms)
                         if self.task_type == "classification":
                             if current_acc is not None:
-                                best_acc = float(current_acc)
+                                self._best_acc = float(current_acc)
+                                best_acc = self._best_acc
                             if current_f1 is not None:
-                                best_f1 = float(current_f1)
+                                self._best_f1 = float(current_f1)
+                                best_f1 = self._best_f1
                         elif self.task_type == "regression":
                             current_r2 = metrics.get('r2', None)
                             current_mae = metrics.get('mae', None)
@@ -3381,13 +3803,25 @@ class TrainableMAICL:
                                 self._best_r2 = float(current_r2)
                             if current_mae is not None:
                                 self._best_mae = float(current_mae)
-                        perf_snapshot = copy.deepcopy(getattr(self, 'mechanism_performance_snapshot', {}))
-                        metrics_snapshot = copy.deepcopy(getattr(self, 'mechanism_metrics_snapshot', {}))
+                        # CRITICAL FIX: Use mechanism performance from current evaluation metrics (not stale snapshot)
+                        # This ensures best snapshot captures the actual performance scores that achieved the best metrics
+                        if metrics.get('predictor_mechanism_performance') is not None:
+                            perf_snapshot = copy.deepcopy(metrics['predictor_mechanism_performance'])
+                            logger.debug(f"  [Best Checkpoint] Using predictor's mechanism_performance from current evaluation (after rejection)")
+                        else:
+                            perf_snapshot = copy.deepcopy(getattr(self, 'mechanism_performance_snapshot', {}))
+                            logger.warning(f"  [Best Checkpoint] WARNING: predictor_mechanism_performance not in metrics, using snapshot (may be stale)")
+                        
+                        # Similarly for mechanism_metrics
+                        if metrics.get('predictor_mechanism_metrics') is not None:
+                            metrics_snapshot = copy.deepcopy(metrics['predictor_mechanism_metrics'])
+                            logger.debug(f"  [Best Checkpoint] Using predictor's mechanism_metrics from current evaluation (after rejection)")
+                        else:
+                            metrics_snapshot = copy.deepcopy(getattr(self, 'mechanism_metrics_snapshot', {}))
                         
                         # CRITICAL: Store overall metrics in snapshot for performance-based restoration
-                        overall_metrics = {
-                            'loss': float(current_loss)
-                        }
+                        # ONLY store performance metrics (R2, MAE, ACC, F1), NOT loss
+                        overall_metrics = {}
                         if self.task_type == "regression":
                             current_r2 = metrics.get('r2', None)
                             current_mae = metrics.get('mae', None)
@@ -3401,55 +3835,101 @@ class TrainableMAICL:
                             if current_f1 is not None:
                                 overall_metrics['f1'] = float(current_f1)
                         
+                        # Capture few-shot examples from current metrics (if available)
+                        few_shot_examples_from_metrics = metrics.get('few_shot_examples', None) if metrics else None
+                        
+                        # Store routing config for exact restoration
+                        routing_config = {
+                            'relax_routing': True,  # Training always uses relax_routing=True
+                            'min_ml_weight': routing_kwargs.get('min_ml_weight', getattr(self, 'min_ml_weight', None)),
+                            'max_ml_weight': routing_kwargs.get('max_ml_weight', getattr(self, 'max_ml_weight', None)),
+                            'attention_temp': routing_kwargs.get('attention_temp', getattr(self, 'attention_temp', None)),
+                            'hard_ml_gate_threshold': routing_kwargs.get('hard_ml_gate_threshold', getattr(self, 'hard_ml_gate_threshold', None))
+                        }
+                        
                         best_snapshot = {
                             "iteration": i + 1,
-                            "loss": float(current_loss),
-                            "overall_metrics": overall_metrics,  # Store overall metrics for performance comparison
+                            "overall_metrics": overall_metrics,  # Store overall metrics for performance comparison (ONLY performance metrics)
                             "mechanisms": copy.deepcopy(self.mechanisms),
                             "mechanism_types": copy.deepcopy(self.mechanism_types),
                             "mechanism_performance": perf_snapshot,
-                            "mechanism_metrics": metrics_snapshot
+                            "mechanism_metrics": metrics_snapshot,
+                            "few_shot_examples": copy.deepcopy(few_shot_examples_from_metrics) if few_shot_examples_from_metrics is not None else None,
+                            "routing_config": routing_config  # Store routing config for exact restoration
                         }
                         if self.task_type == "classification":
-                            logger.info(f"  [Best Checkpoint] Updated best-performing model at iteration {i+1} after rejection: ACC={current_acc:.4f}, F1={current_f1:.4f}, Loss={current_loss:.4f}")
+                            logger.info(f"  [Best Checkpoint] Updated best-performing model at iteration {i+1} after rejection: ACC={current_acc:.4f}, F1={current_f1:.4f}")
                         else:
                             current_r2 = metrics.get('r2', None)
                             current_mae = metrics.get('mae', None)
-                            logger.info(f"  [Best Checkpoint] Updated best-performing model at iteration {i+1} after rejection: R2={current_r2:.4f}, MAE={current_mae:.4f}, Loss={current_loss:.4f}")
+                            logger.info(f"  [Best Checkpoint] Updated best-performing model at iteration {i+1} after rejection: R2={current_r2:.4f}, MAE={current_mae:.4f}")
             
             # Update best checkpoint if no TextGrad was attempted OR if TextGrad update was rejected
             # This ensures we capture improvements even when TextGrad isn't used
+            # CRITICAL: Also update snapshot if new mechanisms were generated and accepted, even if metrics don't improve
+            # This preserves newly generated mechanisms so they can be restored later
             if not accepted and new_metrics is None:
-                # No TextGrad attempted - check if current state is best
+                # No TextGrad attempted - check if current state is best based ONLY on performance metrics
                 is_best = False
-                if current_loss < best_loss:
-                    is_best = True
-                elif self.task_type == "classification" and current_acc is not None and best_acc is not None:
-                    if current_acc > best_acc + 0.01 or (current_acc > best_acc and current_loss <= best_loss + 0.01):
+                if self.task_type == "classification" and current_acc is not None and best_acc is not None:
+                    if current_acc > best_acc + 0.01:
+                        is_best = True
+                elif self.task_type == "classification" and current_f1 is not None and best_f1 is not None:
+                    if current_f1 > best_f1 + 0.01:
                         is_best = True
                 elif self.task_type == "regression":
                     if (current_r2 is not None and self._best_r2 is not None and current_r2 > self._best_r2 + 0.01) or \
                        (current_mae is not None and self._best_mae is not None and current_mae < self._best_mae - 0.01):
                         is_best = True
                 
+                # CLASSIFICATION ONLY: Also update snapshot if new mechanisms were generated and accepted (even if metrics don't improve)
+                # This ensures newly generated mechanisms are preserved for restoration
+                # This is especially important for classification tasks where initial mechanisms may not improve F1/ACC immediately
+                should_update_for_new_mechs = (new_mechanisms_generated_and_accepted and not mechanisms_rejected_at_generation 
+                                               and self.task_type == "classification")
+                if should_update_for_new_mechs:
+                    # Check if we have more LLM mechanisms than the best snapshot
+                    current_llm_count = sum(1 for t in self.mechanism_types if t == "llm")
+                    best_snapshot_llm_count = sum(1 for t in best_snapshot.get("mechanism_types", []) if t == "llm")
+                    if current_llm_count > best_snapshot_llm_count:
+                        is_best = True  # Update snapshot to preserve new mechanisms
+                        acc_str = f"{current_acc:.4f}" if current_acc is not None else "N/A"
+                        f1_str = f"{current_f1:.4f}" if current_f1 is not None else "N/A"
+                        logger.info(f"  [Best Checkpoint] Updating snapshot to preserve {current_llm_count - best_snapshot_llm_count} newly generated LLM mechanism(s) (classification task: ACC={acc_str}, F1={f1_str})")
+                
                 if is_best:
-                    best_loss = float(current_loss)
+                    # Update best metrics (ONLY performance metrics, NOT loss)
                     best_mechanisms = copy.deepcopy(self.mechanisms)
                     if self.task_type == "classification" and current_acc is not None:
-                        best_acc = float(current_acc)
+                        self._best_acc = float(current_acc)
+                        best_acc = self._best_acc
                     if self.task_type == "classification" and current_f1 is not None:
-                        best_f1 = float(current_f1)
+                        self._best_f1 = float(current_f1)
+                        best_f1 = self._best_f1
                     if self.task_type == "regression" and current_r2 is not None:
                         self._best_r2 = float(current_r2)
                     if self.task_type == "regression" and current_mae is not None:
                         self._best_mae = float(current_mae)
-                    perf_snapshot = copy.deepcopy(getattr(self, 'mechanism_performance_snapshot', {}))
-                    metrics_snapshot = copy.deepcopy(getattr(self, 'mechanism_metrics_snapshot', {}))
+                    
+                    # CRITICAL FIX: Use mechanism performance from current evaluation metrics (not stale snapshot)
+                    # This ensures best snapshot captures the actual performance scores that achieved the best metrics
+                    if metrics and metrics.get('predictor_mechanism_performance') is not None:
+                        perf_snapshot = copy.deepcopy(metrics['predictor_mechanism_performance'])
+                        logger.debug(f"  [Best Checkpoint] Using predictor's mechanism_performance from current evaluation (no TextGrad)")
+                    else:
+                        perf_snapshot = copy.deepcopy(getattr(self, 'mechanism_performance_snapshot', {}))
+                        logger.warning(f"  [Best Checkpoint] WARNING: predictor_mechanism_performance not in metrics, using snapshot (may be stale)")
+                    
+                    # Similarly for mechanism_metrics
+                    if metrics and metrics.get('predictor_mechanism_metrics') is not None:
+                        metrics_snapshot = copy.deepcopy(metrics['predictor_mechanism_metrics'])
+                        logger.debug(f"  [Best Checkpoint] Using predictor's mechanism_metrics from current evaluation (no TextGrad)")
+                    else:
+                        metrics_snapshot = copy.deepcopy(getattr(self, 'mechanism_metrics_snapshot', {}))
                     
                     # CRITICAL: Store overall metrics in snapshot for performance-based restoration
-                    overall_metrics = {
-                        'loss': float(current_loss)
-                    }
+                    # ONLY store performance metrics (R2, MAE, ACC, F1), NOT loss
+                    overall_metrics = {}
                     if self.task_type == "regression":
                         if current_r2 is not None:
                             overall_metrics['r2'] = float(current_r2)
@@ -3461,19 +3941,37 @@ class TrainableMAICL:
                         if current_f1 is not None:
                             overall_metrics['f1'] = float(current_f1)
                     
+                    # Capture few-shot examples from current metrics (if available)
+                    # CRITICAL: These few-shot examples must be preserved to ensure final evaluation matches training performance
+                    few_shot_examples_from_metrics = metrics.get('few_shot_examples', None) if metrics else None
+                    if few_shot_examples_from_metrics is not None and len(few_shot_examples_from_metrics) > 0:
+                        logger.debug(f"  [Best Checkpoint] Captured {len(few_shot_examples_from_metrics)} few-shot examples from metrics")
+                    else:
+                        logger.warning(f"  [Best Checkpoint] WARNING: No few-shot examples found in metrics! This may cause final evaluation to differ from training.")
+                    
+                    # Store routing config for exact restoration
+                    routing_config = {
+                        'relax_routing': True,  # Training always uses relax_routing=True
+                        'min_ml_weight': routing_kwargs.get('min_ml_weight', getattr(self, 'min_ml_weight', None)),
+                        'max_ml_weight': routing_kwargs.get('max_ml_weight', getattr(self, 'max_ml_weight', None)),
+                        'attention_temp': routing_kwargs.get('attention_temp', getattr(self, 'attention_temp', None)),
+                        'hard_ml_gate_threshold': routing_kwargs.get('hard_ml_gate_threshold', getattr(self, 'hard_ml_gate_threshold', None))
+                    }
+                    
                     best_snapshot = {
                         "iteration": i + 1,
-                        "loss": float(current_loss),
-                        "overall_metrics": overall_metrics,  # Store overall metrics for performance comparison
+                        "overall_metrics": overall_metrics,  # Store overall metrics for performance comparison (ONLY performance metrics)
                         "mechanisms": copy.deepcopy(self.mechanisms),
                         "mechanism_types": copy.deepcopy(self.mechanism_types),
                         "mechanism_performance": perf_snapshot,
-                        "mechanism_metrics": metrics_snapshot
+                        "mechanism_metrics": metrics_snapshot,
+                        "few_shot_examples": copy.deepcopy(few_shot_examples_from_metrics) if few_shot_examples_from_metrics is not None else None,
+                        "routing_config": routing_config  # Store routing config for exact restoration
                     }
                     if self.task_type == "classification":
-                        logger.info(f"  [Best Checkpoint] Updated best-performing model at iteration {i+1}: ACC={current_acc:.4f}, F1={current_f1:.4f}, Loss={current_loss:.4f}")
+                        logger.info(f"  [Best Checkpoint] Updated best-performing model at iteration {i+1}: ACC={current_acc:.4f}, F1={current_f1:.4f}")
                     else:
-                        logger.info(f"  [Best Checkpoint] Updated best-performing model at iteration {i+1}: R2={current_r2:.4f}, MAE={current_mae:.4f}, Loss={current_loss:.4f}")
+                        logger.info(f"  [Best Checkpoint] Updated best-performing model at iteration {i+1}: R2={current_r2:.4f}, MAE={current_mae:.4f}")
             
             # Log fallback summary at end of iteration
             fallback_summary = get_fallback_summary()
@@ -3491,6 +3989,66 @@ class TrainableMAICL:
                 final_metrics = metrics
             
             # Log metrics table for this iteration (using final_metrics to ensure consistency)
+            # Evaluate LLM-only performance during training to track independent LLM learning
+            llm_only_iter_metrics = None
+            try:
+                # Extract X_original if available for DeepChem datasets
+                llm_only_kwargs = {}
+                if hasattr(self, 'X_val_original') and X_accept_consistent is X_val:
+                    llm_only_kwargs['X_original'] = self.X_val_original
+                    if len(accept_idx) < len(self.X_val_original):
+                        llm_only_kwargs['X_original'] = [self.X_val_original[j] for j in accept_idx]
+                elif hasattr(self, 'X_test_original') and X_accept_consistent is X_test:
+                    llm_only_kwargs['X_original'] = self.X_test_original
+                    if len(accept_idx) < len(self.X_test_original):
+                        llm_only_kwargs['X_original'] = [self.X_test_original[j] for j in accept_idx]
+                elif hasattr(self, 'X_train_original') and X_accept_consistent is X_train:
+                    llm_only_kwargs['X_original'] = self.X_train_original
+                    if len(accept_idx) < len(self.X_train_original):
+                        llm_only_kwargs['X_original'] = [self.X_train_original[j] for j in accept_idx]
+                
+                if hasattr(self, 'X_train_original'):
+                    llm_only_kwargs['X_pool_original'] = self.X_train_original
+                
+                llm_only_iter_metrics = self.evaluate_llm_only(
+                    X_accept_consistent, y_accept_consistent, X_train, y_train,
+                    return_details=True, k_shot=self.k_shot, **llm_only_kwargs
+                )
+                if self.task_type == "regression":
+                    llm_only_r2 = llm_only_iter_metrics.get('r2', -1.0)
+                    llm_only_mae = llm_only_iter_metrics.get('mae', 1e9)
+                    logger.info(f"  [LLM-only] R2={llm_only_r2:.4f}, MAE={llm_only_mae:.4f}")
+                    
+                    # Track LLM-only performance trend
+                    if not hasattr(self, '_prev_llm_only_r2'):
+                        self._prev_llm_only_r2 = llm_only_r2
+                        self._prev_llm_only_mae = llm_only_mae
+                    else:
+                        if llm_only_r2 < self._prev_llm_only_r2 - 0.01 or llm_only_mae > self._prev_llm_only_mae + 0.01:
+                            logger.warning(f"  [LLM-only] Performance degraded: R2 {self._prev_llm_only_r2:.4f}→{llm_only_r2:.4f}, MAE {self._prev_llm_only_mae:.4f}→{llm_only_mae:.4f}")
+                            logger.warning(f"  [LLM-only] NOTE: LLM mechanisms may be learning to complement ML rather than work independently. "
+                                         f"Optimization targets ensemble performance, so LLM-only may not improve if mechanisms specialize for ML complementarity.")
+                        self._prev_llm_only_r2 = llm_only_r2
+                        self._prev_llm_only_mae = llm_only_mae
+                else:
+                    llm_only_acc = llm_only_iter_metrics.get('accuracy', 0.0)
+                    llm_only_f1 = llm_only_iter_metrics.get('f1', 0.0)
+                    logger.info(f"  [LLM-only] ACC={llm_only_acc:.4f}, F1={llm_only_f1:.4f}")
+                    
+                    # Track LLM-only performance trend
+                    if not hasattr(self, '_prev_llm_only_acc'):
+                        self._prev_llm_only_acc = llm_only_acc
+                        self._prev_llm_only_f1 = llm_only_f1
+                    else:
+                        if llm_only_acc < self._prev_llm_only_acc - 0.01 or llm_only_f1 < self._prev_llm_only_f1 - 0.01:
+                            logger.warning(f"  [LLM-only] Performance degraded: ACC {self._prev_llm_only_acc:.4f}→{llm_only_acc:.4f}, F1 {self._prev_llm_only_f1:.4f}→{llm_only_f1:.4f}")
+                            logger.warning(f"  [LLM-only] NOTE: LLM mechanisms may be learning to complement ML rather than work independently. "
+                                         f"Optimization targets ensemble performance, so LLM-only may not improve if mechanisms specialize for ML complementarity.")
+                        self._prev_llm_only_acc = llm_only_acc
+                        self._prev_llm_only_f1 = llm_only_f1
+            except Exception as e:
+                logger.debug(f"Failed to evaluate LLM-only during iteration {i+1}: {e}")
+            
             iter_metrics = {
                 "loss": current_loss,
                 "accepted": accepted,
@@ -3521,6 +4079,25 @@ class TrainableMAICL:
                 self.training_history['val_f1'].append(None)
                 self.training_history['val_r2'].append(float(final_metrics.get('r2', -1.0)))
                 self.training_history['val_mae'].append(float(final_metrics.get('mae', 1e9)))
+            
+            # Track LLM-only metrics during training
+            if llm_only_iter_metrics is not None:
+                if self.task_type == "regression":
+                    self.training_history['llm_only_r2'].append(float(llm_only_iter_metrics.get('r2', -1.0)))
+                    self.training_history['llm_only_mae'].append(float(llm_only_iter_metrics.get('mae', 1e9)))
+                    self.training_history['llm_only_accuracy'].append(None)
+                    self.training_history['llm_only_f1'].append(None)
+                else:
+                    self.training_history['llm_only_r2'].append(None)
+                    self.training_history['llm_only_mae'].append(None)
+                    self.training_history['llm_only_accuracy'].append(float(llm_only_iter_metrics.get('accuracy', 0.0)))
+                    self.training_history['llm_only_f1'].append(float(llm_only_iter_metrics.get('f1', 0.0)))
+            else:
+                # No LLM-only evaluation (e.g., no LLM mechanisms)
+                self.training_history['llm_only_r2'].append(None)
+                self.training_history['llm_only_mae'].append(None)
+                self.training_history['llm_only_accuracy'].append(None)
+                self.training_history['llm_only_f1'].append(None)
             # Save mechanism evolution snapshot and persist artifacts
             mech_snapshot = {
                 "iteration": i + 1,
@@ -3551,20 +4128,19 @@ class TrainableMAICL:
         # CRITICAL: Always restore the best-performing model based on PERFORMANCE METRICS (R2/MAE or Accuracy/F1)
         # This ensures final results use the model with highest performance, not just lowest loss
         try:
-            if best_snapshot is not None:
                 from maicl_config import get_restoration_config
                 
                 # Get best metrics from snapshot for comparison
                 best_snapshot_metrics = best_snapshot.get('mechanism_metrics', {})
-                best_snapshot_loss = best_snapshot.get('loss', float('inf'))
                 
-                # Get current metrics for comparison
-                current_loss = float(getattr(self, '_last_eval_loss', best_snapshot_loss))
+                # Get current metrics for comparison (ONLY performance metrics, NOT loss)
                 current_has_llm = any(t == "llm" for t in self.mechanism_types)
                 best_has_llm = any(t == "llm" for t in best_snapshot.get("mechanism_types", []))
                 
-                # Compare performance metrics (priority) to determine which is truly best
-                should_restore = True
+                # CRITICAL: Always restore the best snapshot if it's from a different iteration
+                # The best_snapshot represents the best performance across ALL iterations on the acceptance set
+                # We should always use it for final evaluation, unless the current state is already the best
+                should_restore = False
                 best_performance_reason = ""
                 
                 if self.task_type == "regression":
@@ -3587,30 +4163,39 @@ class TrainableMAICL:
                     current_r2 = getattr(self, '_best_r2', None)
                     current_mae = getattr(self, '_best_mae', None)
                     
+                    # CRITICAL: Don't restore if best_snapshot has very poor metrics (negative R2) 
+                    # and current state has positive R2 - this indicates best_snapshot wasn't properly updated
+                    if (best_snapshot_r2 is not None and best_snapshot_r2 < 0 and 
+                        current_r2 is not None and current_r2 > 0):
+                        should_restore = False
+                        best_performance_reason = f"Current state has positive R2 ({current_r2:.4f}) vs best snapshot's negative R2 ({best_snapshot_r2:.4f}) - snapshot likely not updated properly"
                     # Compare: best snapshot is better if it has higher R2 or lower MAE
-                    if best_snapshot_r2 is not None and current_r2 is not None:
-                        if best_snapshot_r2 > current_r2 + 0.01:
+                    # ALWAYS restore if best snapshot is better OR if we're not sure (to be safe)
+                    elif best_snapshot_r2 is not None and current_r2 is not None:
+                        if best_snapshot_r2 > current_r2 + 0.001:  # Use smaller threshold to be more sensitive
                             should_restore = True
-                            best_performance_reason = f"Best snapshot has better R2 ({best_snapshot_r2:.4f} vs {current_r2:.4f})"
-                        elif current_r2 > best_snapshot_r2 + 0.01:
+                            best_performance_reason = f"Best snapshot (iter {best_snapshot['iteration']}) has better R2 ({best_snapshot_r2:.4f} vs {current_r2:.4f})"
+                        elif current_r2 > best_snapshot_r2 + 0.001:
                             should_restore = False
                             best_performance_reason = f"Current state has better R2 ({current_r2:.4f} vs {best_snapshot_r2:.4f})"
                     elif best_snapshot_mae is not None and current_mae is not None:
-                        if best_snapshot_mae < current_mae - 0.01:
+                        if best_snapshot_mae < current_mae - 0.001:  # Use smaller threshold
                             should_restore = True
-                            best_performance_reason = f"Best snapshot has better MAE ({best_snapshot_mae:.4f} vs {current_mae:.4f})"
-                        elif current_mae < best_snapshot_mae - 0.01:
+                            best_performance_reason = f"Best snapshot (iter {best_snapshot['iteration']}) has better MAE ({best_snapshot_mae:.4f} vs {current_mae:.4f})"
+                        elif current_mae < best_snapshot_mae - 0.001:
                             should_restore = False
                             best_performance_reason = f"Current state has better MAE ({current_mae:.4f} vs {best_snapshot_mae:.4f})"
                     
-                    # If metrics are similar, check loss
-                    if not best_performance_reason:
-                        if best_snapshot_loss < current_loss - 0.01:
-                            should_restore = True
-                            best_performance_reason = f"Best snapshot has better loss ({best_snapshot_loss:.4f} vs {current_loss:.4f})"
-                        elif current_loss < best_snapshot_loss - 0.01:
-                            should_restore = False
-                            best_performance_reason = f"Current state has better loss ({current_loss:.4f} vs {best_snapshot_loss:.4f})"
+                    # If still undecided, prefer best snapshot if it's from a different iteration
+                    # (This ensures we always use the best performing iteration)
+                    # BUT: Don't restore iteration 0 if current state is better (iteration 0 is pre-training)
+                    if (not best_performance_reason and best_snapshot['iteration'] != iterations and 
+                        not (best_snapshot['iteration'] == 0 and current_r2 is not None and current_r2 > 0)):
+                        should_restore = True
+                        best_performance_reason = f"Best snapshot from iteration {best_snapshot['iteration']} (metrics are similar, using best iteration)"
+                    elif not best_performance_reason and best_snapshot['iteration'] == 0 and current_r2 is not None and current_r2 > 0:
+                        should_restore = False
+                        best_performance_reason = f"Current state (iter {iterations}) has positive R2 ({current_r2:.4f}) vs pre-training snapshot (iter 0) - keeping current state"
                 
                 elif self.task_type == "classification":
                     # Get best Accuracy and F1 from snapshot (prefer overall_metrics, fallback to mechanism_metrics)
@@ -3634,106 +4219,120 @@ class TrainableMAICL:
                     
                     # Compare: best snapshot is better if it has higher Accuracy or F1
                     if best_snapshot_acc is not None and current_acc is not None:
-                        if best_snapshot_acc > current_acc + 0.01:
+                        if best_snapshot_acc > current_acc + 0.001:  # Use smaller threshold
                             should_restore = True
-                            best_performance_reason = f"Best snapshot has better Accuracy ({best_snapshot_acc:.4f} vs {current_acc:.4f})"
-                        elif current_acc > best_snapshot_acc + 0.01:
+                            best_performance_reason = f"Best snapshot (iter {best_snapshot['iteration']}) has better Accuracy ({best_snapshot_acc:.4f} vs {current_acc:.4f})"
+                        elif current_acc > best_snapshot_acc + 0.001:
                             should_restore = False
                             best_performance_reason = f"Current state has better Accuracy ({current_acc:.4f} vs {best_snapshot_acc:.4f})"
                     elif best_snapshot_f1 is not None and current_f1 is not None:
-                        if best_snapshot_f1 > current_f1 + 0.01:
+                        if best_snapshot_f1 > current_f1 + 0.001:  # Use smaller threshold
                             should_restore = True
-                            best_performance_reason = f"Best snapshot has better F1 ({best_snapshot_f1:.4f} vs {current_f1:.4f})"
-                        elif current_f1 > best_snapshot_f1 + 0.01:
+                            best_performance_reason = f"Best snapshot (iter {best_snapshot['iteration']}) has better F1 ({best_snapshot_f1:.4f} vs {current_f1:.4f})"
+                        elif current_f1 > best_snapshot_f1 + 0.001:
                             should_restore = False
                             best_performance_reason = f"Current state has better F1 ({current_f1:.4f} vs {best_snapshot_f1:.4f})"
                     
-                    # If metrics are similar, check loss
-                    if not best_performance_reason:
-                        if best_snapshot_loss < current_loss - 0.01:
-                            should_restore = True
-                            best_performance_reason = f"Best snapshot has better loss ({best_snapshot_loss:.4f} vs {current_loss:.4f})"
-                        elif current_loss < best_snapshot_loss - 0.01:
-                            should_restore = False
-                            best_performance_reason = f"Current state has better loss ({current_loss:.4f} vs {best_snapshot_loss:.4f})"
+                    # If still undecided, prefer best snapshot if it's from a different iteration
+                    if not best_performance_reason and best_snapshot['iteration'] != iterations:
+                        should_restore = True
+                        best_performance_reason = f"Best snapshot from iteration {best_snapshot['iteration']} (metrics are similar, using best iteration)"
+                
+                # CRITICAL: If best snapshot is from a different iteration and metrics are close,
+                # always restore it to ensure we use the best-performing iteration for final evaluation
+                # BUT: Don't restore iteration 0 if current state is better (iteration 0 is pre-training)
+                if not should_restore and best_snapshot['iteration'] != iterations:
+                    # Check if metrics are very close (within 0.01) - if so, prefer the best snapshot
+                    # since it represents the best iteration across all training
+                    metrics_very_close = False
+                    if self.task_type == "regression":
+                        overall_metrics = best_snapshot.get('overall_metrics', {})
+                        best_snapshot_r2 = overall_metrics.get('r2', None)
+                        best_snapshot_mae = overall_metrics.get('mae', None)
+                        current_r2 = getattr(self, '_best_r2', None)
+                        current_mae = getattr(self, '_best_mae', None)
+                        # Don't consider metrics "very close" if best_snapshot is iteration 0 with negative R2
+                        # and current has positive R2 - this indicates best_snapshot wasn't properly updated
+                        if (best_snapshot['iteration'] == 0 and best_snapshot_r2 is not None and best_snapshot_r2 < 0 and
+                            current_r2 is not None and current_r2 > 0):
+                            metrics_very_close = False  # Don't restore iteration 0 in this case
+                        elif (best_snapshot_r2 is not None and current_r2 is not None and 
+                              abs(best_snapshot_r2 - current_r2) < 0.01):
+                            metrics_very_close = True
+                        elif (best_snapshot_mae is not None and current_mae is not None and 
+                              abs(best_snapshot_mae - current_mae) < 0.01):
+                            metrics_very_close = True
+                    elif self.task_type == "classification":
+                        overall_metrics = best_snapshot.get('overall_metrics', {})
+                        best_snapshot_acc = overall_metrics.get('accuracy', None)
+                        best_snapshot_f1 = overall_metrics.get('f1', None)
+                        current_acc = self._best_acc if hasattr(self, '_best_acc') else None
+                        current_f1 = self._best_f1 if hasattr(self, '_best_f1') else None
+                        if (best_snapshot_acc is not None and current_acc is not None and 
+                            abs(best_snapshot_acc - current_acc) < 0.01):
+                            metrics_very_close = True
+                        elif (best_snapshot_f1 is not None and current_f1 is not None and 
+                              abs(best_snapshot_f1 - current_f1) < 0.01):
+                            metrics_very_close = True
+                    
+                    if metrics_very_close:
+                        should_restore = True
+                        best_performance_reason = f"Best snapshot from iteration {best_snapshot['iteration']} (metrics are very close, using best iteration for final evaluation)"
                 
                 # Log restoration decision
                 if should_restore:
                     logger.info(f"  [Restoration] Restoring best-performing model from iteration {best_snapshot['iteration']}: {best_performance_reason}")
+                    logger.info(f"  [Restoration] Final evaluation will use mechanisms from iteration {best_snapshot['iteration']} (best performance across all {iterations} iterations)")
                 else:
-                    logger.info(f"  [Restoration] Keeping current state: {best_performance_reason}")
+                    logger.info(f"  [Restoration] Keeping current state (already best): {best_performance_reason}")
+                    logger.info(f"  [Restoration] Final evaluation will use mechanisms from iteration {iterations} (current/last iteration)")
+                    # Store current iteration as best
+                    self._best_iteration = iterations
                 
                 if should_restore:
-                    # CRITICAL FIX: Preserve LLM mechanisms that were generated during training
-                    # Even if we restore to an earlier iteration, we should keep LLM mechanisms
-                    # since they're part of the training process and shouldn't be lost
-                    current_llm_mechanisms = []
-                    current_llm_types = []
-                    current_llm_performance = {}
-                    current_llm_metrics = {}
-                    
-                    # Extract LLM mechanisms from current state (before restoration)
-                    for i, (mech, mech_type) in enumerate(zip(self.mechanisms, self.mechanism_types)):
-                        if mech_type == "llm":
-                            llm_idx = len(current_llm_mechanisms)  # Index in the preserved LLM list
-                            current_llm_mechanisms.append(mech)
-                            current_llm_types.append(mech_type)
-                            if i in getattr(self, 'mechanism_performance_snapshot', {}):
-                                current_llm_performance[llm_idx] = self.mechanism_performance_snapshot[i]
-                            if i in getattr(self, 'mechanism_metrics_snapshot', {}):
-                                current_llm_metrics[llm_idx] = self.mechanism_metrics_snapshot[i]
-                    
+                    # CRITICAL: Restore EXACTLY the mechanisms from the best snapshot
+                    # Do NOT add mechanisms from the current state - the best snapshot already contains
+                    # all mechanisms that achieved the best performance. Adding extra mechanisms would
+                    # change the routing and thus change the performance.
                     # Restore mechanisms from best snapshot
-                    self.mechanisms = best_snapshot["mechanisms"]
-                    self.mechanism_types = best_snapshot["mechanism_types"]
+                    self.mechanisms = copy.deepcopy(best_snapshot["mechanisms"])
+                    self.mechanism_types = copy.deepcopy(best_snapshot["mechanism_types"])
                     
-                    # Append preserved LLM mechanisms to the restored state
-                    if current_llm_mechanisms:
-                        num_llm_before = len([t for t in self.mechanism_types if t == "llm"])
-                        self.mechanisms.extend(current_llm_mechanisms)
-                        self.mechanism_types.extend(current_llm_types)
-                        logger.info(f"  [Restoration] Preserved {len(current_llm_mechanisms)} LLM mechanism(s) from training (total LLM: {num_llm_before} → {len([t for t in self.mechanism_types if t == 'llm'])})")
-                        
-                        # Update the generator's unknown_mechanisms to match
-                        num_known = len(self.mech_generator.known_mechanisms)
-                        num_restored_llm = len([t for t in best_snapshot.get("mechanism_types", []) if t == "llm"])
-                        # Update unknown_mechanisms: skip any that were in the snapshot, add the preserved ones
-                        self.mech_generator.unknown_mechanisms = current_llm_mechanisms
+                    # Update the generator's unknown_mechanisms to match the restored snapshot
+                    num_known = len(self.mech_generator.known_mechanisms)
+                    restored_llm_mechanisms = []
+                    for i, mech_type in enumerate(self.mechanism_types):
+                        if mech_type == "llm":
+                            # LLM mechanisms start after known mechanisms
+                            unknown_idx = i - num_known
+                            if 0 <= unknown_idx < len(self.mechanisms):
+                                restored_llm_mechanisms.append(self.mechanisms[i])
+                    self.mech_generator.unknown_mechanisms = restored_llm_mechanisms
                     
-                    # CRITICAL FIX: Filter mechanism_performance_snapshot to only include indices that exist in restored mechanisms
-                    # This prevents stale performance scores from mechanisms that were removed during training
+                    logger.info(f"  [Restoration] Restored {len(self.mechanisms)} mechanisms from iteration {best_snapshot['iteration']} (best snapshot)")
+                    logger.info(f"  [Restoration] Mechanism types: {self.mechanism_types}")
+                    
+                    # CRITICAL: Restore mechanism performance scores EXACTLY as they were in the best snapshot
+                    # These scores were calculated on the acceptance set and achieved the best performance
                     restored_performance = best_snapshot.get("mechanism_performance", {})
+                    # Filter to only include indices that exist in restored mechanisms
                     filtered_performance = {}
                     for mech_idx in range(len(self.mechanisms)):
                         if mech_idx in restored_performance:
                             filtered_performance[mech_idx] = restored_performance[mech_idx]
-                        elif mech_idx >= len(best_snapshot["mechanisms"]):
-                            # This is a preserved LLM mechanism - use its performance from current state
-                            llm_idx = mech_idx - len(best_snapshot["mechanisms"])
-                            if llm_idx in current_llm_performance:
-                                filtered_performance[mech_idx] = current_llm_performance[llm_idx]
-                            else:
-                                filtered_performance[mech_idx] = 1.0
                         else:
-                            # If mechanism exists but no performance score, set default
+                            # If mechanism exists but no performance score in snapshot, set default
                             filtered_performance[mech_idx] = 1.0
                     self.mechanism_performance_snapshot = filtered_performance
                     
-                    # Also restore mechanism metrics (R2, MAE, F1, accuracy)
+                    # Also restore mechanism metrics (R2, MAE, F1, accuracy) exactly as they were
                     restored_metrics = best_snapshot.get("mechanism_metrics", {})
                     filtered_metrics = {}
                     for mech_idx in range(len(self.mechanisms)):
                         if mech_idx in restored_metrics:
                             filtered_metrics[mech_idx] = restored_metrics[mech_idx]
-                        elif mech_idx >= len(best_snapshot["mechanisms"]):
-                            # This is a preserved LLM mechanism - use its metrics from current state
-                            llm_idx = mech_idx - len(best_snapshot["mechanisms"])
-                            if llm_idx in current_llm_metrics:
-                                filtered_metrics[mech_idx] = current_llm_metrics[llm_idx]
-                            else:
-                                filtered_metrics[mech_idx] = {}
                         else:
-                            # If mechanism exists but no metrics, set empty dict
+                            # If mechanism exists but no metrics in snapshot, set empty dict
                             filtered_metrics[mech_idx] = {}
                     self.mechanism_metrics_snapshot = filtered_metrics
                     
@@ -3741,7 +4340,42 @@ class TrainableMAICL:
                     if filtered_metrics:
                         logger.info(f"  [Restoration] Restored mechanism metrics: {filtered_metrics}")
                     
-                    logger.info(f"  ✓ Restored {len(self.mechanisms)} mechanisms with {len(filtered_performance)} performance scores")
+                    # Store best iteration number for logging in evaluate()
+                    self._best_iteration = best_snapshot['iteration']
+                    
+                    # CRITICAL: Restore routing config from best snapshot for exact restoration
+                    # This ensures final evaluation uses the exact same config as the best iteration
+                    restored_routing_config = best_snapshot.get("routing_config", {})
+                    if restored_routing_config:
+                        if 'min_ml_weight' in restored_routing_config and restored_routing_config['min_ml_weight'] is not None:
+                            self.min_ml_weight = restored_routing_config['min_ml_weight']
+                        if 'max_ml_weight' in restored_routing_config and restored_routing_config['max_ml_weight'] is not None:
+                            self.max_ml_weight = restored_routing_config['max_ml_weight']
+                        if 'attention_temp' in restored_routing_config and restored_routing_config['attention_temp'] is not None:
+                            self.attention_temp = restored_routing_config['attention_temp']
+                        if 'hard_ml_gate_threshold' in restored_routing_config and restored_routing_config['hard_ml_gate_threshold'] is not None:
+                            self.hard_ml_gate_threshold = restored_routing_config['hard_ml_gate_threshold']
+                        logger.info(f"  [Restoration] Restored routing config from best iteration: min_ml_weight={restored_routing_config.get('min_ml_weight')}, max_ml_weight={restored_routing_config.get('max_ml_weight')}")
+                    else:
+                        logger.warning(f"  [Restoration] No routing config in best snapshot - using current config")
+                    
+                    # CRITICAL: Restore few-shot examples from best snapshot (for consistency in final evaluation)
+                    restored_few_shot_examples = best_snapshot.get("few_shot_examples", None)
+                    if restored_few_shot_examples is not None and len(restored_few_shot_examples) > 0:
+                        self._best_few_shot_examples = copy.deepcopy(restored_few_shot_examples)
+                        logger.info(f"  [Restoration] ✓ Restored {len(restored_few_shot_examples)} few-shot examples from best iteration (iter {best_snapshot['iteration']})")
+                        logger.info(f"  [Restoration] These few-shot examples will be used in final evaluation to ensure consistency with best iteration performance")
+                    else:
+                        self._best_few_shot_examples = None
+                        logger.warning(f"  [Restoration] ⚠️  No few-shot examples in best snapshot! Final evaluation will re-select few-shot examples, which may cause different results.")
+                        logger.warning(f"  [Restoration] This is likely why final evaluation differs from best iteration. Few-shot examples should have been captured during training.")
+                    
+                    logger.info(f"  ✓ Restored {len(self.mechanisms)} mechanisms with {len(filtered_performance)} performance scores and exact routing config from iteration {best_snapshot['iteration']}")
+                    
+                    # CRITICAL: Set flag to auto-preserve mechanism performance on next evaluate() call
+                    # This ensures final test evaluation uses the same routing weights that achieved best performance
+                    self._use_best_snapshot_for_evaluation = True
+                    logger.info(f"  [Restoration] Auto-preservation enabled: next evaluate() will use best snapshot's routing weights")
                 else:
                     # Keep current state - just log what we have
                     current_perf = getattr(self, 'mechanism_performance_snapshot', {})
@@ -3750,6 +4384,35 @@ class TrainableMAICL:
                     logger.info(f"  [Restoration] Current mechanism performance scores: {current_perf}")
                     if current_metrics:
                         logger.info(f"  [Restoration] Current mechanism metrics: {current_metrics}")
+                    
+                    # CRITICAL: Even when keeping current state, restore few-shot examples from best snapshot
+                    # This ensures final evaluation uses the same few-shot examples as the best iteration
+                    restored_few_shot_examples = best_snapshot.get("few_shot_examples", None)
+                    restored_k_shot = best_snapshot.get("k_shot", None)
+                    
+                    # CRITICAL FIX: Restore k_shot value from best snapshot to ensure consistency
+                    if restored_k_shot is not None:
+                        self.k_shot = restored_k_shot
+                        logger.info(f"  [Restoration] ✓ Restored k_shot={restored_k_shot} from best iteration (iter {best_snapshot['iteration']})")
+                    
+                    if restored_few_shot_examples is not None:
+                        # CRITICAL: Even if empty list (k_shot=0), restore it to ensure consistency
+                        self._best_few_shot_examples = copy.deepcopy(restored_few_shot_examples)
+                        if len(restored_few_shot_examples) > 0:
+                            logger.info(f"  [Restoration] ✓ Restored {len(restored_few_shot_examples)} few-shot examples from best iteration (iter {best_snapshot['iteration']})")
+                            logger.info(f"  [Restoration] These few-shot examples will be used in final evaluation to ensure consistency with best iteration performance")
+                        else:
+                            logger.info(f"  [Restoration] ✓ Restored empty few-shot examples (k_shot={restored_k_shot}) from best iteration (iter {best_snapshot['iteration']})")
+                            logger.info(f"  [Restoration] Final evaluation will use no few-shot examples to ensure consistency with best iteration performance")
+                    else:
+                        self._best_few_shot_examples = None
+                        logger.warning(f"  [Restoration] ⚠️  No few-shot examples in best snapshot! Final evaluation will re-select few-shot examples, which may cause different results.")
+                        logger.warning(f"  [Restoration] This is likely why final evaluation differs from best iteration. Few-shot examples should have been captured during training.")
+                    
+                    # CRITICAL: Set flag to auto-preserve mechanism performance on next evaluate() call
+                    # This ensures final test evaluation uses the same routing weights that achieved best performance
+                    self._use_best_snapshot_for_evaluation = True
+                    logger.info(f"  [Restoration] Auto-preservation enabled: next evaluate() will use best snapshot's routing weights")
         except Exception as e:
             logger.warning(f"  ⚠️ Could not restore best snapshot: {e}")
             pass
@@ -3810,15 +4473,15 @@ class TrainableMAICL:
 
     def train_on_residuals(self, X_full: np.ndarray, y_full: np.ndarray, top_k: int = -1,
                            iterations: int = 3, X_test: Optional[np.ndarray] = None,
-                           y_test: Optional[np.ndarray] = None, use_test_for_acceptance: bool = False) -> Dict[str, Any]:
+                           y_test: Optional[np.ndarray] = None, acceptance_set: str = "validation") -> Dict[str, Any]:
         """
         Convenience training that computes ML residuals, selects top-K, and trains.
         Requires an ML mechanism to be present and trained when use_ml_mechanism=True.
         
         Args:
-            X_test: Optional test set features. Used if use_test_for_acceptance=True.
-            y_test: Optional test set targets. Used if use_test_for_acceptance=True.
-            use_test_for_acceptance: If True, use test set for acceptance evaluation instead of validation set.
+            X_test: Optional test set features. Used if acceptance_set="test".
+            y_test: Optional test set targets. Used if acceptance_set="test".
+            acceptance_set: Which dataset to use for acceptance evaluation. Options: "test", "validation" (default), or "train".
         """
         if self.use_ml_mechanism and (self.mech_generator.ml_mechanism is None or not self.mech_generator.ml_mechanism.is_trained):
             raise RuntimeError("ML mechanism is not trained. Call train_ml_mechanism(...) first or disable use_ml_mechanism.")
@@ -3846,7 +4509,7 @@ class TrainableMAICL:
                 # Select residuals corresponding to the top-K samples
                 residual_sel = residuals[top_indices]
         self.train(X_sel, y_sel, X_full, y_full, iterations=iterations, ml_residuals=residual_sel,
-                   X_test=X_test, y_test=y_test, use_test_for_acceptance=use_test_for_acceptance)
+                   X_test=X_test, y_test=y_test, acceptance_set=acceptance_set)
         return {
             "top_indices": top_indices,
             "residuals": residuals.tolist() if hasattr(residuals, "tolist") else residuals,

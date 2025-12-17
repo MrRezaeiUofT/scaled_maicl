@@ -107,8 +107,20 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
                                 pre_maicl: Dict[str, Any], 
                                 post_maicl: Dict[str, Any],
                                 task_type: str = "classification",
-                                output_path: Optional[str] = None):
-    """Plot performance comparison between ML baseline, pre-training MA-ICL, and post-training MA-ICL"""
+                                output_path: Optional[str] = None,
+                                llm_only_pre: Optional[Dict[str, Any]] = None,
+                                llm_only_post: Optional[Dict[str, Any]] = None):
+    """Plot performance comparison between ML baseline, pre-training MA-ICL, post-training MA-ICL, and LLM-only mechanisms
+    
+    Args:
+        ml_baseline: ML baseline metrics
+        pre_maicl: Pre-training MA-ICL metrics
+        post_maicl: Post-training MA-ICL metrics
+        task_type: "classification" or "regression"
+        output_path: Output file path
+        llm_only_pre: Optional LLM-only metrics for pre-training
+        llm_only_post: Optional LLM-only metrics for post-training
+    """
     if not _HAS_MPL:
         logger.warning("Matplotlib not available, skipping performance comparison plot")
         return
@@ -125,22 +137,42 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
             ylabel = 'Score'
             ylim = None
         
-        fig, axes = plt.subplots(1, len(metrics), figsize=(12, 5))
+        # Determine which models to include
+        has_llm_pre = llm_only_pre is not None
+        has_llm_post = llm_only_post is not None
+        
+        models = ['ML Baseline', 'MA-ICL\n(Pre-train)']
+        colors = ['#3498db', '#e74c3c']
+        
+        if has_llm_pre:
+            models.append('LLM-only\n(Pre-train)')
+            colors.append('#f39c12')  # Orange
+        
+        models.append('MA-ICL\n(Post-train)')
+        colors.append('#2ecc71')
+        
+        if has_llm_post:
+            models.append('LLM-only\n(Post-train)')
+            colors.append('#9b59b6')  # Purple
+        
+        fig, axes = plt.subplots(1, len(metrics), figsize=(max(14, len(models) * 2.5), 5))
         if len(metrics) == 1:
             axes = [axes]
-        
-        models = ['ML Baseline', 'MA-ICL\n(Pre-train)', 'MA-ICL\n(Post-train)']
-        colors = ['#3498db', '#e74c3c', '#2ecc71']
         
         for idx, (metric, metric_label) in enumerate(zip(metrics, metric_labels)):
             ax = axes[idx]
             
             # Get values, handling missing data
-            ml_val = ml_baseline.get(metric, 0)
-            pre_val = pre_maicl.get(metric, 0)
-            post_val = post_maicl.get(metric, 0)
+            values = [ml_baseline.get(metric, 0)]
+            values.append(pre_maicl.get(metric, 0))
             
-            values = [ml_val, pre_val, post_val]
+            if has_llm_pre:
+                values.append(llm_only_pre.get(metric, 0))
+            
+            values.append(post_maicl.get(metric, 0))
+            
+            if has_llm_post:
+                values.append(llm_only_post.get(metric, 0))
             
             bars = ax.bar(models, values, color=colors, alpha=0.8, edgecolor='black', linewidth=1.5)
             
@@ -149,7 +181,7 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
                 height = bar.get_height()
                 ax.text(bar.get_x() + bar.get_width()/2., height,
                        f'{val:.4f}',
-                       ha='center', va='bottom', fontsize=10, fontweight='bold')
+                       ha='center', va='bottom', fontsize=9, fontweight='bold')
             
             ax.set_ylabel(ylabel, fontsize=12, fontweight='bold')
             ax.set_title(metric_label, fontsize=14, fontweight='bold')
@@ -159,9 +191,10 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
                 ax.set_ylim(ylim)
             
             # Rotate x labels slightly for better readability
-            ax.tick_params(axis='x', labelsize=10)
+            ax.tick_params(axis='x', labelsize=9)
+            plt.setp(ax.xaxis.get_majorticklabels(), rotation=15, ha='right')
         
-        fig.suptitle('Performance Comparison: ML Baseline vs MA-ICL', 
+        fig.suptitle('Performance Comparison: ML Baseline vs MA-ICL vs LLM-only', 
                      fontsize=16, fontweight='bold', y=1.02)
         plt.tight_layout()
         
@@ -172,6 +205,8 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
         plt.close(fig)
     except Exception as e:
         logger.warning(f"Failed to plot performance comparison: {e}")
+        import traceback
+        logger.warning(f"Traceback: {traceback.format_exc()}")
 
 
 def plot_scatter_predictions(y_true: np.ndarray, y_pred: np.ndarray, 
@@ -230,7 +265,8 @@ def create_result_visualizations(y_test: np.ndarray,
                                  task_type: str = "classification",
                                  class_names: Optional[List[str]] = None,
                                  output_dir: Optional[str] = None,
-                                 llm_only_metrics: Optional[Dict[str, Any]] = None):
+                                 llm_only_metrics: Optional[Dict[str, Any]] = None,
+                                 llm_only_pre_metrics: Optional[Dict[str, Any]] = None):
     """Create all result visualizations (confusion matrices + performance comparison + scatter plots)
     
     Args:
@@ -241,7 +277,8 @@ def create_result_visualizations(y_test: np.ndarray,
         task_type: "classification" or "regression"
         class_names: List of class names for classification
         output_dir: Output directory for visualizations
-        llm_only_metrics: Optional metrics from LLM-only evaluation (excluding ML)
+        llm_only_metrics: Optional metrics from LLM-only evaluation post-training (excluding ML)
+        llm_only_pre_metrics: Optional metrics from LLM-only evaluation pre-training (excluding ML)
     """
     if output_dir is None:
         from maicl_lib_v2 import OUTPUT_DIR
@@ -249,10 +286,12 @@ def create_result_visualizations(y_test: np.ndarray,
     
     os.makedirs(output_dir, exist_ok=True)
     
-    # Performance comparison plot
+    # Performance comparison plot (includes LLM-only if available)
     perf_plot_path = os.path.join(output_dir, "performance_comparison.png")
     plot_performance_comparison(ml_baseline_metrics, pre_metrics, post_metrics, 
-                                task_type=task_type, output_path=perf_plot_path)
+                                task_type=task_type, output_path=perf_plot_path,
+                                llm_only_pre=llm_only_pre_metrics,
+                                llm_only_post=llm_only_metrics)
     
     # Scatter plots for regression
     if task_type == "regression":
@@ -539,8 +578,9 @@ def persist_iteration_artifacts(iteration: int,
         for m, t in zip(mech_snapshot["mechanisms"], mech_snapshot["mechanism_types"]):
             content.append(f"[{t.upper()}] {m}")
         _safe_write_text(mech_txt_path, "\n\n".join(content))
-    except Exception:
-        pass
+        logger.info(f"  ✓ Saved mechanisms for iteration {iteration} to {mech_txt_path}")
+    except Exception as e:
+        logger.warning(f"Failed to save mechanisms for iteration {iteration}: {e}")
     
     # JSONL append
     jsonl_path = os.path.join(output_dir, "mechanism_evolution.jsonl")

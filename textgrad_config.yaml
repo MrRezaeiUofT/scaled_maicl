@@ -17,11 +17,20 @@ prompts:
 
       {feature_instruction}
 
-      YOUR TASK: FIX THE MECHANISM BY LEARNING NEW COEFFICIENTS
+      YOUR TASK: BUILD A STRONG, INDEPENDENT PREDICTIVE MECHANISM
+
+      🎯 PRIMARY GOAL: Your mechanism must work WELL ON ITS OWN as a standalone predictor.
+      While it may complement other mechanisms in an ensemble, it should be independently predictive.
+      Focus on building a mechanism that can make accurate predictions by itself, not just one that fills gaps.
 
       CRITICAL: Your mechanism formula has coefficients (like 0.783, 0.301, 0.194, etc.) that are starting values. 
       You MUST learn new coefficient values based on performance metrics (R² and MAE for regression, Accuracy and F1 for classification).
       Don't just add interaction terms - actually change the base coefficients to improve performance.
+      
+      INDEPENDENT PERFORMANCE TARGET:
+      - Your mechanism should achieve strong R² and low MAE when used alone (LLM-only evaluation)
+      - Don't specialize only for complementarity - build a robust standalone predictor
+      - Use all relevant features and interactions that improve independent predictive power
 
       Follow this diagnostic process:
 
@@ -56,11 +65,15 @@ prompts:
 
       3️⃣ PROPOSE TARGETED FIX:
 
+         - BUILD INDEPENDENT PREDICTIVE POWER: Focus on making your mechanism work well as a standalone predictor. Include all features and interactions that improve independent performance, not just those that complement other mechanisms.
+
          - LEARN NEW COEFFICIENTS: Don't just add interaction terms - actually adjust the base coefficients (0.783, 0.301, etc.) based on performance metrics. If R² is low or MAE is high, increase/decrease coefficients systematically. Try different coefficient values (e.g., 0.5, 1.0, 1.5, 2.0) to find what improves performance.
 
-         - Add the missing feature or interaction that explains errors
+         - Add the missing feature or interaction that explains errors AND improves standalone performance
 
          - Adjust coefficients to improve performance metrics (R² and MAE for regression, Accuracy and F1 for classification) - NOT just to reduce loss
+
+         - PRIORITIZE INDEPENDENT ACCURACY: Your mechanism should predict well on its own. If a feature or interaction improves standalone R²/MAE, include it even if it overlaps with other mechanisms.
 
          - CRITICAL: Do NOT use feature importance values (like 0.392, 0.150) as coefficients. These are NOT coefficients - they only indicate which features are important. Learn proper coefficients (typically 0.1-2.0 range) by optimizing performance metrics.
 
@@ -101,7 +114,7 @@ prompts:
 
       ✓ Each term must have clear mechanistic meaning
 
-      ✓ For regression: Output must be in scaled range [0, 10]
+      ✓ For regression: Output must be in scaled range [{scale_min}, {scale_max}] (use clip() function)
       ✓ For classification: Output must be a CLASS INDEX (integer: 0, 1, 2, ...), NOT a probability or continuous value
         - Use thresholds, argmax, or conditional logic to map feature values to class indices
         - DO NOT use sigmoid or other probability functions - output must be a discrete class index
@@ -148,7 +161,7 @@ prompts:
 
   update_instructions:
     classification: "Update the mechanism to improve Accuracy and F1 score (primary metrics) by refining feature interactions, thresholds, and decision boundaries. Do NOT use feature importance values as coefficients - learn proper coefficients (0.1-2.0 range) by optimizing Accuracy and F1. Preserve correctness on easy cases and focus on systematic residual patterns."
-    regression: "Update the mechanism to maximize R² and minimize MAE (primary metrics) by refining monotonic trends, curvature, and interaction terms. Do NOT use feature importance values as coefficients - learn proper coefficients (0.1-2.0 range) by optimizing R² and MAE. Explicitly address residual bias and outliers while keeping predictions in [0,1]."
+    regression: "Update the mechanism to maximize R² and minimize MAE (primary metrics) by refining monotonic trends, curvature, and interaction terms. Do NOT use feature importance values as coefficients - learn proper coefficients (0.1-2.0 range) by optimizing R² and MAE. Explicitly address residual bias and outliers while keeping predictions in the correct scaled range."
 
 templates:
   feature_instruction:
@@ -205,6 +218,34 @@ templates:
       - Not modeling template concentration effects
       - Missing competitive resource allocation
       FEATURES: {features}
+    gfp_yield: |
+      DATASET: GFP Yield Prediction (Cell-Free Expression)
+      DOMAIN: Synthetic Biology / Cell-Free Protein Expression
+      TASK: Predict GFP (Green Fluorescent Protein) production yield from experimental conditions
+      KEY MECHANISMS:
+      - Temperature optimum: Transcription/translation has optimal temperature (typically 30-37°C)
+      - Magnesium saturation: Mg2+ is essential cofactor for DNA/RNA polymerases and ribosomes (Michaelis-Menten: Mg/(Km+Mg), Km ~ 8-12 mM)
+      - Potassium saturation: K+ stabilizes ribosomes and affects translation (saturation: K/(Km+K), Km ~ 100-150 mM)
+      - NTP saturation: Nucleotides required for transcription (strong saturation: NTPs/(Km+NTPs), Km ~ 0.5-1.5 mM)
+      - DNA template saturation: Transcription initiation depends on DNA (saturation: DNA/(Km+DNA), Km ~ 5-15 nM)
+      - Synergistic interactions: Mg2+ * K+ for ribosome stability, Temperature * Mg2+ (higher temp needs more Mg)
+      - Resource competition: Very high DNA concentrations may compete for limited resources
+      COMMON ERROR SOURCES:
+      - Ignoring temperature optimum (use Gaussian or inverse-U: exp(-((T-T_opt)^2)/(2*sigma^2)))
+      - Missing Mg2+ saturation (use Michaelis-Menten: Mg/(Km_Mg+Mg) where Km_Mg ~ 0.08-0.12 for scaled data)
+      - Not modeling K+ effects (use saturation: K/(Km_K+K) where Km_K ~ 0.5-0.75 for scaled data)
+      - Ignoring NTP saturation (critical limiting factor: NTPs/(Km_NTP+NTPs) where Km_NTP ~ 0.01-0.03 for scaled data)
+      - Missing DNA template effects (saturation: DNA/(Km_DNA+DNA) where Km_DNA ~ 0.05-0.15 for scaled data)
+      - Not capturing Mg2+ * K+ synergy (multiply: (Mg/(Km_Mg+Mg)) * (K/(Km_K+K)))
+      - Missing Temperature * Mg2+ interaction (higher temperature requires more Mg for enzyme stability)
+      - Ignoring NTPs * DNA interaction (both needed for transcription: multiply saturation terms)
+      - Linear modeling instead of saturation kinetics (use Michaelis-Menten forms)
+      - Not accounting for resource competition at high DNA concentrations
+      FEATURES: {features}
+      CRITICAL SCALING INFORMATION:
+      {scale_info}
+      All predictions must be clipped to [{scale_min}, {scale_max}] using clip(expression, {scale_min}, {scale_max})
+      NOTE: All feature values are scaled to [0, 1]. Adjust Km values proportionally (e.g., if Mg range is 0-20 mM scaled to [0,1], then Km_Mg ~ 0.4-0.6 for 8-12 mM optimal).
     concrete: |
       DATASET: Concrete Strength
       DOMAIN: Materials Science / Civil Engineering
@@ -216,6 +257,26 @@ templates:
       - Not modeling aggregate size distribution
       - Missing temperature effects on hydration
       FEATURES: {features}
+    esol: |
+      DATASET: ESOL (Water Solubility)
+      DOMAIN: Computational Chemistry / Drug Discovery
+      TASK: Predict aqueous solubility (log solubility in mols per litre) from molecular structure
+      KEY MECHANISMS: 
+      - Polar functional groups (hydroxyl, carboxyl, amino) increase solubility via hydrogen bonding
+      - Molecular weight and hydrophobicity decrease solubility
+      - Aromatic rings and halogens reduce water solubility
+      - Number of rings affects molecular flexibility and solubility
+      COMMON ERROR SOURCES:
+      - Ignoring molecular weight effects (larger molecules less soluble)
+      - Missing functional group contributions (hydroxyl groups strongly increase solubility)
+      - Not accounting for halogen effects (Cl, Br, F reduce solubility)
+      - Overlooking ring count effects (more rings often reduce flexibility and solubility)
+      - Incorrect output scaling (must match target range)
+      CRITICAL SCALING INFORMATION:
+      {scale_info}
+      All predictions must be clipped to [{scale_min}, {scale_max}] using clip(expression, {scale_min}, {scale_max})
+      FEATURES: {features}
+      NOTE: This dataset uses SMILES strings. Work with molecular properties (molecular_weight, num_hydroxyl_groups, num_halogen, num_rings, etc.) derived from SMILES, NOT ECFP bit features.
     generic: |
       DATASET: {dataset_name}
       FEATURES: {features}
@@ -223,7 +284,9 @@ templates:
       - Use actual feature names (not generic x1, x2, etc.)
       - Model nonlinear effects (saturation, thresholds, synergies)
       - Include domain-relevant interactions
-      - Ensure output stays in valid range [0, 10]
+      CRITICAL SCALING INFORMATION:
+      {scale_info}
+      - Ensure output stays in valid range [{scale_min}, {scale_max}] using clip(expression, {scale_min}, {scale_max})
 
   error_feedback:
     performance_analysis_header: |
@@ -231,8 +294,14 @@ templates:
       Current Loss: {current_loss:.4f}
       {metrics_str}{improvement_target_str}{routing_guidance_str}{ml_model_type}
       
-      🎯 YOUR MISSION: The ML mechanism has systematic failures. Your mechanism must correct these errors.
-      The examples below show WHERE and WHY the ML model fails. Design your mechanism to handle these cases correctly.
+      🎯 YOUR MISSION: Build a STRONG, INDEPENDENT PREDICTIVE MECHANISM that works well on its own.
+      
+      While the ML mechanism has systematic failures (shown below), your primary goal is to create a mechanism that:
+      1. Makes accurate predictions independently (high R², low MAE when used alone)
+      2. Handles the error cases shown below correctly
+      3. Uses all relevant features and patterns that improve standalone performance
+      
+      The examples below show WHERE and WHY the ML model fails. Use these to improve your mechanism's independent predictive power, not just to complement the ML model.
       
       CRITICAL ERROR PATTERNS (ML Model Failures):
       
@@ -242,14 +311,25 @@ templates:
       
     deepchem_molecular_guidance: |
         • Focus on molecular properties that can be derived from SMILES:
-        - Molecular weight (larger molecules may have different solubility)
-        - Number of rings (aromatic vs aliphatic structures)
-        - Functional groups (hydroxyl, carboxyl, amino groups affect solubility)
-        - Halogen atoms (Cl, Br, I - affect hydrophobicity)
-        - Aromaticity (aromatic rings vs aliphatic chains)
-        - Polarity (polar groups increase water solubility)
+        - Molecular weight (larger molecules typically have lower solubility - use negative coefficient)
+        - Number of rings (more rings often reduce flexibility and solubility - use negative coefficient)
+        - Functional groups (hydroxyl groups strongly increase solubility - use positive coefficient ~0.2-0.5)
+        - Halogen atoms (Cl, Br, I reduce solubility - use negative coefficient ~-0.1 to -0.2)
+        - Aromaticity (aromatic rings reduce solubility compared to aliphatic - use negative coefficient)
+        - Polarity (polar groups like -OH, -COOH, -NH2 increase water solubility - use positive coefficients)
+        - Nitrogen and oxygen atoms (generally increase solubility - use small positive coefficients ~0.05-0.1)
         
         DO NOT use ECFP bit features - work with interpretable molecular properties instead.
+        
+        COEFFICIENT GUIDANCE FOR ESOL:
+        - Base intercept: typically 0.4-0.7 for [0,1] scaled data
+        - Hydroxyl groups: +0.2 to +0.5 per group (strong positive effect)
+        - Halogens: -0.1 to -0.2 per atom (negative effect)
+        - Molecular weight: -0.001 to -0.01 per 100 Da (negative effect, scale appropriately)
+        - Rings: -0.05 to -0.15 per ring (negative effect)
+        - Nitrogen/Oxygen: +0.05 to +0.15 per atom (moderate positive effect)
+        
+        Remember: All outputs must be clipped to [{scale_min}, {scale_max}]
     worst_predictions_header: |
       
       ML MECHANISM FAILURES - YOUR MECHANISM SHOULD FIX THESE SPECIFIC ERRORS:
@@ -352,5 +432,5 @@ templates:
 
 formula_instructions:
   classification: "- For classification: Formula MUST output a CLASS INDEX (integer: 0, 1, 2, ...), NOT a probability or continuous value. Use thresholds, argmax, or conditional logic as needed."
-  regression: "- For regression: Clipped to [0, 10]"
+  regression: "- For regression: Clipped to [{scale_min}, {scale_max}]"
 

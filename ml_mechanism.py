@@ -584,8 +584,7 @@ def compute_ml_residuals(
     probas: List[Any] = []
     is_multiclass = task_type == "classification" and class_names is not None and len(class_names) > 2
     
-    # For classification: only use class predictions, no probabilities needed
-    # For regression: keep existing behavior
+    # For both classification and regression: use batch prediction when possible
     try:
         if task_type == "classification":
             # Classification: only get class predictions, no probabilities
@@ -606,15 +605,22 @@ def compute_ml_residuals(
                     predictions.append(pred)
                     probas.append(None)  # No probabilities for classification
         else:
-            # Regression: keep existing behavior (no change)
-            for i in range(len(X_train)):
-                x_dict = {feature_cols[j]: float(X_train[i, j]) for j in range(len(feature_cols))}
-                try:
-                    pred = ml_model.predict(x_dict, return_class_index=False)
-                except Exception:
-                    pred = 0.0
-                predictions.append(pred)
-                probas.append(None)
+            # Regression: use batch prediction for efficiency and accuracy (matching baseline evaluation)
+            if hasattr(ml_model, "model") and hasattr(ml_model.model, "predict"):
+                # Direct batch prediction for efficiency (same as baseline evaluation)
+                predictions_batch = ml_model.model.predict(X_train)
+                predictions = predictions_batch.tolist()
+                probas = [None] * len(predictions)
+            else:
+                # Fallback to per-sample prediction (for models without direct sklearn interface)
+                for i in range(len(X_train)):
+                    x_dict = {feature_cols[j]: float(X_train[i, j]) for j in range(len(feature_cols))}
+                    try:
+                        pred = ml_model.predict(x_dict, return_class_index=False)
+                    except Exception:
+                        pred = 0.0
+                    predictions.append(pred)
+                    probas.append(None)
     except Exception as e:
         logger.warning(f"[Residuals] Batch prediction failed, falling back to per-sample: {e}")
         # Fallback to per-sample

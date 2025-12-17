@@ -54,7 +54,7 @@ class GoogleAPIKeyManager:
             if current_key not in self.llm_cache:
                 self.llm_cache[current_key] = ChatGoogleGenerativeAI(
                     model=self.model_name,
-                    temperature=0,
+                    temperature=.8,
                     google_api_key=current_key
                 )
             return self.llm_cache[current_key]

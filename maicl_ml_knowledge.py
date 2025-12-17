@@ -114,7 +114,8 @@ def generate_ml_guided_mechanism(ml_knowledge: Dict[str, Any],
                                   feature_cols: List[str],
                                   task_type: str = "regression",
                                   class_names: Optional[List[str]] = None,
-                                  variant: int = 0) -> str:
+                                  variant: int = 0,
+                                  use_scaling: bool = True) -> str:
     """
     Generate an LLM mechanism initialized from ML model knowledge.
     
@@ -147,7 +148,7 @@ def generate_ml_guided_mechanism(ml_knowledge: Dict[str, Any],
     
     # Build mechanism based on variant
     if variant == 0:
-        # Variant 0: Linear combination (like ML baseline)
+        # Variant 0: Nonlinear transformations with intermediate variables (complements ML baseline)
         if is_deepchem:
             # For DeepChem: use molecular properties, not ECFP features
             mechanism = f"""[ML-GUIDED LINEAR] This mechanism uses molecular properties derived from SMILES strings.
@@ -161,14 +162,17 @@ KEY MOLECULAR PROPERTIES:
             mechanism += "  2. num_rings(SMILES) - ring count\n"
             mechanism += "  3. num_hydroxyl_groups(SMILES) - hydrogen bonding capacity\n"
             
-            mechanism += f"\nFORMULA: ŷ = clip((molecular_weight(SMILES) + num_rings(SMILES) + num_hydroxyl_groups(SMILES)) / 3, 0, 10)"
+            if use_scaling:
+                mechanism += f"\nFORMULA: ŷ = clip((molecular_weight(SMILES) + num_rings(SMILES) + num_hydroxyl_groups(SMILES)) / 3, {scale_min}, {scale_max})"
+            else:
+                mechanism += f"\nFORMULA: ŷ = (molecular_weight(SMILES) + num_rings(SMILES) + num_hydroxyl_groups(SMILES)) / 3"
         else:
             # For non-DeepChem: use actual features
             # IMPORTANT: Don't use feature importance as coefficients - they're not mathematically equivalent
             # Instead, use normalized weights as a starting point, and let TextGrad optimize them
-            mechanism = f"""[ML-GUIDED LINEAR] This mechanism uses the most important features identified by the ML model.
+            mechanism = f"""[ML-GUIDED WITH NONLINEAR TRANSFORMATIONS] This mechanism uses the most important features identified by the ML model with advanced nonlinear transformations.
 
-MECHANISM: The output is a weighted combination of the top features. The ML model indicates these features are most important, but you must learn proper coefficients from the data through optimization.
+MECHANISM: The output uses nonlinear transformations (saturation effects, intermediate variables, nonlinear interactions) of the top features. The ML model indicates these features are most important, but you must learn proper coefficients and nonlinear forms from the data through optimization. This mechanism should work well as a standalone predictor - optimize coefficients, saturation parameters, and interaction forms to maximize independent predictive performance (high R², low MAE when used alone). Use intermediate variables to capture complex nonlinear relationships between features. Learn the nonlinearity of interactions themselves - interactions may have saturation effects.
 
 KEY FEATURES (by ML relative importance - use as guide, NOT as coefficients):
 
@@ -203,24 +207,101 @@ KEY FEATURES (by ML relative importance - use as guide, NOT as coefficients):
             if class_names and len(class_names) > 0:
                 n_classes = len(class_names)
                 class_mapping = ", ".join([f"{i}={cn}" for i, cn in enumerate(class_names)])
-                # Add explicit threshold-based class mapping formula
-                bin_size = (scale_max - scale_min) / n_classes
-                thresholds = [scale_min + (i + 1) * bin_size for i in range(n_classes - 1)]
-                if len(thresholds) == 1:
-                    class_formula = f"ŷ = 0 if score < {thresholds[0]:.2f} else 1"
-                elif len(thresholds) == 2:
-                    class_formula = f"ŷ = 0 if score < {thresholds[0]:.2f} else (1 if score < {thresholds[1]:.2f} else 2)"
-                elif len(thresholds) == 3:
-                    class_formula = f"ŷ = 0 if score < {thresholds[0]:.2f} else (1 if score < {thresholds[1]:.2f} else (2 if score < {thresholds[2]:.2f} else 3))"
-                else:
-                    # General case
-                    class_formula = f"ŷ = 0"
-                    for i in range(len(thresholds)):
-                        class_formula = f"({class_formula} if score < {thresholds[i]:.2f} else {i+1})"
-                    class_formula = f"({class_formula} else {n_classes-1})"
-                mechanism += f"\nMap score to class index: {class_formula}\nClass mapping: {class_mapping}"
+                
+                # Generate class-specific equations instead of thresholding
+                mechanism += f"\n\nCLASSIFICATION FORMULATION:\n"
+                mechanism += f"This mechanism uses separate equations for each class. First, interpret each class textually based on its label and relationship to input features. Then compute a score for each class, and select the class with the highest score.\n\n"
+                
+                # Generate textual interpretations and equations for each class
+                for i, class_name in enumerate(class_names):
+                    mechanism += f"CLASS {i} ({class_name}):\n"
+                    
+                    # Add textual interpretation for the class
+                    primary_feat = top_features[i % len(top_features)] if len(top_features) > 0 else "feature_0"
+                    secondary_feat = top_features[(i + 1) % len(top_features)] if len(top_features) > 1 else primary_feat
+                    
+                    # Generate meaningful textual description based on class name
+                    mechanism += f"  INTERPRETATION: "
+                    if class_name and len(class_name) > 0 and not class_name.isdigit():
+                        # Class has meaningful label - provide interpretation
+                        mechanism += f"The class '{class_name}' is characterized by "
+                        if len(top_features) >= 2:
+                            mechanism += f"specific patterns in {primary_feat} and {secondary_feat}. "
+                        else:
+                            mechanism += f"patterns in {primary_feat}. "
+                        mechanism += f"Examples belonging to this class typically exhibit "
+                        mechanism += f"distinctive NONLINEAR relationships between these features that distinguish '{class_name}' from other classes. "
+                        mechanism += f"The INTERACTION between these features is also nonlinear - they don't just multiply, but interact in complex ways. "
+                        mechanism += f"The mechanism models this class using intermediate variables and nonlinear transformations of {primary_feat}"
+                        if len(top_features) >= 2:
+                            mechanism += f" and {secondary_feat}"
+                        mechanism += f" in the scoring equation.\n"
+                    else:
+                        # Generic class label - provide feature-based interpretation
+                        mechanism += f"This class is characterized by specific patterns in {primary_feat}"
+                        if len(top_features) >= 2:
+                            mechanism += f" and {secondary_feat}"
+                        mechanism += f". Examples belonging to this class typically exhibit distinctive NONLINEAR relationships between these features. "
+                        mechanism += f"The INTERACTION between features is nonlinear. "
+                        mechanism += f"The mechanism models this class using intermediate variables and nonlinear transformations of {primary_feat}"
+                        if len(top_features) >= 2:
+                            mechanism += f" and {secondary_feat}"
+                        mechanism += f" in the scoring equation.\n"
+                    
+                    # Add equation after interpretation - USE ADVANCED NONLINEAR TRANSFORMATIONS
+                    mechanism += f"  EQUATION (with nonlinear transformations and interactions):\n"
+                    # Use different feature combinations for each class to encourage diversity
+                    # Apply sophisticated nonlinear transformations including intermediate variables
+                    if len(top_features) >= 2:
+                        # Alternate which features are emphasized for each class
+                        w1 = scaled_weights[i % len(scaled_weights)] if len(scaled_weights) > 0 else 0.5
+                        w2 = scaled_weights[(i + 1) % len(scaled_weights)] if len(scaled_weights) > 1 else 0.3
+                        saturation_param = 0.3 + (i * 0.1)  # Vary saturation parameter per class
+                        
+                        # Create intermediate variable for nonlinear interaction
+                        mechanism += f"    # Intermediate variable capturing nonlinear interaction\n"
+                        mechanism += f"    intermediate_{i} = {primary_feat} * {secondary_feat} / (0.2 + {primary_feat} * {secondary_feat})\n"
+                        mechanism += f"    # Main equation with saturation and nonlinear interaction\n"
+                        mechanism += f"    score_{i} = {w1:.3f} * {primary_feat} / ({saturation_param:.2f} + {primary_feat}) + {w2:.3f} * {secondary_feat} / (0.4 + {secondary_feat}) + 0.25 * intermediate_{i}"
+                        
+                        if len(top_features) >= 3:
+                            tertiary_feat = top_features[(i + 2) % len(top_features)]
+                            w3 = scaled_weights[(i + 2) % len(scaled_weights)] if len(scaled_weights) > 2 else 0.2
+                            # Add three-way interaction with nonlinearity
+                            mechanism += f" + {w3:.3f} * {primary_feat} * {tertiary_feat} / (0.3 + {primary_feat} * {tertiary_feat})"
+                        mechanism += f"\n"
+                    else:
+                        saturation_param = 0.3
+                        mechanism += f"    score_{i} = {scaled_weights[0] if len(scaled_weights) > 0 else 0.5:.3f} * {top_features[0]} / ({saturation_param:.2f} + {top_features[0]})\n"
+                    
+                    mechanism += f"    NOTE: Intermediate variables (like intermediate_{i}) capture complex nonlinear interactions between features. "
+                    mechanism += f"The saturation terms (feature / (K + feature)) model diminishing returns. "
+                    mechanism += f"Nonlinear interactions (feature1 * feature2 / (K + feature1 * feature2)) capture how features interact nonlinearly. "
+                    mechanism += f"Optimize saturation parameters, interaction coefficients, and all weights to improve performance.\n"
+                
+                mechanism += f"\nFINAL PREDICTION:\n"
+                mechanism += f"ŷ = argmax([score_0, score_1"
+                if n_classes > 2:
+                    for i in range(2, n_classes):
+                        mechanism += f", score_{i}"
+                mechanism += f"])\n"
+                mechanism += f"Class mapping: {class_mapping}\n"
+                mechanism += f"\nCRITICAL NONLINEARITY AND INTERACTION GUIDANCE:\n"
+                mechanism += f"- Each class equation uses INTERMEDIATE VARIABLES to capture complex nonlinear interactions\n"
+                mechanism += f"- Learn the NONLINEARITY of interactions: interactions themselves may have saturation effects (feature1 * feature2 / (K + feature1 * feature2))\n"
+                mechanism += f"- Discover which features interact and HOW they interact nonlinearly (multiplicative, ratio-based, threshold-based)\n"
+                mechanism += f"- Use intermediate variables to model complex relationships: intermediate = f(feature1, feature2) where f is nonlinear\n"
+                mechanism += f"- Think about feature relationships: do features interact multiplicatively, additively, or through more complex patterns?\n"
+                mechanism += f"- Optimize BOTH the form of interactions AND their coefficients - the nonlinearity of interactions matters\n"
+                mechanism += f"- Linear combinations fail - you must learn nonlinear relationships and nonlinear interactions"
             else:
-                mechanism += f"\nMap score to class index: ŷ = 0 if score < {(scale_min + scale_max) / 2:.2f} else 1"
+                mechanism += f"\n\nCLASSIFICATION FORMULATION:\n"
+                mechanism += f"This mechanism uses separate equations for each class with nonlinear transformations.\n\n"
+                mechanism += f"# Intermediate variable for nonlinear interaction\n"
+                mechanism += f"intermediate_0 = {top_features[0] if len(top_features) > 0 else 'feature_0'} * {top_features[1] if len(top_features) > 1 else 'feature_1'} / (0.2 + {top_features[0] if len(top_features) > 0 else 'feature_0'} * {top_features[1] if len(top_features) > 1 else 'feature_1'})\n"
+                mechanism += f"CLASS 0 SCORE: score_0 = {scaled_weights[0] if len(scaled_weights) > 0 else 0.5:.3f} * {top_features[0] if len(top_features) > 0 else 'feature_0'} / (0.3 + {top_features[0] if len(top_features) > 0 else 'feature_0'}) + 0.25 * intermediate_0\n"
+                mechanism += f"CLASS 1 SCORE: score_1 = {scaled_weights[1] if len(scaled_weights) > 1 else 0.3:.3f} * {top_features[1] if len(top_features) > 1 else 'feature_1'} / (0.4 + {top_features[1] if len(top_features) > 1 else 'feature_1'}) + 0.25 * intermediate_0\n"
+                mechanism += f"ŷ = argmax([score_0, score_1])\n"
         else:
             mechanism += f"\nClipped to [{scale_min}, {scale_max}]"
     
@@ -240,12 +321,15 @@ KEY MOLECULAR PROPERTIES:
             mechanism += "  3. num_hydroxyl_groups(SMILES) - hydrogen bonding capacity\n"
             mechanism += "  4. num_halogen(SMILES) - halogen atom count\n"
             
-            mechanism += f"\nFORMULA: ŷ = clip((molecular_weight(SMILES) + num_rings(SMILES) + num_hydroxyl_groups(SMILES) - 0.1 * num_halogen(SMILES) + 0.05 * molecular_weight(SMILES) * num_rings(SMILES)) / 3, 0, 10)"
+            if use_scaling:
+                mechanism += f"\nFORMULA: ŷ = clip((molecular_weight(SMILES) + num_rings(SMILES) + num_hydroxyl_groups(SMILES) - 0.1 * num_halogen(SMILES) + 0.05 * molecular_weight(SMILES) * num_rings(SMILES)) / 3, {scale_min}, {scale_max})"
+            else:
+                mechanism += f"\nFORMULA: ŷ = (molecular_weight(SMILES) + num_rings(SMILES) + num_hydroxyl_groups(SMILES) - 0.1 * num_halogen(SMILES) + 0.05 * molecular_weight(SMILES) * num_rings(SMILES)) / 3"
         else:
             # For non-DeepChem: use actual features
             mechanism = f"""[ML-GUIDED WITH INTERACTIONS] This mechanism uses the ML model's top features with interactions.
 
-MECHANISM: Uses the most important features from the ML model and adds multiplicative interactions between them. Coefficients are normalized based on relative importance.
+MECHANISM: Uses the most important features from the ML model and adds multiplicative interactions between them. This mechanism should work well as a standalone predictor - optimize coefficients to maximize independent predictive performance. Coefficients are normalized based on relative importance as starting values - learn proper values through optimization.
 
 KEY FEATURES:
 
@@ -291,24 +375,83 @@ KEY FEATURES:
             if class_names and len(class_names) > 0:
                 n_classes = len(class_names)
                 class_mapping = ", ".join([f"{i}={cn}" for i, cn in enumerate(class_names)])
-                # Add explicit threshold-based class mapping formula
-                bin_size = (scale_max - scale_min) / n_classes
-                thresholds = [scale_min + (i + 1) * bin_size for i in range(n_classes - 1)]
-                if len(thresholds) == 1:
-                    class_formula = f"ŷ = 0 if score < {thresholds[0]:.2f} else 1"
-                elif len(thresholds) == 2:
-                    class_formula = f"ŷ = 0 if score < {thresholds[0]:.2f} else (1 if score < {thresholds[1]:.2f} else 2)"
-                elif len(thresholds) == 3:
-                    class_formula = f"ŷ = 0 if score < {thresholds[0]:.2f} else (1 if score < {thresholds[1]:.2f} else (2 if score < {thresholds[2]:.2f} else 3))"
-                else:
-                    # General case
-                    class_formula = f"ŷ = 0"
-                    for i in range(len(thresholds)):
-                        class_formula = f"({class_formula} if score < {thresholds[i]:.2f} else {i+1})"
-                    class_formula = f"({class_formula} else {n_classes-1})"
-                mechanism += f"\nMap score to class index: {class_formula}\nClass mapping: {class_mapping}"
+                
+                # Generate class-specific equations instead of thresholding
+                mechanism += f"\n\nCLASSIFICATION FORMULATION:\n"
+                mechanism += f"This mechanism uses separate equations for each class. First, interpret each class textually based on its label and relationship to input features. Then compute a score for each class, and select the class with the highest score.\n\n"
+                
+                # Generate textual interpretations and equations for each class
+                for i, class_name in enumerate(class_names):
+                    mechanism += f"CLASS {i} ({class_name}):\n"
+                    
+                    # Add textual interpretation for the class
+                    primary_feat = top_features[i % len(top_features)] if len(top_features) > 0 else "feature_0"
+                    secondary_feat = top_features[(i + 1) % len(top_features)] if len(top_features) > 1 else primary_feat
+                    
+                    # Generate meaningful textual description based on class name
+                    mechanism += f"  INTERPRETATION: "
+                    if class_name and len(class_name) > 0 and not class_name.isdigit():
+                        # Class has meaningful label - provide interpretation
+                        mechanism += f"The class '{class_name}' is characterized by "
+                        if len(top_features) >= 2:
+                            mechanism += f"specific patterns in {primary_feat} and {secondary_feat}. "
+                        else:
+                            mechanism += f"patterns in {primary_feat}. "
+                        mechanism += f"Examples belonging to this class typically exhibit "
+                        mechanism += f"distinctive NONLINEAR relationships between these features that distinguish '{class_name}' from other classes. "
+                        mechanism += f"The INTERACTION between these features is also nonlinear - they don't just multiply, but interact in complex ways. "
+                        mechanism += f"The mechanism models this class using intermediate variables and nonlinear transformations of {primary_feat}"
+                        if len(top_features) >= 2:
+                            mechanism += f" and {secondary_feat}"
+                        mechanism += f" in the scoring equation.\n"
+                    else:
+                        # Generic class label - provide feature-based interpretation
+                        mechanism += f"This class is characterized by specific patterns in {primary_feat}"
+                        if len(top_features) >= 2:
+                            mechanism += f" and {secondary_feat}"
+                        mechanism += f". Examples belonging to this class typically exhibit distinctive NONLINEAR relationships between these features. "
+                        mechanism += f"The INTERACTION between features is nonlinear. "
+                        mechanism += f"The mechanism models this class using intermediate variables and nonlinear transformations of {primary_feat}"
+                        if len(top_features) >= 2:
+                            mechanism += f" and {secondary_feat}"
+                        mechanism += f" in the scoring equation.\n"
+                    
+                    # Add equation after interpretation
+                    mechanism += f"  EQUATION:\n"
+                    # Use different feature combinations for each class to encourage diversity
+                    if len(top_features) >= 2:
+                        # Alternate which features are emphasized for each class
+                        w1 = scaled_weights[i % len(scaled_weights)] if len(scaled_weights) > 0 else 0.5
+                        w2 = scaled_weights[(i + 1) % len(scaled_weights)] if len(scaled_weights) > 1 else 0.3
+                        mechanism += f"    score_{i} = {w1:.3f}*{primary_feat} + {w2:.3f}*{secondary_feat}"
+                        if len(top_features) >= 3:
+                            tertiary_feat = top_features[(i + 2) % len(top_features)]
+                            w3 = scaled_weights[(i + 2) % len(scaled_weights)] if len(scaled_weights) > 2 else 0.2
+                            mechanism += f" + {w3:.3f}*{tertiary_feat}"
+                        mechanism += f"\n"
+                    else:
+                        mechanism += f"    score_{i} = {scaled_weights[0] if len(scaled_weights) > 0 else 0.5:.3f}*{top_features[0]}\n"
+                
+                mechanism += f"\nFINAL PREDICTION:\n"
+                mechanism += f"ŷ = argmax([score_0, score_1"
+                if n_classes > 2:
+                    for i in range(2, n_classes):
+                        mechanism += f", score_{i}"
+                mechanism += f"])\n"
+                mechanism += f"Class mapping: {class_mapping}\n"
+                mechanism += f"\nCRITICAL NONLINEARITY AND INTERACTION GUIDANCE:\n"
+                mechanism += f"- Each class equation uses INTERMEDIATE VARIABLES to capture complex nonlinear interactions\n"
+                mechanism += f"- Learn the NONLINEARITY of interactions: interactions themselves may have saturation effects (feature1 * feature2 / (K + feature1 * feature2))\n"
+                mechanism += f"- Discover which features interact and HOW they interact nonlinearly (multiplicative, ratio-based, threshold-based)\n"
+                mechanism += f"- Use intermediate variables to model complex relationships: intermediate = f(feature1, feature2) where f is nonlinear\n"
+                mechanism += f"- Think about feature relationships: do features interact multiplicatively, additively, or through more complex patterns?\n"
+                mechanism += f"- Optimize BOTH the form of interactions AND their coefficients - the nonlinearity of interactions matters\n"
+                mechanism += f"- Linear combinations fail - you must learn nonlinear relationships and nonlinear interactions"
             else:
-                mechanism += f"\nMap score to class index: ŷ = 0 if score < {(scale_min + scale_max) / 2:.2f} else 1"
+                mechanism += f"\n\nCLASSIFICATION FORMULATION:\n"
+                mechanism += f"CLASS 0 SCORE: score_0 = {scaled_weights[0] if len(scaled_weights) > 0 else 0.5:.3f}*{top_features[0] if len(top_features) > 0 else 'feature_0'}\n"
+                mechanism += f"CLASS 1 SCORE: score_1 = {scaled_weights[1] if len(scaled_weights) > 1 else 0.3:.3f}*{top_features[1] if len(top_features) > 1 else 'feature_1'}\n"
+                mechanism += f"ŷ = argmax([score_0, score_1])\n"
         else:
             mechanism += f"\nClipped to [{scale_min}, {scale_max}]"
     
@@ -328,89 +471,225 @@ KEY MOLECULAR PROPERTIES:
             mechanism += "  3. num_hydroxyl_groups(SMILES) - hydrogen bonding capacity\n"
             mechanism += "  4. num_halogen(SMILES) - halogen atom count\n"
             
-            mechanism += f"\nFORMULA: ŷ = clip(molecular_weight(SMILES) / (100 + molecular_weight(SMILES)) + 0.1 * num_rings(SMILES) / (1 + num_rings(SMILES)) + 0.15 * num_hydroxyl_groups(SMILES) - 0.05 * num_halogen(SMILES), 0, 10)"
+            if use_scaling:
+                mechanism += f"\nFORMULA: ŷ = clip(molecular_weight(SMILES) / (100 + molecular_weight(SMILES)) + 0.1 * num_rings(SMILES) / (1 + num_rings(SMILES)) + 0.15 * num_hydroxyl_groups(SMILES) - 0.05 * num_halogen(SMILES), {scale_min}, {scale_max})"
+            else:
+                mechanism += f"\nFORMULA: ŷ = molecular_weight(SMILES) / (100 + molecular_weight(SMILES)) + 0.1 * num_rings(SMILES) / (1 + num_rings(SMILES)) + 0.15 * num_hydroxyl_groups(SMILES) - 0.05 * num_halogen(SMILES)"
         else:
             # For non-DeepChem: use actual features
-            mechanism = f"""[ML-GUIDED NON-LINEAR] This mechanism uses non-linear transformations of the ML model's top features.
+            if task_type == "classification":
+                # For classification: add descriptive text explaining the classification task
+                class_desc = ""
+                if class_names and len(class_names) > 0:
+                    class_list = ", ".join(class_names)
+                    class_desc = f"This mechanism classifies examples into {len(class_names)} classes: {class_list}. "
+                
+                mechanism = f"""[ML-GUIDED NON-LINEAR] This mechanism uses non-linear transformations of the ML model's top features.
 
-MECHANISM: Applies saturation and threshold effects to the most important features from the ML model, designed to complement the linear ML baseline. Uses normalized coefficients based on relative importance.
+MECHANISM DESCRIPTION:
+{class_desc}The mechanism applies saturation and threshold effects to the most important features identified by the ML model. It uses non-linear transformations to capture complex decision boundaries between classes. The mechanism is designed to be a strong, independent predictor that works well on its own, while also complementing the linear ML baseline. Key features are combined using saturation functions (where very high feature values have diminishing returns) and weighted combinations to distinguish between different classes. Uses normalized coefficients based on relative importance as starting values - optimize these to maximize standalone predictive performance.
 
 KEY FEATURES:
 
 """
-            for i, feat in enumerate(top_features[:MAX_TOP_FEATURES_DISPLAY]):
-                imp = feature_importance.get(feat, 0.5)
-                mechanism += f"  {i+1}. {feat} (relative importance: {imp:.3f})\n"
-            
-            # Normalize weights properly
-            total_importance = sum(feature_importance.get(feat, 0.5) for feat in top_features[:MAX_TOP_FEATURES])
-            if total_importance > 0:
-                normalized_weights = [feature_importance.get(feat, 0.5) / total_importance for feat in top_features[:MAX_TOP_FEATURES]]
-                scaled_weights = [max(0.1, min(1.0, w * 2.0)) for w in normalized_weights]
-            else:
-                scaled_weights = [0.5] * len(top_features[:MAX_TOP_FEATURES])
-            
-            mechanism += f"\nINITIAL FORMULA (starting point - optimize coefficients and saturation parameters based on performance metrics R² and MAE):\n"
-            mechanism += f"ŷ = "
-            
-            if len(top_features) >= 2:
-                f1, f2 = top_features[0], top_features[1]
-                w1 = scaled_weights[0] if len(scaled_weights) > 0 else 0.5
-                w2 = scaled_weights[1] if len(scaled_weights) > 1 else 0.5
+                for i, feat in enumerate(top_features[:MAX_TOP_FEATURES_DISPLAY]):
+                    imp = feature_importance.get(feat, 0.5)
+                    mechanism += f"  {i+1}. {feat} (relative importance: {imp:.3f})\n"
                 
-                # Use normalized weights with saturation for top feature
-                mechanism += f"{w1:.3f} * {f1} / (0.3 + {f1})"
-                
-                # Add second feature with interaction or addition
-                if interactions and len(interactions) > 0:
-                    mechanism += f" * (1 + {w2*0.8:.3f}*{f2})"
+                # Normalize weights properly
+                total_importance = sum(feature_importance.get(feat, 0.5) for feat in top_features[:MAX_TOP_FEATURES])
+                if total_importance > 0:
+                    normalized_weights = [feature_importance.get(feat, 0.5) / total_importance for feat in top_features[:MAX_TOP_FEATURES]]
+                    scaled_weights = [max(0.1, min(1.0, w * 2.0)) for w in normalized_weights]
                 else:
-                    mechanism += f" + {w2*0.8:.3f}*{f2}"
+                    scaled_weights = [0.5] * len(top_features[:MAX_TOP_FEATURES])
                 
-                # Add third feature if available (with reduced weight to avoid overfitting)
-                if len(top_features) >= 3:
-                    f3 = top_features[2]
-                    w3 = scaled_weights[2] if len(scaled_weights) > 2 else 0.5
-                    mechanism += f" + {w3*0.4:.3f}*{f3}"
+                mechanism += f"\nINITIAL FORMULA (starting point - optimize coefficients and saturation parameters based on performance metrics R² and MAE):\n"
+                mechanism += f"ŷ = "
                 
-                # Add fourth and fifth features with even smaller weights for stability
-                if len(top_features) >= 4:
-                    f4 = top_features[3]
-                    w4 = scaled_weights[3] if len(scaled_weights) > 3 else 0.5
-                    mechanism += f" + {w4*0.2:.3f}*{f4}"
-                if len(top_features) >= 5:
-                    f5 = top_features[4]
-                    w5 = scaled_weights[4] if len(scaled_weights) > 4 else 0.5
-                    mechanism += f" + {w5*0.1:.3f}*{f5}"
+                if len(top_features) >= 2:
+                    f1, f2 = top_features[0], top_features[1]
+                    w1 = scaled_weights[0] if len(scaled_weights) > 0 else 0.5
+                    w2 = scaled_weights[1] if len(scaled_weights) > 1 else 0.5
+                    
+                    # Use normalized weights with saturation for top feature
+                    mechanism += f"{w1:.3f} * {f1} / (0.3 + {f1})"
+                    
+                    # Add second feature with interaction or addition
+                    if interactions and len(interactions) > 0:
+                        mechanism += f" * (1 + {w2*0.8:.3f}*{f2})"
+                    else:
+                        mechanism += f" + {w2*0.8:.3f}*{f2}"
+                    
+                    # Add third feature if available (with reduced weight to avoid overfitting)
+                    if len(top_features) >= 3:
+                        f3 = top_features[2]
+                        w3 = scaled_weights[2] if len(scaled_weights) > 2 else 0.5
+                        mechanism += f" + {w3*0.4:.3f}*{f3}"
+                    
+                    # Add fourth and fifth features with even smaller weights for stability
+                    if len(top_features) >= 4:
+                        f4 = top_features[3]
+                        w4 = scaled_weights[3] if len(scaled_weights) > 3 else 0.5
+                        mechanism += f" + {w4*0.2:.3f}*{f4}"
+                    if len(top_features) >= 5:
+                        f5 = top_features[4]
+                        w5 = scaled_weights[4] if len(scaled_weights) > 4 else 0.5
+                        mechanism += f" + {w5*0.1:.3f}*{f5}"
+                else:
+                    mechanism += f"{top_features[0]} / (0.5 + {top_features[0]})"
+                
+                mechanism += f"\n\nCRITICAL: Adjust coefficients, saturation parameters (e.g., 0.3 in denominator), and feature combinations based on R² and MAE performance metrics. Feature importance values are NOT coefficients - learn proper values through optimization."
             else:
-                mechanism += f"{top_features[0]} / (0.5 + {top_features[0]})"
-            
-            mechanism += f"\n\nCRITICAL: Adjust coefficients, saturation parameters (e.g., 0.3 in denominator), and feature combinations based on R² and MAE performance metrics. Feature importance values are NOT coefficients - learn proper values through optimization."
+                # For regression: keep original format
+                mechanism = f"""[ML-GUIDED NON-LINEAR] This mechanism uses non-linear transformations of the ML model's top features.
+
+MECHANISM: Applies saturation and threshold effects to the most important features from the ML model. This mechanism is designed to be a strong, independent predictor that works well on its own, while also complementing the linear ML baseline. Uses normalized coefficients based on relative importance as starting values - optimize these to maximize standalone predictive performance.
+
+KEY FEATURES:
+
+"""
+                for i, feat in enumerate(top_features[:MAX_TOP_FEATURES_DISPLAY]):
+                    imp = feature_importance.get(feat, 0.5)
+                    mechanism += f"  {i+1}. {feat} (relative importance: {imp:.3f})\n"
+                
+                # Normalize weights properly
+                total_importance = sum(feature_importance.get(feat, 0.5) for feat in top_features[:MAX_TOP_FEATURES])
+                if total_importance > 0:
+                    normalized_weights = [feature_importance.get(feat, 0.5) / total_importance for feat in top_features[:MAX_TOP_FEATURES]]
+                    scaled_weights = [max(0.1, min(1.0, w * 2.0)) for w in normalized_weights]
+                else:
+                    scaled_weights = [0.5] * len(top_features[:MAX_TOP_FEATURES])
+                
+                mechanism += f"\nINITIAL FORMULA (starting point - optimize coefficients and saturation parameters based on performance metrics R² and MAE):\n"
+                mechanism += f"ŷ = "
+                
+                if len(top_features) >= 2:
+                    f1, f2 = top_features[0], top_features[1]
+                    w1 = scaled_weights[0] if len(scaled_weights) > 0 else 0.5
+                    w2 = scaled_weights[1] if len(scaled_weights) > 1 else 0.5
+                    
+                    # Use normalized weights with saturation for top feature
+                    mechanism += f"{w1:.3f} * {f1} / (0.3 + {f1})"
+                    
+                    # Add second feature with interaction or addition
+                    if interactions and len(interactions) > 0:
+                        mechanism += f" * (1 + {w2*0.8:.3f}*{f2})"
+                    else:
+                        mechanism += f" + {w2*0.8:.3f}*{f2}"
+                    
+                    # Add third feature if available (with reduced weight to avoid overfitting)
+                    if len(top_features) >= 3:
+                        f3 = top_features[2]
+                        w3 = scaled_weights[2] if len(scaled_weights) > 2 else 0.5
+                        mechanism += f" + {w3*0.4:.3f}*{f3}"
+                    
+                    # Add fourth and fifth features with even smaller weights for stability
+                    if len(top_features) >= 4:
+                        f4 = top_features[3]
+                        w4 = scaled_weights[3] if len(scaled_weights) > 3 else 0.5
+                        mechanism += f" + {w4*0.2:.3f}*{f4}"
+                    if len(top_features) >= 5:
+                        f5 = top_features[4]
+                        w5 = scaled_weights[4] if len(scaled_weights) > 4 else 0.5
+                        mechanism += f" + {w5*0.1:.3f}*{f5}"
+                else:
+                    mechanism += f"{top_features[0]} / (0.5 + {top_features[0]})"
+                
+                mechanism += f"\n\nCRITICAL: Adjust coefficients, saturation parameters (e.g., 0.3 in denominator), and feature combinations based on R² and MAE performance metrics. Feature importance values are NOT coefficients - learn proper values through optimization."
         
         if task_type == "classification":
             if class_names and len(class_names) > 0:
                 n_classes = len(class_names)
                 class_mapping = ", ".join([f"{i}={cn}" for i, cn in enumerate(class_names)])
-                # Add explicit threshold-based class mapping formula
-                bin_size = (scale_max - scale_min) / n_classes
-                thresholds = [scale_min + (i + 1) * bin_size for i in range(n_classes - 1)]
-                if len(thresholds) == 1:
-                    class_formula = f"ŷ = 0 if score < {thresholds[0]:.2f} else 1"
-                elif len(thresholds) == 2:
-                    class_formula = f"ŷ = 0 if score < {thresholds[0]:.2f} else (1 if score < {thresholds[1]:.2f} else 2)"
-                elif len(thresholds) == 3:
-                    class_formula = f"ŷ = 0 if score < {thresholds[0]:.2f} else (1 if score < {thresholds[1]:.2f} else (2 if score < {thresholds[2]:.2f} else 3))"
-                else:
-                    # General case
-                    class_formula = f"ŷ = 0"
-                    for i in range(len(thresholds)):
-                        class_formula = f"({class_formula} if score < {thresholds[i]:.2f} else {i+1})"
-                    class_formula = f"({class_formula} else {n_classes-1})"
-                mechanism += f"\nMap score to class index: {class_formula}\nClass mapping: {class_mapping}"
+                
+                # Generate class-specific equations instead of thresholding
+                mechanism += f"\n\nCLASSIFICATION FORMULATION:\n"
+                mechanism += f"This mechanism uses separate equations for each class. First, interpret each class textually based on its label and relationship to input features. Then compute a score for each class, and select the class with the highest score.\n\n"
+                
+                # Generate textual interpretations and equations for each class with non-linear transformations
+                for i, class_name in enumerate(class_names):
+                    mechanism += f"CLASS {i} ({class_name}):\n"
+                    
+                    # Add textual interpretation for the class
+                    primary_feat = top_features[i % len(top_features)] if len(top_features) > 0 else "feature_0"
+                    secondary_feat = top_features[(i + 1) % len(top_features)] if len(top_features) > 1 else primary_feat
+                    
+                    # Generate meaningful textual description based on class name
+                    mechanism += f"  INTERPRETATION: "
+                    if class_name and len(class_name) > 0 and not class_name.isdigit():
+                        # Class has meaningful label - provide interpretation
+                        mechanism += f"The class '{class_name}' is characterized by "
+                        if len(top_features) >= 2:
+                            mechanism += f"specific patterns in {primary_feat} and {secondary_feat}. "
+                        else:
+                            mechanism += f"patterns in {primary_feat}. "
+                        mechanism += f"Examples belonging to this class typically exhibit "
+                        mechanism += f"distinctive relationships between these features that distinguish '{class_name}' from other classes. "
+                        mechanism += f"The mechanism models this class using non-linear transformations (saturation effects) on {primary_feat}"
+                        if len(top_features) >= 2:
+                            mechanism += f" and linear contributions from {secondary_feat}"
+                        mechanism += f" in the scoring equation.\n"
+                    else:
+                        # Generic class label - provide feature-based interpretation
+                        mechanism += f"This class is characterized by specific patterns in {primary_feat}"
+                        if len(top_features) >= 2:
+                            mechanism += f" and {secondary_feat}"
+                        mechanism += f". Examples belonging to this class typically exhibit distinctive relationships between these features. "
+                        mechanism += f"The mechanism models this class using non-linear transformations (saturation effects) on {primary_feat}"
+                        if len(top_features) >= 2:
+                            mechanism += f" and linear contributions from {secondary_feat}"
+                        mechanism += f" in the scoring equation.\n"
+                    
+                    # Add equation after interpretation - USE NONLINEAR TRANSFORMATIONS
+                    mechanism += f"  EQUATION (with nonlinear transformations):\n"
+                    # Use different feature combinations for each class to encourage diversity
+                    # Apply nonlinear transformations to capture complex relationships
+                    if len(top_features) >= 2:
+                        # Alternate which features are emphasized for each class
+                        w1 = scaled_weights[i % len(scaled_weights)] if len(scaled_weights) > 0 else 0.5
+                        w2 = scaled_weights[(i + 1) % len(scaled_weights)] if len(scaled_weights) > 1 else 0.3
+                        # Use saturation for primary feature to capture nonlinear relationships
+                        saturation_param = 0.3 + (i * 0.1)  # Vary saturation parameter per class
+                        mechanism += f"    score_{i} = {w1:.3f} * {primary_feat} / ({saturation_param:.2f} + {primary_feat}) + {w2:.3f} * {secondary_feat}"
+                        if len(top_features) >= 3:
+                            tertiary_feat = top_features[(i + 2) % len(top_features)]
+                            w3 = scaled_weights[(i + 2) % len(scaled_weights)] if len(scaled_weights) > 2 else 0.2
+                            # Add interaction term for nonlinearity
+                            mechanism += f" + {w3:.3f} * {primary_feat} * {tertiary_feat}"
+                        mechanism += f"\n"
+                    else:
+                        saturation_param = 0.3
+                        mechanism += f"    score_{i} = {scaled_weights[0] if len(scaled_weights) > 0 else 0.5:.3f} * {top_features[0]} / ({saturation_param:.2f} + {top_features[0]})\n"
+                    mechanism += f"    NOTE: The saturation term ({primary_feat} / ({saturation_param:.2f} + {primary_feat})) captures nonlinear relationships where high feature values have diminishing returns. The interaction term ({primary_feat} * {tertiary_feat if len(top_features) >= 3 else 'feature'}) captures synergistic effects. Optimize saturation parameters and coefficients to improve performance.\n"
+                
+                mechanism += f"\nFINAL PREDICTION:\n"
+                mechanism += f"ŷ = argmax([score_0, score_1"
+                if n_classes > 2:
+                    for i in range(2, n_classes):
+                        mechanism += f", score_{i}"
+                mechanism += f"])\n"
+                mechanism += f"Class mapping: {class_mapping}\n"
+                mechanism += f"\nCRITICAL NONLINEARITY AND INTERACTION GUIDANCE:\n"
+                mechanism += f"- Each class equation uses INTERMEDIATE VARIABLES to capture complex nonlinear interactions\n"
+                mechanism += f"- Learn the NONLINEARITY of interactions: interactions themselves may have saturation effects (feature1 * feature2 / (K + feature1 * feature2))\n"
+                mechanism += f"- Discover which features interact and HOW they interact nonlinearly (multiplicative, ratio-based, threshold-based)\n"
+                mechanism += f"- Use intermediate variables to model complex relationships: intermediate = f(feature1, feature2) where f is nonlinear\n"
+                mechanism += f"- Think about feature relationships: do features interact multiplicatively, additively, or through more complex patterns?\n"
+                mechanism += f"- The saturation terms (feature / (K + feature)) capture diminishing returns and nonlinear relationships\n"
+                mechanism += f"- Nonlinear interactions (feature1 * feature2 / (K + feature1 * feature2)) capture how features interact nonlinearly\n"
+                mechanism += f"- Optimize BOTH the form of interactions AND their coefficients - the nonlinearity of interactions matters\n"
+                mechanism += f"- Consider threshold effects: are there critical values where the relationship changes?\n"
+                mechanism += f"- Linear combinations fail - you must learn nonlinear relationships and nonlinear interactions"
             else:
-                mechanism += f"\nMap score to class index: ŷ = 0 if score < {(scale_min + scale_max) / 2:.2f} else 1"
+                mechanism += f"\n\nCLASSIFICATION FORMULATION:\n"
+                mechanism += f"CLASS 0 SCORE: score_0 = {scaled_weights[0] if len(scaled_weights) > 0 else 0.5:.3f} * {top_features[0] if len(top_features) > 0 else 'feature_0'} / (0.3 + {top_features[0] if len(top_features) > 0 else 'feature_0'})\n"
+                mechanism += f"CLASS 1 SCORE: score_1 = {scaled_weights[1] if len(scaled_weights) > 1 else 0.3:.3f} * {top_features[1] if len(top_features) > 1 else 'feature_1'} / (0.3 + {top_features[1] if len(top_features) > 1 else 'feature_1'})\n"
+                mechanism += f"ŷ = argmax([score_0, score_1])\n"
         else:
-            mechanism += f"\nClipped to [{scale_min}, {scale_max}]"
+            # Only mention clipping if scaling is enabled
+            if use_scaling:
+                mechanism += f"\nClipped to [{scale_min}, {scale_max}]"
     
     return mechanism
 
@@ -779,25 +1058,56 @@ The ML baseline identifies these as the most important features:
                     feedback += f"    → {suggestion}\n"
         feedback += "\n"
     
-    feedback += """YOUR TASK: Use the above ML insights and failure patterns to improve your mechanism.
+    feedback += """YOUR TASK: Build a STRONG, INDEPENDENT PREDICTIVE MECHANISM
+
+🎯 PRIMARY GOAL: Your mechanism must work WELL ON ITS OWN as a standalone predictor.
+While it may complement other mechanisms in an ensemble, prioritize independent predictive performance.
+Your mechanism should achieve high R² and low MAE when evaluated alone (LLM-only evaluation).
 
 KEY STRATEGIES:
-1. LEARN NEW COEFFICIENT VALUES: Your current formula has coefficients (like 0.783, 0.301, 0.194, etc.) that are starting values. You MUST change these to new values based on performance metrics. Don't just keep the same coefficients and add interaction terms - actually try different coefficient values (e.g., 0.5, 1.0, 1.2, 1.5, 2.0) to find what maximizes R² and minimizes MAE. If R² is low, try increasing important feature coefficients. If MAE is high, adjust coefficients systematically.
+1. BUILD INDEPENDENT PREDICTIVE POWER: Focus on making your mechanism work well as a standalone predictor. 
+   Include all features and interactions that improve independent performance, not just those that complement other mechanisms.
+   If a feature or pattern improves standalone R²/MAE, include it even if it overlaps with other mechanisms.
 
-2. OPTIMIZE COEFFICIENTS BASED ON PERFORMANCE METRICS: Don't just copy feature importance values - adjust coefficients based on R² and MAE (for regression) or Accuracy and F1 (for classification). Feature importance (e.g., 0.392) is NOT a coefficient - it's just a measure of contribution. Learn proper coefficients (typically 0.1-2.0 range) by optimizing performance metrics, not loss.
+2. LEARN NEW COEFFICIENT VALUES: Your current formula has coefficients (like 0.783, 0.301, 0.194, etc.) that are starting values. 
+   You MUST change these to new values based on performance metrics. Don't just keep the same coefficients and add interaction terms - 
+   actually try different coefficient values (e.g., 0.5, 1.0, 1.2, 1.5, 2.0) to find what maximizes R² and minimizes MAE. 
+   If R² is low, try increasing important feature coefficients. If MAE is high, adjust coefficients systematically.
 
-3. FIX ML WEAKNESSES: Target the error patterns identified above - these show where the ML model fails
+3. OPTIMIZE COEFFICIENTS BASED ON PERFORMANCE METRICS: Don't just copy feature importance values - adjust coefficients based on 
+   R² and MAE (for regression) or Accuracy and F1 (for classification). Feature importance (e.g., 0.392) is NOT a coefficient - 
+   it's just a measure of contribution. Learn proper coefficients (typically 0.1-2.0 range) by optimizing performance metrics, not loss.
 
-4. ADD NON-LINEAR TERMS: Where ML (linear) fails, add saturation/threshold effects or interactions
+4. USE ML INSIGHTS TO IMPROVE INDEPENDENT PERFORMANCE: The error patterns identified above show where the ML model fails. 
+   Use these to improve your mechanism's independent predictive power. Design your mechanism to handle these cases correctly 
+   and achieve better standalone performance.
 
-5. USE COUNTERFACTUALS: The suggestions above show which features to emphasize and how to adjust them
+5. CRITICAL: ADD ADVANCED NONLINEAR TRANSFORMATIONS AND LEARN NONLINEAR INTERACTIONS:
+   - Use INTERMEDIATE VARIABLES to capture complex nonlinear interactions: intermediate = f(feature1, feature2) where f is nonlinear
+   - LEARN THE NONLINEARITY OF INTERACTIONS: interactions themselves may have saturation (feature1 * feature2 / (K + feature1 * feature2))
+   - DISCOVER which features interact and HOW they interact nonlinearly (multiplicative, ratio-based, threshold-based)
+   - Use saturation effects: feature / (K + feature) to capture diminishing returns
+   - Use NONLINEAR interactions: not just feature1 * feature2, but feature1 * feature2 / (K + feature1 * feature2)
+   - Use threshold effects: max(0, feature - threshold) or conditional logic
+   - Think about how features interact: do high values of multiple features create different effects? How do they interact nonlinearly?
+   - Consider saturation: do very high feature values have diminishing returns?
+   - The ML model is linear - you must use nonlinearity to capture patterns it misses
+   - Each class equation should use different nonlinear transformations and intermediate variables to model what makes that class unique
+   - Create intermediate variables that capture complex relationships: e.g., intermediate = feature1 * feature2 / (0.2 + feature1 * feature2)
+   - Optimize BOTH the form of interactions AND their coefficients - the nonlinearity of interactions matters
 
-6. ITERATE BASED ON PERFORMANCE METRICS: Change coefficients, add/remove terms, or modify formulas based on R² and MAE (for regression) or Accuracy and F1 (for classification). Focus on improving these metrics, not just reducing loss.
+6. USE COUNTERFACTUALS: The suggestions above show which features to emphasize and how to adjust them to improve standalone performance.
 
-CRITICAL: Your mechanism formula should use proper mathematical coefficients (typically 0.1-2.0 range), NOT raw feature importance values. The initial formula uses normalized weights as a starting point - you should optimize these based on performance metrics (R²/MAE for regression, Accuracy/F1 for classification), NOT by copying feature importance values.
+7. ITERATE BASED ON PERFORMANCE METRICS: Change coefficients, add/remove terms, or modify formulas based on R² and MAE 
+   (for regression) or Accuracy and F1 (for classification). Focus on improving these metrics for standalone performance, not just reducing loss.
 
-REMEMBER: Your mechanism should COMPLEMENT the ML model, not replicate it.
-Focus on the error patterns and use different mathematical forms. Adjust coefficients iteratively based on performance metrics (R², MAE, Accuracy, F1), not just loss.
+CRITICAL: Your mechanism formula should use proper mathematical coefficients (typically 0.1-2.0 range), NOT raw feature importance values. 
+The initial formula uses normalized weights as a starting point - you should optimize these based on performance metrics 
+(R²/MAE for regression, Accuracy/F1 for classification), NOT by copying feature importance values.
+
+REMEMBER: Your mechanism should be a STRONG, INDEPENDENT PREDICTOR that works well on its own.
+While it may complement the ML model, prioritize building standalone predictive power. Use all relevant features and patterns 
+that improve independent performance. Adjust coefficients iteratively based on performance metrics (R², MAE, Accuracy, F1), not just loss.
 
 """
     

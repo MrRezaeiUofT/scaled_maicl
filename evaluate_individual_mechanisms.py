@@ -16,6 +16,14 @@ from typing import List, Tuple, Optional, Dict, Any
 import math
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
+# Try to import RDKit for molecular property computation
+try:
+    from rdkit import Chem
+    from rdkit.Chem import Descriptors
+    RDKIT_AVAILABLE = True
+except ImportError:
+    RDKIT_AVAILABLE = False
+
 
 def parse_mechanisms_file(filepath: str) -> List[Tuple[str, str]]:
     """
@@ -99,12 +107,108 @@ def extract_formula_from_llm_mechanism(mechanism_text: str) -> Optional[str]:
     return None
 
 
+def _compute_molecular_properties(smiles: str) -> Dict[str, float]:
+    """
+    Compute molecular properties from a SMILES string using RDKit.
+    
+    Args:
+        smiles: SMILES string
+        
+    Returns:
+        Dictionary of molecular properties
+    """
+    if not RDKIT_AVAILABLE:
+        # Fallback: return zeros if RDKit is not available
+        return {
+            'molecular_weight': 0.0,
+            'num_rings': 0.0,
+            'num_hydroxyl_groups': 0.0,
+            'num_halogen': 0.0,
+            'num_nitrogen': 0.0,
+            'num_oxygen': 0.0,
+            'num_atoms': 0.0,
+            'is_aromatic': 0.0,
+            'num_hbd': 0.0  # hydrogen bond donors
+        }
+    
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return {
+                'molecular_weight': 0.0,
+                'num_rings': 0.0,
+                'num_hydroxyl_groups': 0.0,
+                'num_halogen': 0.0,
+                'num_nitrogen': 0.0,
+                'num_oxygen': 0.0,
+                'num_atoms': 0.0,
+                'is_aromatic': 0.0,
+                'num_hbd': 0.0
+            }
+        
+        # Compute molecular weight
+        mw = Descriptors.MolWt(mol)
+        
+        # Count rings
+        num_rings = Descriptors.RingCount(mol)
+        
+        # Count atoms
+        num_atoms = mol.GetNumAtoms()
+        
+        # Count specific atom types
+        num_nitrogen = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == 'N')
+        num_oxygen = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == 'O')
+        
+        # Count halogens (F, Cl, Br, I)
+        num_halogen = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() in ['F', 'Cl', 'Br', 'I'])
+        
+        # Count hydroxyl groups (-OH)
+        num_hydroxyl = 0
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() == 'O':
+                # Check if this oxygen is part of a hydroxyl group
+                neighbors = [n.GetSymbol() for n in atom.GetNeighbors()]
+                if 'H' in neighbors:
+                    num_hydroxyl += 1
+        
+        # Check aromaticity
+        is_aromatic = 1.0 if Descriptors.NumAromaticRings(mol) > 0 else 0.0
+        
+        # Count hydrogen bond donors (N-H, O-H)
+        num_hbd = Descriptors.NumHDonors(mol)
+        
+        return {
+            'molecular_weight': float(mw),
+            'num_rings': float(num_rings),
+            'num_hydroxyl_groups': float(num_hydroxyl),
+            'num_halogen': float(num_halogen),
+            'num_nitrogen': float(num_nitrogen),
+            'num_oxygen': float(num_oxygen),
+            'num_atoms': float(num_atoms),
+            'is_aromatic': is_aromatic,
+            'num_hbd': float(num_hbd)
+        }
+    except Exception:
+        return {
+            'molecular_weight': 0.0,
+            'num_rings': 0.0,
+            'num_hydroxyl_groups': 0.0,
+            'num_halogen': 0.0,
+            'num_nitrogen': 0.0,
+            'num_oxygen': 0.0,
+            'num_atoms': 0.0,
+            'is_aromatic': 0.0,
+            'num_hbd': 0.0
+        }
+
+
 def evaluate_llm_formula(
     formula: str,
     X: np.ndarray,
     feature_cols: List[str],
     scaler: Any,
-    y_scaler: Optional[Any] = None
+    y_scaler: Optional[Any] = None,
+    X_original: Optional[List[Any]] = None
 ) -> np.ndarray:
     """
     Evaluate an LLM formula on data.
@@ -115,15 +219,37 @@ def evaluate_llm_formula(
         feature_cols: List of feature names
         scaler: Feature scaler (for inverse transform if needed)
         y_scaler: Target scaler (for inverse transform if needed)
+        X_original: Optional list of original (non-vectorized) features (e.g., SMILES strings)
         
     Returns:
         Array of predictions
     """
     predictions = []
     
+    # Check if this is a DeepChem dataset (formula uses molecular properties)
+    is_deepchem = 'molecular_weight(SMILES)' in formula or 'num_rings(SMILES)' in formula or 'num_hydroxyl_groups(SMILES)' in formula
+    
     for i in range(len(X)):
-        # Create feature dictionary
-        x_dict = {feature_cols[j]: float(X[i, j]) for j in range(len(feature_cols))}
+        # For DeepChem datasets, use SMILES from X_original
+        if is_deepchem and X_original is not None and i < len(X_original):
+            # Extract SMILES string
+            if isinstance(X_original[i], dict):
+                smiles = X_original[i].get('SMILES', '')
+            elif isinstance(X_original[i], str):
+                smiles = X_original[i]
+            else:
+                smiles = str(X_original[i])
+            
+            # Compute molecular properties from SMILES
+            mol_props = _compute_molecular_properties(smiles)
+            
+            # Create x_dict with molecular properties
+            x_dict = mol_props.copy()
+            # Also add SMILES as a variable (for formulas that reference it)
+            x_dict['SMILES'] = smiles
+        else:
+            # For non-DeepChem datasets, use vectorized features
+            x_dict = {feature_cols[j]: float(X[i, j]) for j in range(len(feature_cols))}
         
         # Evaluate formula
         pred = _execute_formula(formula, x_dict)
@@ -153,30 +279,46 @@ def _execute_formula(formula: str, x_dict: Dict[str, float]) -> Optional[float]:
     """
     Safely execute a formula with feature values.
     
+    Handles molecular property functions like molecular_weight(SMILES), num_rings(SMILES), etc.
+    by replacing them with their computed values from x_dict.
+    
     Args:
-        formula: Formula string
-        x_dict: Dictionary of feature names to values
+        formula: Formula string (may contain function calls like molecular_weight(SMILES))
+        x_dict: Dictionary of feature names to values (including molecular properties)
         
     Returns:
         Computed value or None if execution fails
     """
     try:
+        # Replace molecular property function calls with their values
+        # Pattern: function_name(SMILES) -> function_name
+        formula_processed = formula
+        
+        # List of molecular property functions
+        mol_prop_functions = [
+            'molecular_weight', 'num_rings', 'num_hydroxyl_groups', 'num_halogen',
+            'num_nitrogen', 'num_oxygen', 'num_atoms', 'is_aromatic', 'num_hbd'
+        ]
+        
+        for func_name in mol_prop_functions:
+            # Replace function_name(SMILES) with just function_name
+            # This handles patterns like: molecular_weight(SMILES) / 100
+            pattern = rf'{func_name}\s*\([^)]*\)'
+            if func_name in x_dict:
+                # Replace the function call with the value from x_dict
+                formula_processed = re.sub(pattern, func_name, formula_processed)
+        
         # Create safe evaluation environment
         safe_dict = {}
         for key, val in x_dict.items():
-            # Sanitize key name (remove special chars, replace with underscore)
-            safe_key = re.sub(r'[^a-zA-Z0-9_]', '_', str(key))
-            safe_dict[safe_key] = float(val)
-            # Also add original key if different
-            if safe_key != key:
-                safe_dict[key] = float(val)
-        
-        # Replace feature names in formula with safe names
-        formula_safe = formula
-        for orig_key in x_dict.keys():
-            safe_key = re.sub(r'[^a-zA-Z0-9_]', '_', str(orig_key))
-            # Replace both original and safe versions
-            formula_safe = formula_safe.replace(str(orig_key), safe_key)
+            # Skip non-numeric values (like SMILES string itself)
+            if isinstance(val, (int, float)):
+                # Sanitize key name (remove special chars, replace with underscore)
+                safe_key = re.sub(r'[^a-zA-Z0-9_]', '_', str(key))
+                safe_dict[safe_key] = float(val)
+                # Also add original key if different
+                if safe_key != key:
+                    safe_dict[key] = float(val)
         
         # Add math functions to safe environment
         safe_dict.update({
@@ -186,8 +328,13 @@ def _execute_formula(formula: str, x_dict: Dict[str, float]) -> Optional[float]:
             'pow': pow, '__builtins__': {}
         })
         
+        # Add clip function for regression formulas
+        def clip_func(x, min_val, max_val):
+            return max(min_val, min(max_val, float(x)))
+        safe_dict['clip'] = clip_func
+        
         # Execute formula
-        score = eval(formula_safe, {"__builtins__": {}}, safe_dict)
+        score = eval(formula_processed, {"__builtins__": {}}, safe_dict)
         return float(score)
         
     except Exception as e:
