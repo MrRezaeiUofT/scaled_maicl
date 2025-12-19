@@ -1142,11 +1142,55 @@ prompts:
       ecoli:
         encoder: |
           You are a mechanism encoder for E. coli protein localization classification dataset.
-          Predicts protein localization site from sequence features.
-          Focus on sequence motifs and localization signals.
+          Predicts protein localization site (8 classes) from sequence recognition features.
+          
+          DATASET CONTEXT:
+          This dataset classifies E. coli proteins into localization sites based on sequence signals.
+          
+          FEATURES:
+          - mcg (Continuous): McGeoch's method for signal sequence recognition - measures sequence signal strength
+          - gvh (Continuous): von Heijne's method for signal sequence recognition - alternative signal sequence scoring
+          - lip (Binary): von Heijne's Signal Peptidase II consensus sequence score - lipoprotein signal indicator
+          - chg (Binary): Presence of charge on N-terminus of predicted lipoproteins - charge characteristics
+          - aac (Continuous): Discriminant analysis score of amino acid content for outer membrane/periplasmic proteins
+          - alm1 (Continuous): ALOM membrane spanning region prediction score - membrane localization prediction
+          - alm2 (Continuous): ALOM score after excluding cleavable signal regions - refined membrane prediction
+          
+          KEY INSIGHTS:
+          - Multiple signal sequence recognition methods (McGeoch, von Heijne, ALOM) provide complementary information
+          - Signal peptide characteristics (charge, peptidase sites) are critical for localization
+          - Membrane spanning regions and amino acid composition patterns determine localization site
+          - Different localization sites have distinct sequence signatures
+          - Binary features (lip, chg) indicate specific signal peptide types
+          - Continuous features provide quantitative signal strength scores
+          
+          Focus on how sequence recognition signals, membrane predictions, and amino acid composition interact to determine localization.
         decoder: |
           You are a mechanism decoder for E. coli protein localization classification dataset.
-          Generate a mechanism predicting localization site from sequence features.
+          Generate a mechanism predicting localization site (8 classes) from sequence recognition features.
+          
+          DATASET CONTEXT:
+          This dataset classifies E. coli proteins into localization sites based on sequence signals.
+          
+          FEATURES:
+          - mcg (Continuous): McGeoch's method for signal sequence recognition - measures sequence signal strength
+          - gvh (Continuous): von Heijne's method for signal sequence recognition - alternative signal sequence scoring
+          - lip (Binary): von Heijne's Signal Peptidase II consensus sequence score - lipoprotein signal indicator
+          - chg (Binary): Presence of charge on N-terminus of predicted lipoproteins - charge characteristics
+          - aac (Continuous): Discriminant analysis score of amino acid content for outer membrane/periplasmic proteins
+          - alm1 (Continuous): ALOM membrane spanning region prediction score - membrane localization prediction
+          - alm2 (Continuous): ALOM score after excluding cleavable signal regions - refined membrane prediction
+          
+          MECHANISM DESIGN PRINCIPLES:
+          - Consider how signal sequence recognition methods (mcg, gvh) combine to indicate localization
+          - Use binary features (lip, chg) to identify specific signal peptide types
+          - Incorporate membrane prediction scores (alm1, alm2) to distinguish membrane-bound vs soluble proteins
+          - Use amino acid composition (aac) to differentiate outer membrane vs periplasmic proteins
+          - Higher signal scores (mcg, gvh) typically indicate stronger localization signals
+          - Membrane scores (alm1, alm2) help distinguish inner membrane, outer membrane, and periplasmic sites
+          - Charge characteristics (chg) and peptidase signals (lip) are important for lipoprotein localization
+          
+          Generate mechanisms that reason about sequence recognition signals, membrane predictions, and amino acid composition patterns.
       
       credit:
         encoder: |

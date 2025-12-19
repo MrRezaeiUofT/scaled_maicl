@@ -104,12 +104,27 @@ Key insights:
 - Features include diagnostic attributes
 - Medical classification task""",
         
-        "ecoli": """ECOLI DATASET:
-This dataset contains protein localization sites in E.coli bacteria.
+        "ecoli": """ECOLI PROTEIN LOCALIZATION DATASET:
+This dataset contains protein localization sites in E.coli bacteria based on sequence features.
+The task is to classify proteins into 8 different localization sites based on sequence recognition signals.
+
+FEATURES:
+- mcg (Continuous): McGeoch's method for signal sequence recognition - measures sequence signal strength
+- gvh (Continuous): von Heijne's method for signal sequence recognition - alternative signal sequence scoring method
+- lip (Binary): von Heijne's Signal Peptidase II consensus sequence score - indicates presence of lipoprotein signal
+- chg (Binary): Presence of charge on N-terminus of predicted lipoproteins - charge characteristics
+- aac (Continuous): Score of discriminant analysis of the amino acid content of outer membrane and periplasmic proteins - amino acid composition analysis
+- alm1 (Continuous): Score of the ALOM membrane spanning region prediction program - membrane localization prediction
+- alm2 (Continuous): Score of ALOM program after excluding putative cleavable signal regions from the sequence - refined membrane prediction
+
 Key insights:
-- 8 classes representing different localization sites
-- Features include sequence and composition attributes
-- Biological classification task""",
+- 8 classes representing different localization sites (cytoplasm, inner membrane, outer membrane, periplasm, etc.)
+- Features combine multiple signal sequence recognition methods (McGeoch, von Heijne, ALOM)
+- Signal peptide characteristics (charge, peptidase sites) are critical for localization
+- Membrane spanning regions and amino acid composition patterns determine localization
+- Different localization sites have distinct sequence signatures and signal patterns
+- Binary features (lip, chg) indicate specific signal peptide types
+- Continuous features (mcg, gvh, aac, alm1, alm2) provide quantitative signal strength scores""",
         
         "credit": """CREDIT APPROVAL DATASET:
 This dataset contains credit application data.

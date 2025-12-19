@@ -145,6 +145,10 @@ def load_openml_classification(dataset_name: str, max_samples: int):
         "leukemia": 1104,  # Leukemia classification (AML vs ALL) - 72 samples, 7129 genes
         "colon-cancer": 1100,  # Colon cancer classification (tumor vs normal) - 62 samples, 2000 genes
         "colon": 1100,  # Alias for colon-cancer
+        # Biological/genomic datasets
+        "mice-protein": 40966,  # Mice Protein Expression - 8 classes, 1080 samples, 77 protein expression levels
+        "miceprotein": 40966,  # Alias for mice-protein
+        "splice": 46,  # Splice (Gene Sequences) - 3 classes, 3175 samples, 60 DNA sequence positions
         # Note: primary-tumor (ID 47) is private and requires authentication
         # Note: TCGA (The Cancer Genome Atlas) datasets require dbGaP authentication and are not directly
         #       accessible via OpenML. To use TCGA data, download from GDC (https://portal.gdc.cancer.gov/)
@@ -205,6 +209,31 @@ def load_openml_classification(dataset_name: str, max_samples: int):
         else:
             X_parts.append(X[col].values.reshape(-1, 1))
     X_encoded = np.hstack(X_parts)
+    
+    # Handle missing values (NaN) - remove rows with any missing values
+    # This is important for datasets like mice-protein that may have missing values
+    # Check for NaN in X_encoded
+    x_valid_mask = ~np.isnan(X_encoded).any(axis=1)
+    # Check for NaN in y (handle both pandas Series and numpy arrays)
+    if hasattr(y, 'isna'):
+        # pandas Series - convert to numpy array for boolean operations
+        y_valid_mask = ~y.isna().values
+    else:
+        # numpy array or array-like
+        y_array = np.asarray(y)
+        y_valid_mask = ~np.isnan(y_array)
+    valid_mask = x_valid_mask & y_valid_mask
+    if not valid_mask.all():
+        n_missing = (~valid_mask).sum()
+        logger.info(f"Removing {n_missing} samples with missing values (out of {len(X_encoded)} total)")
+        X_encoded = X_encoded[valid_mask]
+        # Filter y (pandas Series or numpy array)
+        if hasattr(y, 'reset_index'):
+            y = y[valid_mask].reset_index(drop=True)
+        else:
+            y = np.asarray(y)[valid_mask]
+        X_original = [X_original[i] for i in range(len(X_original)) if valid_mask[i]]
+        logger.info(f"After removing missing values: {len(X_encoded)} samples remaining")
     
     # Encode target labels and get class names
     # Convert to string first to preserve original class names (e.g., "unacc", "acc", "good", "vgood")
@@ -850,6 +879,9 @@ def main():
                              "  OpenML (gene expression cancer):\n"
                              "    - leukemia (2) - Leukemia classification (AML vs ALL), 72 samples, 7129 genes\n"
                              "    - colon-cancer (2) or colon (2) - Colon cancer classification (tumor vs normal), 62 samples, 2000 genes\n"
+                             "  OpenML (biological/genomic):\n"
+                             "    - mice-protein (8) or miceprotein (8) - Mice Protein Expression, 1080 samples, 77 protein expression levels\n"
+                             "    - splice (3) - Splice (Gene Sequences), 3175 samples, 60 DNA sequence positions\n"
                              "  Synthetic: synthetic5 (5)\n"
                              "  TabArena (HuggingFace):\n"
                              "    - adult (2), bank (2), income (2), wine (3), spaceship (2), default (2), booking (3), churn (2)\n"
@@ -878,7 +910,7 @@ def main():
                              "    - gt_donors_chiral_categorical\n"
                              "    - gt_acceptors_achiral_categorical\n"
                              "    - gt_acceptors_chiral_categorical")
-    parser.add_argument("--model_name", default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash"),
+    parser.add_argument("--model_name", default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-pro"),
                         help="Gemini model name, e.g., gemini-2.0-flash, gemini-2.0-pro")
     parser.add_argument("--ml_mech", default="linear", help="ML mechanism: logreg|xgboost|tabicl")
     parser.add_argument("--use_ml", type=int, default=1, choices=[0,1], help="Include ML mechanism in ensemble")

@@ -29,9 +29,9 @@ import logging
 
 # Base command arguments (fixed for all runs)
 BASE_ARGS = {
-    'dataset': 'soybean',
+    'dataset': 'adult',
     'iterations': 10,
-    'max_samples': 300,
+    'max_samples': 400,
     'evaluate_individual_mechanisms': True,
     'use_ml': 1,
     'val_size': 0.2,
