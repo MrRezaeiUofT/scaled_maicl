@@ -1095,7 +1095,7 @@ def main():
                         help="Plate index (0-based) for protein_expression dataset. Use --list_plates to see available indices.")
     parser.add_argument("--list_plates", action="store_true",
                         help="List all available protein expression plate files and exit")
-    parser.add_argument("--model_name", default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-pro"),
+    parser.add_argument("--model_name", default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash"),
                         help="Gemini model name, e.g., gemini-2.0-flash, gemini-2.5-pro")
     parser.add_argument("--ml_mech", default="linear", help="Regression ML mechanism: linear|xgboost|kernelridge|tabicl")
     parser.add_argument("--tabicl_bins", type=int, default=20,

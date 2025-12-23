@@ -19,16 +19,6 @@ prompts:
 
       YOUR TASK: BUILD A STRONG, INDEPENDENT PREDICTIVE MECHANISM
 
-      HISTORY-AWARE OPTIMIZATION RULE:
-      - If iteration history shows recent REJECTIONS or no meaningful metric gains, you MUST escalate beyond tiny edits.
-      - Make at least TWO structural changes (not just coefficient tweaks): add/remove an interaction, change a transform form
-        (linear → saturation/log/inverse-U), add gating/inhibition, or introduce a new intermediate concept and inline it into the final formula.
-      
-      KEEP IT SHORT (IMPORTANT):
-      - DIAGNOSIS: 1 sentence. FIX: 1 sentence.
-      - REVISED MECHANISM description: 2-4 sentences max.
-      - Prefer editing the formula directly; do not add long "the mechanism does..." filler.
-
       🎯 PRIMARY GOAL: Your mechanism must work WELL ON ITS OWN as a standalone predictor.
       While it may complement other mechanisms in an ensemble, it should be independently predictive.
       Focus on building a mechanism that can make accurate predictions by itself, not just one that fills gaps.
@@ -42,11 +32,77 @@ prompts:
       - Don't specialize only for complementarity - build a robust standalone predictor
       - Use all relevant features and interactions that improve independent predictive power
 
-      ACTION CHECKLIST (use this, don’t write it out):
-      - Address the biggest error patterns and worst examples shown above.
-      - Make 1–2 nonlinearities + 1–2 interactions that target those failures.
-      - Update coefficients meaningfully (don’t keep the same ones).
-      - Keep the mechanism compact and executable.
+      Follow this diagnostic process:
+
+      1️⃣ ANALYZE THE ERROR PATTERNS:
+
+         - What are the systematic failures? (overestimation? underestimation?)
+
+         - Which features correlate with large errors?
+
+         - Are errors worse for high/low values of specific features?
+
+      2️⃣ IDENTIFY THE ROOT CAUSE:
+
+         - Is a key feature missing from the mechanism?
+
+         - Are feature interactions modeled incorrectly?
+
+         - Are there saturation effects or thresholds being ignored?
+
+         - Is the functional form (linear/nonlinear) appropriate?
+
+         - COMPLEXITY GUIDANCE: Follow the complexity guidance provided above. If errors show
+           nonlinear patterns (errors increase faster than linear), use nonlinear transformations.
+           If errors appear relatively linear, simple forms may work better. Let the data guide
+           complexity rather than forcing it. Consider:
+           * Saturation effects: feature/(K+feature) or tanh-like responses (if errors show saturation)
+           * Multiplicative interactions: feature1 * feature2 (if interaction patterns detected)
+           * Threshold effects: max(0, feature - threshold) or step functions (if threshold effects seen)
+           * Polynomial terms: feature^2, feature^3 (only with clear mechanistic justification)
+           * Ratios and divisions: feature1/feature2 (if ratio relationships make sense)
+           * Exponential/logarithmic relationships (only if scientifically justified)
+
+      3️⃣ PROPOSE TARGETED FIX:
+
+         - BUILD INDEPENDENT PREDICTIVE POWER: Focus on making your mechanism work well as a standalone predictor. Include all features and interactions that improve independent performance, not just those that complement other mechanisms.
+
+         - LEARN NEW COEFFICIENTS: Don't just add interaction terms - actually adjust the base coefficients (0.783, 0.301, etc.) based on performance metrics. If R² is low or MAE is high, increase/decrease coefficients systematically. Try different coefficient values (e.g., 0.5, 1.0, 1.5, 2.0) to find what improves performance.
+
+         - Add the missing feature or interaction that explains errors AND improves standalone performance
+
+         - Adjust coefficients to improve performance metrics (R² and MAE for regression, Accuracy and F1 for classification) - NOT just to reduce loss
+
+         - PRIORITIZE INDEPENDENT ACCURACY: Your mechanism should predict well on its own. If a feature or interaction improves standalone R²/MAE, include it even if it overlaps with other mechanisms.
+
+         - CRITICAL: Do NOT use feature importance values (like 0.392, 0.150) as coefficients. These are NOT coefficients - they only indicate which features are important. Learn proper coefficients (typically 0.1-2.0 range) by optimizing performance metrics.
+
+         - CRITICAL: When you see coefficients like 0.783, 0.301, 0.194 in the formula, these are starting values that need to be OPTIMIZED. Don't keep them the same - try different values (e.g., 0.5, 1.0, 1.2, 1.5) and see which improves R² and MAE. The goal is to find coefficients that maximize R² and minimize MAE.
+
+         - Change functional form if needed - FOLLOW COMPLEXITY GUIDANCE:
+           * If complexity guidance suggests nonlinearity: use saturation, interactions, thresholds
+           * If complexity guidance suggests linear/simple: use simpler forms, let data guide
+           * Saturation: feature/(K+feature) for Michaelis-Menten-like responses (if saturation detected)
+           * Multiplicative interactions: feature1 * feature2 for synergistic effects (if interactions detected)
+           * Thresholds: max(0, feature - threshold) or conditional logic (if threshold effects seen)
+           * Polynomial terms: feature^2, feature^3 (only with clear mechanistic reason)
+           * Ratios: feature1/feature2 for relative effects (if ratio relationships make sense)
+           * Other nonlinear forms that capture the underlying process (when data supports it)
+
+         - IMPORTANT: Follow the complexity guidance provided above. Don't force nonlinearity if
+           the data doesn't support it, but do use it when error patterns indicate it's needed.
+
+         - Ensure all terms have mechanistic justification
+
+      4️⃣ VALIDATE THE FIX:
+
+         - Will this fix improve performance metrics (R² and MAE for regression, Accuracy and F1 for classification) in the specific examples shown?
+
+         - Does it make scientific sense for this dataset?
+
+         - Are all feature names correct?
+
+         - Are coefficients learned from performance metrics (not copied from feature importance values)?
 
       QUALITY REQUIREMENTS:
 
@@ -58,7 +114,7 @@ prompts:
 
       ✓ Each term must have clear mechanistic meaning
 
-      ✓ For regression: Output must be in scaled range [{scale_min}, {scale_max}] (use clip() function)
+      ✓ For regression: Output must be in scaled range [{scale_min}, {scale_max}] (when scaling is enabled)
       ✓ For classification: Output must be a CLASS INDEX (integer: 0, 1, 2, ...), NOT a probability or continuous value
         - Use thresholds, argmax, or conditional logic to map feature values to class indices
         - DO NOT use sigmoid or other probability functions - output must be a discrete class index
@@ -140,6 +196,62 @@ templates:
       Example: Instead of "x1 + x2", write "{feature_example}"
 
   dataset_contexts:
+    # -----------------------------
+    # Reusable templates (anchors)
+    # -----------------------------
+    tabular_classification: &tabular_classification |
+      DATASET: {dataset_name}
+      DOMAIN: Tabular Classification
+      TASK: Predict a discrete class label from input features.
+      GUIDANCE:
+      - Use thresholds/piecewise logic and feature interactions.
+      - For multi-class, score each class and use argmax.
+      - Pay attention to minority classes; avoid predicting only the majority.
+      FEATURES: {features}
+
+    tabular_regression: &tabular_regression |
+      DATASET: {dataset_name}
+      DOMAIN: Tabular Regression
+      TASK: Predict a continuous target from input features.
+      GUIDANCE:
+      - Use saturations/thresholds/interactions when error patterns indicate them.
+      - Keep the final formula stable (avoid extreme coefficients/constants).
+      FEATURES: {features}
+
+    molecular_classification: &molecular_classification |
+      DATASET: {dataset_name}
+      DOMAIN: Molecular Classification (SMILES)
+      TASK: Predict class label from molecular structure.
+      GUIDANCE:
+      - Use molecular properties derived from SMILES (molecular_weight, num_rings, num_halogen, num_hydroxyl_groups, num_nitrogen, num_oxygen).
+      - Do NOT use ECFP bit features.
+      FEATURES: SMILES + derived properties
+
+    molecular_regression: &molecular_regression |
+      DATASET: {dataset_name}
+      DOMAIN: Molecular Regression (SMILES)
+      TASK: Predict a continuous molecular property from molecular structure.
+      GUIDANCE:
+      - Use molecular properties derived from SMILES (molecular_weight, num_rings, num_halogen, num_hydroxyl_groups, num_nitrogen, num_oxygen).
+      - Do NOT use ECFP bit features.
+      FEATURES: SMILES + derived properties
+
+    enzyme_regression: &enzyme_regression |
+      DATASET: {dataset_name}
+      DOMAIN: Enzyme Activity Regression
+      TASK: Predict enzyme activity/affinity from sequence/substrate-derived features.
+      GUIDANCE:
+      - Use sequence and substrate complexity terms; include saturations/inhibition when reasonable.
+      FEATURES: {features}
+
+    enzyme_classification: &enzyme_classification |
+      DATASET: {dataset_name}
+      DOMAIN: Enzyme Activity Classification
+      TASK: Predict a discrete class from sequence/substrate-derived features.
+      GUIDANCE:
+      - Use class scores + thresholds/argmax.
+      FEATURES: {features}
+
     enzyme: |
       DATASET: Enzyme Activity Prediction
       DOMAIN: Biochemistry / Biocatalysis
@@ -162,6 +274,10 @@ templates:
       - Not modeling template concentration effects
       - Missing competitive resource allocation
       FEATURES: {features}
+    # Regression biotech datasets (018)
+    protein_expression: *tabular_regression
+    protein_expression_all: *tabular_regression
+    dataset_102: *tabular_regression
     gfp_yield: |
       DATASET: GFP Yield Prediction (Cell-Free Expression)
       DOMAIN: Synthetic Biology / Cell-Free Protein Expression
@@ -221,6 +337,107 @@ templates:
       All predictions must be clipped to [{scale_min}, {scale_max}] using clip(expression, {scale_min}, {scale_max})
       FEATURES: {features}
       NOTE: This dataset uses SMILES strings. Work with molecular properties (molecular_weight, num_hydroxyl_groups, num_halogen, num_rings, etc.) derived from SMILES, NOT ECFP bit features.
+    # DeepChem regression aliases (018)
+    delaney: *molecular_regression
+    lipo: *molecular_regression
+    lipophilicity: *molecular_regression
+    deepchem: *molecular_regression
+
+    # TabArena regression datasets (018)
+    diabetes_regression: *tabular_regression
+    housing: *tabular_regression
+    bike: *tabular_regression
+    insurance: *tabular_regression
+    energy: *tabular_regression
+    airfoil: *tabular_regression
+    yacht: *tabular_regression
+    auto: *tabular_regression
+    abalone: *tabular_regression
+    winequality: *tabular_regression
+    students: *tabular_regression
+    diamonds: *tabular_regression
+    house-prices: *tabular_regression
+    airbnb: *tabular_regression
+
+    # Enzyme regression dataset names (018)
+    aminotransferase: *enzyme_regression
+    olea: *enzyme_regression
+    halogenase_nabr: *enzyme_regression
+    halogenase_nacl: *enzyme_regression
+    phosphatase_achiral: *enzyme_regression
+    phosphatase_chiral: *enzyme_regression
+    davis: *enzyme_regression
+    davis_filtered: *enzyme_regression
+
+    # Classification datasets (017)
+    car: *tabular_classification
+    iris: *tabular_classification
+    wine: *tabular_classification
+    zoo: *tabular_classification
+    glass: *tabular_classification
+    vehicle: *tabular_classification
+    soybean: *tabular_classification
+    lymphography: *tabular_classification
+    ecoli: *tabular_classification
+    adult: *tabular_classification
+    credit: *tabular_classification
+    vote: *tabular_classification
+    mushroom: *tabular_classification
+    letter: *tabular_classification
+    mfeat: *tabular_classification
+    pendigits: *tabular_classification
+    optdigits: *tabular_classification
+    avila: *tabular_classification
+    amazon: *tabular_classification
+    plant-margin: *tabular_classification
+    plant-shape: *tabular_classification
+    plant-texture: *tabular_classification
+    leukemia: *tabular_classification
+    colon-cancer: *tabular_classification
+    colon: *tabular_classification
+    mice-protein: *tabular_classification
+    miceprotein: *tabular_classification
+    splice: *tabular_classification
+    synthetic5: *tabular_classification
+    # TabArena classification datasets (017) that are not OpenML keys
+    bank: *tabular_classification
+    income: *tabular_classification
+    spaceship: *tabular_classification
+    default: *tabular_classification
+    booking: *tabular_classification
+    churn: *tabular_classification
+    breast-cancer: *tabular_classification
+    digits: *tabular_classification
+    diabetes_classification: *tabular_classification
+    heart: *tabular_classification
+    stroke: *tabular_classification
+    employee: *tabular_classification
+    telecom: *tabular_classification
+    customer: *tabular_classification
+
+    # DeepChem classification datasets (017)
+    hiv: *molecular_classification
+    bace: *molecular_classification
+    tox21: *molecular_classification
+
+    # Enzyme classification dataset names (017)
+    aminotransferase_binary: *enzyme_classification
+    olea_binary: *enzyme_classification
+    gt_donors_achiral_binary: *enzyme_classification
+    gt_donors_chiral_binary: *enzyme_classification
+    nitrilase_binary: *enzyme_classification
+    halogenase_nabr_binary: *enzyme_classification
+    halogenase_nacl_binary: *enzyme_classification
+    duf_binary: *enzyme_classification
+    gt_acceptors_achiral_binary: *enzyme_classification
+    gt_acceptors_chiral_binary: *enzyme_classification
+    esterase_binary: *enzyme_classification
+    phosphatase_achiral_binary: *enzyme_classification
+    phosphatase_chiral_binary: *enzyme_classification
+    gt_donors_achiral_categorical: *enzyme_classification
+    gt_donors_chiral_categorical: *enzyme_classification
+    gt_acceptors_achiral_categorical: *enzyme_classification
+    gt_acceptors_chiral_categorical: *enzyme_classification
     generic: |
       DATASET: {dataset_name}
       FEATURES: {features}

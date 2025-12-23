@@ -190,7 +190,7 @@ class MultiAgentPredictor:
             if self.use_scaling:
                 y_hat_desc = "Predicted numeric output (float in the target's scaled range)"
             else:
-                y_hat_desc = "Predicted numeric output (float, use raw/unscaled target values)"
+                y_hat_desc = "Predicted numeric output (float, use raw target values)"
             self.agent_format = get_prompt('prediction.format_instructions.regression',
                                           y_hat_desc=y_hat_desc)
         self.agent_parser = None
@@ -242,11 +242,11 @@ class MultiAgentPredictor:
                         # No scaling: use raw values - create prompt without scaling mentions
                         task_instr = """Regression Task: Predict a numeric scalar value.
 
-IMPORTANT: Data is NOT normalized; use raw/unscaled feature and target values.
+IMPORTANT: Data is NOT normalized; use raw feature and target values.
 Apply the mechanism as math; do not output text.
 Return confidence (0-10).
 
-Format: {"y_hat": <float (raw/unscaled value)>, "confidence": <number>}"""
+Format: {"y_hat": <float (raw value)>, "confidence": <number>}"""
                 
                 # Build prompt with mechanism, few-shot examples, and format instructions
                 prompt = f"""{task_instr}
@@ -400,7 +400,7 @@ Please provide your prediction in the format specified above."""
                 # No scaling: use raw values - create prompt without scaling mentions
                 task_instr = """Regression Task: Predict a numeric scalar value.
 
-IMPORTANT: Data is NOT normalized; use raw/unscaled feature and target values.
+IMPORTANT: Data is NOT normalized; use raw feature and target values.
 Apply the mechanism's mathematical description to compute the output value from the input features."""
         
         # Grouped predictions: combine mechanisms per input group to reduce calls by factor M
@@ -1087,18 +1087,125 @@ class VariationalMechanismGenerator:
                 if isinstance(X_original_check[0], dict) and 'SMILES' in X_original_check[0]:
                     has_smiles = True
         
+        # Prefer raw/non-encoded features for what the LLM "sees".
+        # The ML baseline still uses X_sample (numeric/encoded), but the mechanism generator should
+        # reason over human-readable fields (categoricals/text/SMILES) when available.
+        X_original_src = None
+        try:
+            if hasattr(self, "X_train_original") and self.X_train_original is not None:
+                X_original_src = self.X_train_original
+            elif hasattr(self, "predictor") and hasattr(self.predictor, "X_train_original"):
+                X_original_src = self.predictor.X_train_original
+        except Exception:
+            X_original_src = None
+
+        # Describe features without exploding token usage on high-dimensional encodings (ECFP, gene-expression, etc.)
+        n_features = int(getattr(X_sample, "shape", [0, 0])[1]) if hasattr(X_sample, "shape") and len(X_sample.shape) > 1 else 0
+        feature_cols = self.feature_cols or [f"x{i}" for i in range(n_features)]
         if is_deepchem and has_smiles:
             features_desc = "SMILES strings (molecular structures) - ML model uses ECFP fingerprints internally"
             deepchem_note = "\n\nCRITICAL: This is a DeepChem molecular dataset. The LLM mechanism MUST work with SMILES strings and molecular properties (molecular_weight, num_rings, num_hydroxyl_groups, etc.), NOT ECFP bit features (ecfp_bit_0, ecfp_bit_1, etc.)."
         else:
-            features_desc = str(self.feature_cols) if self.feature_cols else "features"
+            # Only show a small prefix of feature names to keep prompts compact
+            if feature_cols and len(feature_cols) > 0:
+                shown = ", ".join([str(c) for c in feature_cols[:10]])
+                more = f", ... ({len(feature_cols)} total)" if len(feature_cols) > 10 else ""
+                features_desc = f"{shown}{more}"
+            else:
+                features_desc = "features"
             deepchem_note = ""
-        
+
+        def _truncate(v: Any, max_len: int = 140) -> str:
+            try:
+                s = str(v)
+            except Exception:
+                s = repr(v)
+            s = s.replace("\n", " ").replace("\r", " ")
+            return s if len(s) <= max_len else s[: max_len - 3] + "..."
+
+        def _format_example(i: int) -> str:
+            # Prefer raw dict if we have it and indices line up
+            if X_original_src is not None and i < len(X_original_src):
+                orig = X_original_src[i]
+                if isinstance(orig, dict):
+                    # Prefer a single, semantically rich field if present
+                    if "SMILES" in orig:
+                        return f"SMILES={_truncate(orig.get('SMILES'))}"
+                    if "SEQ" in orig or "SUBSTRATES" in orig:
+                        parts = []
+                        if "SEQ" in orig:
+                            parts.append(f"SEQ={_truncate(orig.get('SEQ'))}")
+                        if "SUBSTRATES" in orig:
+                            parts.append(f"SUBSTRATES={_truncate(orig.get('SUBSTRATES'))}")
+                        # Add a couple extra numeric descriptors if present
+                        extra = [(k, v) for k, v in orig.items() if k not in ("SEQ", "SUBSTRATES")]
+                        for k, v in extra[: max(0, MAX_FEATURES_IN_COMPONENT_LIST - len(parts))]:
+                            parts.append(f"{k}={_truncate(v)}")
+                        return ", ".join(parts)
+                    # Generic dict: show first few key/vals (raw categorical/text preserved by loaders)
+                    kvs = list(orig.items())[:MAX_FEATURES_IN_COMPONENT_LIST]
+                    return ", ".join([f"{k}={_truncate(v)}" for k, v in kvs])
+                # Non-dict raw item
+                return _truncate(orig)
+
+            # Fallback: show encoded/numeric row (best effort, capped)
+            try:
+                row = X_sample[i]
+                if hasattr(row, "shape") and len(row.shape) > 0:
+                    row = np.asarray(row, dtype=float).ravel()
+                    kvs = []
+                    for j in range(min(len(feature_cols), len(row), MAX_FEATURES_IN_COMPONENT_LIST)):
+                        kvs.append(f"{feature_cols[j]}={float(row[j]):.3f}")
+                    return ", ".join(kvs)
+            except Exception:
+                pass
+            return f"sample_{i}"
+
+        # Compact numeric stats (avoid dumping 2048+ floats / huge gene-expression vectors)
+        x_mean = stats.get("X_mean", None)
+        x_std = stats.get("X_std", None)
+        show_full_stats = (not (is_deepchem and has_smiles)) and isinstance(x_mean, np.ndarray) and x_mean.size <= 50
+        if show_full_stats:
+            x_stats_str = f"- X mean (per-feature): {x_mean.tolist()}\n- X std (per-feature): {x_std.tolist() if isinstance(x_std, np.ndarray) else 'N/A'}"
+        else:
+            # Summaries over features
+            try:
+                x_mean_arr = np.asarray(x_mean, dtype=float).ravel()
+                x_std_arr = np.asarray(x_std, dtype=float).ravel() if x_std is not None else None
+                mean_min, mean_max = float(np.min(x_mean_arr)), float(np.max(x_mean_arr))
+                mean_avg = float(np.mean(x_mean_arr))
+                if x_std_arr is not None and x_std_arr.size == x_mean_arr.size:
+                    std_min, std_max = float(np.min(x_std_arr)), float(np.max(x_std_arr))
+                    std_avg = float(np.mean(x_std_arr))
+                    x_stats_str = (
+                        f"- X mean summary: min={mean_min:.4f}, avg={mean_avg:.4f}, max={mean_max:.4f}\n"
+                        f"- X std summary:  min={std_min:.4f}, avg={std_avg:.4f}, max={std_max:.4f}"
+                    )
+                else:
+                    x_stats_str = f"- X mean summary: min={mean_min:.4f}, avg={mean_avg:.4f}, max={mean_max:.4f}"
+            except Exception:
+                x_stats_str = "- X stats: (unavailable)"
+
+        # Provide a few raw examples for the LLM to ground its mechanism (categoricals/text/SMILES).
+        n_examples = min(6, int(len(X_sample)) if hasattr(X_sample, "__len__") else 0)
+        example_lines = []
+        for i in range(n_examples):
+            try:
+                yv = y_sample[i]
+            except Exception:
+                yv = None
+            example_lines.append(f"  - {i}: {_format_example(i)} -> y={_truncate(yv)}")
+        examples_block = "\n".join(example_lines) if example_lines else "  (no examples available)"
+
         data_summary = f"""Dataset statistics:
-- Features: {features_desc}{deepchem_note}
-- X mean: {stats['X_mean'].tolist()}
+- Features (LLM-facing): {features_desc}{deepchem_note}
+{x_stats_str}
+- y mean: {float(stats.get('y_mean', 0.0)):.4f}
+- y std: {float(stats.get('y_std', 0.0)):.4f}
 - Sample size: {len(X_sample)}
-- Prediction errors (MAE): {np.mean(prediction_errors):.3f}"""
+- Prediction errors (MAE): {np.mean(prediction_errors):.3f}
+- Example samples (raw/non-encoded when available):
+{examples_block}"""
         
         if self.use_ml_mechanism and self.ml_mechanism is not None and self.ml_mechanism.is_trained:
             ml_mech_name = self.ml_mechanism.model_name if hasattr(self.ml_mechanism, 'model_name') else "ML"
@@ -1392,7 +1499,7 @@ FINAL PREDICTION:
                 scaling_note = f'Output MUST be clipped to [{scale_min:.1f}, {scale_max:.1f}]'
             else:
                 scaling_line = 'Formula: ŷ = <expression>'
-                scaling_note = 'Scaling/clipping is disabled; output can be any real number.'
+                scaling_note = 'Clipping is disabled; output can be any real number.'
             
             regression_instruction = f"""
 
@@ -1455,8 +1562,8 @@ FORMULA FORMAT REQUIREMENTS:
 - All outputs must be clipped to [{scale_min:.1f}, {scale_max:.1f}] range"""
             else:
                 deepchem_instruction += """
-- Format: Formula: ŷ = expression (no clipping, use raw/unscaled values)
-- Output can be any numeric value (no scaling/clipping constraints)"""
+- Format: Formula: ŷ = expression (no clipping; use raw values)
+- Output can be any numeric value (no clipping constraints)"""
             deepchem_instruction += """
 - NORMALIZE molecular_weight: divide by 100-500 (e.g., molecular_weight(SMILES) / 200)
 - Use realistic coefficients: intercept 0.3-0.7, feature coefficients 0.001-0.3
@@ -1632,9 +1739,22 @@ class TrainableMAICL:
             use_scaling=use_scaling
         )
         
-        # Get scale range from y_scaler (for target/output range) to pass to TextGrad
-        scale_min, scale_max = self._scaled_range_from(y_scaler) if y_scaler is not None else (SCALE_MIN, SCALE_MAX)
-        self.textgrad = TextGrad(batched_llm, task_type=task_type, feature_cols=feature_cols, dataset_name=dataset_name, class_names=class_names, scale_min=scale_min, scale_max=scale_max, use_scaling=use_scaling)
+        # Get scale range (for target/output range) to pass to TextGrad.
+        # IMPORTANT: when use_scaling=False, do NOT inject any scaling range into prompts.
+        if use_scaling:
+            scale_min, scale_max = self._scaled_range_from(y_scaler) if y_scaler is not None else (SCALE_MIN, SCALE_MAX)
+        else:
+            scale_min, scale_max = None, None
+        self.textgrad = TextGrad(
+            batched_llm,
+            task_type=task_type,
+            feature_cols=feature_cols,
+            dataset_name=dataset_name,
+            class_names=class_names,
+            scale_min=scale_min,
+            scale_max=scale_max,
+            use_scaling=use_scaling,
+        )
         # Routing parameters (can be overridden)
         self.attention_temp = attention_temp if attention_temp is not None else ATTENTION_TEMP
         self.min_ml_weight = min_ml_weight if min_ml_weight is not None else MIN_ML_WEIGHT
@@ -1686,6 +1806,10 @@ class TrainableMAICL:
         Note: For classification tasks, y values are class labels and should NOT be scaled.
         Only X (features) are validated for classification. For regression, both X and y are validated.
         """
+        # If scaling is disabled, skip verification entirely (raw/unscaled data is expected).
+        if not getattr(self, "use_scaling", True):
+            logger.info("\n[Scaling Verification] Skipped (use_scaling=False)")
+            return
         # Use configured scaling range (default: [0.0, 1.0])
         scale_min, scale_max = SCALE_MIN, SCALE_MAX
         is_classification = getattr(self, 'task_type', 'regression') == 'classification'

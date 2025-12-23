@@ -104,27 +104,12 @@ Key insights:
 - Features include diagnostic attributes
 - Medical classification task""",
         
-        "ecoli": """ECOLI PROTEIN LOCALIZATION DATASET:
-This dataset contains protein localization sites in E.coli bacteria based on sequence features.
-The task is to classify proteins into 8 different localization sites based on sequence recognition signals.
-
-FEATURES:
-- mcg (Continuous): McGeoch's method for signal sequence recognition - measures sequence signal strength
-- gvh (Continuous): von Heijne's method for signal sequence recognition - alternative signal sequence scoring method
-- lip (Binary): von Heijne's Signal Peptidase II consensus sequence score - indicates presence of lipoprotein signal
-- chg (Binary): Presence of charge on N-terminus of predicted lipoproteins - charge characteristics
-- aac (Continuous): Score of discriminant analysis of the amino acid content of outer membrane and periplasmic proteins - amino acid composition analysis
-- alm1 (Continuous): Score of the ALOM membrane spanning region prediction program - membrane localization prediction
-- alm2 (Continuous): Score of ALOM program after excluding putative cleavable signal regions from the sequence - refined membrane prediction
-
+        "ecoli": """ECOLI DATASET:
+This dataset contains protein localization sites in E.coli bacteria.
 Key insights:
-- 8 classes representing different localization sites (cytoplasm, inner membrane, outer membrane, periplasm, etc.)
-- Features combine multiple signal sequence recognition methods (McGeoch, von Heijne, ALOM)
-- Signal peptide characteristics (charge, peptidase sites) are critical for localization
-- Membrane spanning regions and amino acid composition patterns determine localization
-- Different localization sites have distinct sequence signatures and signal patterns
-- Binary features (lip, chg) indicate specific signal peptide types
-- Continuous features (mcg, gvh, aac, alm1, alm2) provide quantitative signal strength scores""",
+- 8 classes representing different localization sites
+- Features include sequence and composition attributes
+- Biological classification task""",
         
         "credit": """CREDIT APPROVAL DATASET:
 This dataset contains credit application data.
@@ -300,7 +285,37 @@ def get_dataset_specific_known_mechanisms(
         else:
             return """- Output must be a numeric value (no scaling/clipping constraints)"""
     
-    scale_range_str = f"[{scale_min}, {scale_max}]" if scale_min is not None and scale_max is not None else "unscaled"
+    scale_range_str = f"[{scale_min}, {scale_max}]" if scale_min is not None and scale_max is not None else "raw/unscaled"
+
+    def _strip_scaling_language_if_unscaled(text: str) -> str:
+        """
+        When scaling is disabled (scale_min/scale_max are None), ensure prompts do NOT claim the data
+        is normalized/scaled or instruct clipping to a numeric range.
+        """
+        if scale_min is not None and scale_max is not None:
+            return text
+        try:
+            lines = str(text).splitlines()
+        except Exception:
+            return text
+        cleaned: List[str] = []
+        for ln in lines:
+            l = ln.strip().lower()
+            # Remove any scaling/normalization/clipping constraints
+            if "normalized to" in l or "scaled to" in l:
+                continue
+            if "clip" in l and ("output" in l or "ŷ" in l or "y_hat" in l or "yhat" in l):
+                continue
+            if "valid range" in l and ("scale" in l or "range" in l):
+                continue
+            if "output must be a numeric value in" in l and ("[" in l and "]" in l):
+                continue
+            cleaned.append(ln)
+        # Add a single explicit unscaled note if nothing mentions it
+        joined = "\n".join(cleaned).strip()
+        if "raw/unscaled" not in joined.lower() and "not normalized" not in joined.lower():
+            joined = joined + ("\n" if joined else "") + "- Inputs/outputs are raw/unscaled (no normalization or clipping)."
+        return joined
     
     # Check if this is a DeepChem dataset
     is_deepchem = is_deepchem_dataset(feature_cols)

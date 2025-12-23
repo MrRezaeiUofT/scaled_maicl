@@ -65,20 +65,69 @@ class TextGrad:
         self.class_names = class_names
         self.config = self._load_config(config_path)
         self.use_scaling = use_scaling  # Flag to indicate if scaling is enabled
-        # Store scale range for output clipping (defaults to [0, 1] if not provided)
-        # Always set scale_min and scale_max, even for classification (needed for template formatting)
-        try:
-            from maicl_config import SCALE_MIN, SCALE_MAX
-            self.scale_min = scale_min if scale_min is not None else SCALE_MIN
-            self.scale_max = scale_max if scale_max is not None else SCALE_MAX
-        except ImportError:
-            self.scale_min = scale_min if scale_min is not None else 0.0
-            self.scale_max = scale_max if scale_max is not None else 1.0
-        # Ensure they are never None (fallback to defaults)
-        if self.scale_min is None:
-            self.scale_min = 0.0
-        if self.scale_max is None:
-            self.scale_max = 1.0
+        # Store scale range for output clipping.
+        # IMPORTANT: when use_scaling=False, we keep scale_min/scale_max as None to avoid
+        # accidentally injecting scaling/clipping constraints into prompts.
+        if not self.use_scaling:
+            self.scale_min = None
+            self.scale_max = None
+        else:
+            try:
+                from maicl_config import SCALE_MIN, SCALE_MAX
+                self.scale_min = scale_min if scale_min is not None else SCALE_MIN
+                self.scale_max = scale_max if scale_max is not None else SCALE_MAX
+            except ImportError:
+                self.scale_min = scale_min if scale_min is not None else 0.0
+                self.scale_max = scale_max if scale_max is not None else 1.0
+            # Ensure they are never None (fallback to defaults)
+            if self.scale_min is None:
+                self.scale_min = 0.0
+            if self.scale_max is None:
+                self.scale_max = 1.0
+
+    def _strip_scaling_mentions(self, text: str) -> str:
+        """
+        Remove any scaling/clipping/range instructions from prompt text.
+        This is used when use_scaling=False to ensure prompts do not mention scaling or numeric clip ranges.
+        """
+        if not text:
+            return text
+        # Remove common placeholders without inserting numeric defaults
+        text = str(text)
+        text = text.replace("{scale_min}", "")
+        text = text.replace("{scale_max}", "")
+        text = text.replace("{scale_range}", "")
+        text = text.replace("{scale_info}", "")
+
+        # Drop lines that talk about scaling/clipping/ranges.
+        # Use word-boundary matching so "unscaled" does NOT trigger "\bscaled\b".
+        drop_line_patterns = [
+            r".*\bscaled\b.*",
+            r".*\bscaling\b.*",
+            r".*\bclip\b.*",
+            r".*\bclipped\b.*",
+            r".*\bscale_min\b.*",
+            r".*\bscale_max\b.*",
+            r".*\bscale_range\b.*",
+            r".*\[0,\s*1\].*",
+            r".*\[0,\s*10\].*",
+            r".*CRITICAL SCALING INFORMATION.*",
+            r".*SCALING INFORMATION.*",
+        ]
+        lines = text.splitlines()
+        kept = []
+        for line in lines:
+            should_drop = False
+            for pat in drop_line_patterns:
+                if re.search(pat, line, flags=re.IGNORECASE):
+                    should_drop = True
+                    break
+            if not should_drop:
+                kept.append(line)
+        # Clean up excessive blank lines
+        cleaned = "\n".join(kept)
+        cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+        return cleaned
     
     def _load_config(self, config_path: Optional[str] = None) -> Dict[str, Any]:
         """Load configuration from YAML file"""
@@ -278,17 +327,20 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
         if is_deepchem_feedback and has_smiles_feedback:
             # For DeepChem: provide molecular property guidance instead of ECFP bit correlations
             deepchem_guidance_template = self.config.get('templates', {}).get('error_feedback', {}).get('deepchem_molecular_guidance', "")
-            # Format with scale information if placeholders are present
-            try:
-                deepchem_guidance = deepchem_guidance_template.format(
-                    scale_min=self.scale_min,
-                    scale_max=self.scale_max
-                )
-            except (KeyError, ValueError):
-                # If formatting fails, use template as-is and append scale info
-                deepchem_guidance = deepchem_guidance_template
-                if self.use_scaling:
+            if self.use_scaling:
+                # Format with scale information if placeholders are present
+                try:
+                    deepchem_guidance = deepchem_guidance_template.format(
+                        scale_min=self.scale_min,
+                        scale_max=self.scale_max
+                    )
+                except (KeyError, ValueError):
+                    # If formatting fails, use template as-is and append clip guidance
+                    deepchem_guidance = deepchem_guidance_template
                     deepchem_guidance += f"\n\nCRITICAL: All outputs must be clipped to [{self.scale_min}, {self.scale_max}] using clip(expression, {self.scale_min}, {self.scale_max})"
+            else:
+                # No scaling: ensure no scaling/clipping wording leaks into the prompt
+                deepchem_guidance = self._strip_scaling_mentions(deepchem_guidance_template)
             feedback += deepchem_guidance
         else:
             # For other datasets: show feature correlations as usual
@@ -590,12 +642,7 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
         
         return "\n".join(patterns)
     
-    def _build_iteration_history_context(
-        self,
-        iteration_history: Optional[List[Dict[str, Any]]] = None,
-        mechanism_index: Optional[int] = None,
-        mechanism_local_index: Optional[int] = None
-    ) -> str:
+    def _build_iteration_history_context(self, iteration_history: Optional[List[Dict[str, Any]]] = None) -> str:
         """Build context from previous iterations to help TextGrad learn from past changes
         
         Args:
@@ -609,18 +656,6 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
                 - reason: str (acceptance/rejection reason)
         """
         if not iteration_history or len(iteration_history) == 0:
-            # Keep empty to avoid prompt bloat; the main prompt already contains full context.
-            return ""
-        
-        # Filter history to the current mechanism when possible.
-        # TrainableMAICL stores full mechanism indices; TextGrad optimization uses local indices (0..num_llm-1).
-        filtered = iteration_history
-        if mechanism_index is not None:
-            filtered = [h for h in iteration_history if h.get('mechanism_index', None) == mechanism_index]
-        elif mechanism_local_index is not None:
-            filtered = [h for h in iteration_history if h.get('mechanism_local_index', None) == mechanism_local_index]
-        
-        if len(filtered) == 0:
             return ""
         
         # Get templates from config
@@ -637,28 +672,15 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
             context_parts.append("Use this to avoid repeating mistakes and build on successful changes.\n")
         
         # Show last N iterations (most recent first) - configurable
-        recent_history = filtered[-TEXTGRAD_MAX_ITERATION_HISTORY:] if len(filtered) > TEXTGRAD_MAX_ITERATION_HISTORY else filtered
-        
-        # Track whether we should escalate change magnitude (stagnation / repeated rejection)
-        accepted_flags = [bool(h.get('accepted', False)) for h in recent_history]
-        rejected_streak = 0
-        for a in reversed(accepted_flags):
-            if not a:
-                rejected_streak += 1
-            else:
-                break
+        recent_history = iteration_history[-TEXTGRAD_MAX_ITERATION_HISTORY:] if len(iteration_history) > TEXTGRAD_MAX_ITERATION_HISTORY else iteration_history
         
         for hist in reversed(recent_history):  # Show most recent first
             iter_num = hist.get('iteration', '?')
             accepted = hist.get('accepted', False)
             reason = hist.get('reason', '')
-            mech_idx_display = hist.get('mechanism_index', None)
-            mech_local_display = hist.get('mechanism_local_index', None)
             
             iter_separator = iteration_templates.get('iteration_separator', f"\n--- Iteration {iter_num} ---")
             context_parts.append(iter_separator.format(iter_num=iter_num))
-            if mech_idx_display is not None or mech_local_display is not None:
-                context_parts.append(f"  Mechanism: full_idx={mech_idx_display}, llm_local_idx={mech_local_display}")
             
             if accepted:
                 accepted_label = iteration_templates.get('accepted_label', f"✓ ACCEPTED: {reason}")
@@ -709,8 +731,7 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
                 
                 # Show what changed in the mechanism
                 mech_before = hist.get('mechanism_before', '')
-                # Prefer proposed_after if available (what TextGrad actually suggested)
-                mech_after = hist.get('mechanism_proposed_after', hist.get('mechanism_after', ''))
+                mech_after = hist.get('mechanism_after', '')
                 
                 if mech_before and mech_after and mech_before != mech_after:
                     # Show a summary of the change (first 200 chars of each)
@@ -751,24 +772,6 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
                 rejected_warning = iteration_templates.get('rejected_warning', "  ⚠️ This change did NOT improve performance - avoid similar changes")
                 context_parts.append(rejected_warning)
         
-        # Escalation directive if we are stagnating (recent rejections or tiny gains)
-        # This makes TextGrad propose larger, more structural updates (new interactions/nonlinearities),
-        # not just small coefficient tweaks.
-        if rejected_streak >= 1:
-            context_parts.append("\n" + "="*80)
-            context_parts.append("ESCALATION DIRECTIVE (HISTORY-BASED):")
-            context_parts.append(
-                f"- Recent updates were rejected ({rejected_streak} in a row). "
-                "Do NOT repeat the same style of minor edits.\n"
-                "- Make a MORE SIGNIFICANT change: introduce at least TWO structural changes such as:\n"
-                "  (a) add a new intermediate concept capturing a nonlinear interaction (e.g., x*y/(K+x*y))\n"
-                "  (b) change a transform form (linear → saturation/log/exp/inverse-U)\n"
-                "  (c) add a gating or inhibition term (e.g., 1/(1+alpha*z) or saturation(z))\n"
-                "  (d) change which features interact (swap/add/remove interaction pairs)\n"
-                "- Still keep the final formula executable and clipped (for regression) and preserve interpretability."
-            )
-            context_parts.append("="*80 + "\n")
-        
         # Analyze patterns
         accepted_count = sum(1 for h in recent_history if h.get('accepted', False))
         rejected_count = len(recent_history) - accepted_count
@@ -806,39 +809,35 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
             scale_range_str = f"[{self.scale_min}, {self.scale_max}]"
             scale_info = f"All data (inputs and outputs) are scaled to {scale_range_str} range."
         else:
-            scale_range_str = "raw/unscaled"
-            scale_info = "Data is NOT normalized; use raw/unscaled feature and target values."
+            # Do not mention any numeric range or scaling/clipping terminology.
+            scale_range_str = "raw (no clipping)"
+            scale_info = "Data is NOT normalized; use raw feature and target values. Do NOT clip outputs to any fixed range."
         
         # Get dataset contexts from config
         dataset_contexts = self.config.get('templates', {}).get('dataset_contexts', {})
-        
-        # Treat enzyme classification/regression datasets as "enzyme" domain context.
-        # These dataset names often look like "aminotransferase_binary", "halogenase_nabr_binary", etc.
-        enzyme_markers = (
-            "aminotransferase",
-            "halogenase",
-            "phosphatase",
-            "nitrilase",
-            "esterase",
-            "olea",
-            "duf",
-            "gt_",
-            "davis",
-        )
-        if any(m in dataset_lower for m in enzyme_markers):
-            enzyme_template = dataset_contexts.get('enzyme')
-            if enzyme_template:
-                features_str_enzyme = ', '.join(self.feature_cols) if self.feature_cols else 'enzyme features'
-                try:
-                    return enzyme_template.format(
-                        features=features_str_enzyme,
-                        scale_min=self.scale_min,
-                        scale_max=self.scale_max,
-                        scale_range=scale_range_str,
-                        scale_info=scale_info
-                    )
-                except (KeyError, ValueError):
-                    return enzyme_template + f"\n\nCRITICAL SCALING INFORMATION:\n{scale_info}\nOutput must be clipped to {scale_range_str}."
+
+        # Prefer explicit per-task keys when present (helps disambiguate datasets that exist in both
+        # classification and regression, e.g. "diabetes").
+        # Example keys: "diabetes_regression", "diabetes_classification".
+        if dataset_lower:
+            task_suffix = self.task_type.lower() if self.task_type else ""
+            if task_suffix:
+                direct_key = f"{dataset_lower}_{task_suffix}"
+                if direct_key in dataset_contexts:
+                    try:
+                        formatted_ctx = dataset_contexts[direct_key].format(
+                            dataset_name=self.dataset_name,
+                            features=features_str,
+                            scale_min=self.scale_min if self.use_scaling else "N/A",
+                            scale_max=self.scale_max if self.use_scaling else "N/A",
+                            scale_range=scale_range_str,
+                            scale_info=scale_info,
+                        )
+                    except Exception:
+                        formatted_ctx = str(dataset_contexts[direct_key])
+                    if not self.use_scaling:
+                        formatted_ctx = self._strip_scaling_mentions(formatted_ctx)
+                    return formatted_ctx
         
         # Match dataset name
         for key, template in dataset_contexts.items():
@@ -852,22 +851,39 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
                     features_str = ', '.join(self.feature_cols) if self.feature_cols else 'concrete composition parameters'
                 # Try to format with scale info, fallback if not in template
                 try:
-                    return template.format(features=features_str, scale_min=self.scale_min, scale_max=self.scale_max, scale_range=scale_range_str, scale_info=scale_info)
+                    formatted_ctx = template.format(
+                        dataset_name=self.dataset_name,
+                        features=features_str,
+                        scale_min=self.scale_min if self.use_scaling else "N/A",
+                        scale_max=self.scale_max if self.use_scaling else "N/A",
+                        scale_range=scale_range_str,
+                        scale_info=scale_info,
+                    )
+                    # If scaling is disabled, remove any scaling/clipping instructions embedded
+                    # in the YAML templates (they are only valid when scaling is enabled).
+                    if not self.use_scaling:
+                        formatted_ctx = self._strip_scaling_mentions(formatted_ctx)
+                    return formatted_ctx
                 except (KeyError, ValueError) as e:
                     # If template doesn't have all placeholders, try with just features first
                     try:
-                        formatted = template.format(features=features_str)
+                        formatted = template.format(dataset_name=self.dataset_name, features=features_str)
                         # Check if there are still unformatted placeholders
                         if '{scale_min}' in formatted or '{scale_max}' in formatted:
                             # Replace any remaining scale placeholders
-                            formatted = formatted.replace('{scale_min}', str(self.scale_min))
-                            formatted = formatted.replace('{scale_max}', str(self.scale_max))
+                            formatted = formatted.replace('{scale_min}', str(self.scale_min if self.use_scaling else "N/A"))
+                            formatted = formatted.replace('{scale_max}', str(self.scale_max if self.use_scaling else "N/A"))
                             formatted = formatted.replace('{scale_range}', scale_range_str)
                             formatted = formatted.replace('{scale_info}', scale_info)
-                        return formatted + f"\n\nCRITICAL SCALING INFORMATION:\n{scale_info}\nOutput must be clipped to {scale_range_str}."
+                        if self.use_scaling:
+                            return formatted + f"\n\nCRITICAL SCALING INFORMATION:\n{scale_info}\nOutput must be clipped to {scale_range_str}."
+                        # No scaling: avoid the word "scaling" entirely
+                        return self._strip_scaling_mentions(formatted + f"\n\nDATA NORMALIZATION:\n{scale_info}")
                     except (KeyError, ValueError):
                         # Last resort: just append scale info
-                        return template + f"\n\nCRITICAL SCALING INFORMATION:\n{scale_info}\nOutput must be clipped to {scale_range_str}."
+                        if self.use_scaling:
+                            return template + f"\n\nCRITICAL SCALING INFORMATION:\n{scale_info}\nOutput must be clipped to {scale_range_str}."
+                        return self._strip_scaling_mentions(template + f"\n\nDATA NORMALIZATION:\n{scale_info}")
         
         # Generic fallback
         generic_template = dataset_contexts.get('generic', 
@@ -878,16 +894,18 @@ OPTIMIZATION GUIDANCE:
 - Model nonlinear effects (saturation, thresholds, synergies)
 - Include domain-relevant interactions
 - {scale_info}
-- Ensure output stays in valid range {scale_range}
 """)
-        return generic_template.format(
+        formatted_generic = generic_template.format(
             dataset_name=self.dataset_name, 
             features=features_str,
-            scale_min=self.scale_min,
-            scale_max=self.scale_max,
+            scale_min=self.scale_min if self.use_scaling else "N/A",
+            scale_max=self.scale_max if self.use_scaling else "N/A",
             scale_range=scale_range_str,
             scale_info=scale_info
         )
+        if not self.use_scaling:
+            formatted_generic = self._strip_scaling_mentions(formatted_generic)
+        return formatted_generic
     
     def optimize_batch_single_call(self, mechanisms: List[str], error_feedbacks: List[str],
                                    ml_residuals: Optional[np.ndarray] = None,
@@ -980,16 +998,12 @@ OPTIMIZATION GUIDANCE:
                 enhanced_feedbacks = error_feedbacks
         
         prompts = []
-        for mech_local_idx, (mechanism, error_feedback) in enumerate(zip(mechanisms, enhanced_feedbacks)):
+        for mechanism, error_feedback in zip(mechanisms, enhanced_feedbacks):
             # Extract dataset-specific context
             dataset_context = self._get_dataset_optimization_context()
             
             # Build iteration history context (memory from previous iterations)
-            # Prefer local index filtering (TrainableMAICL will also store full indices if available)
-            iteration_history_context = self._build_iteration_history_context(
-                iteration_history,
-                mechanism_local_index=mech_local_idx
-            )
+            iteration_history_context = self._build_iteration_history_context(iteration_history)
             
             # Build feature instruction with actual names
             # For DeepChem datasets, don't show ECFP features - use SMILES instead
@@ -1047,28 +1061,40 @@ OPTIMIZATION GUIDANCE:
                 if self.use_scaling:
                     default_regression = f"- For regression: Clipped to [{self.scale_min}, {self.scale_max}]"
                 else:
-                    default_regression = "- For regression: Output numeric values (no clipping, use raw/unscaled values)"
+                    default_regression = "- For regression: Output numeric values (no clipping, use raw target values)"
                 formula_instruction = formula_instructions.get('regression', default_regression)
                 # If the config has a template with {scale_min} and {scale_max}, format it
                 # This handles both old configs (hardcoded [0, 10]) and new configs (with placeholders)
                 try:
                     if '{scale_min}' in formula_instruction or '{scale_max}' in formula_instruction:
-                        formula_instruction = formula_instruction.format(scale_min=self.scale_min, scale_max=self.scale_max)
+                        # Only format scale placeholders when scaling is enabled
+                        if self.use_scaling:
+                            formula_instruction = formula_instruction.format(scale_min=self.scale_min, scale_max=self.scale_max)
+                        else:
+                            formula_instruction = self._strip_scaling_mentions(formula_instruction)
                 except (KeyError, ValueError):
                     # If formatting fails (e.g., old config without placeholders), use default
                     formula_instruction = default_regression
             
             # Format main_template with all required placeholders
             # Handle both old templates (without scale placeholders) and new ones (with scale placeholders)
-            # Ensure scale_min and scale_max are always set (not None)
-            scale_min_val = self.scale_min if self.scale_min is not None else 0.0
-            scale_max_val = self.scale_max if self.scale_max is not None else 1.0
-            
-            # Replace any unformatted scale placeholders in sub-strings to prevent KeyError
-            # This handles cases where dataset_context or other strings have unformatted placeholders
-            dataset_context = str(dataset_context).replace('{scale_min}', str(scale_min_val)).replace('{scale_max}', str(scale_max_val))
-            feature_instruction = str(feature_instruction).replace('{scale_min}', str(scale_min_val)).replace('{scale_max}', str(scale_max_val))
-            formula_instruction = str(formula_instruction).replace('{scale_min}', str(scale_min_val)).replace('{scale_max}', str(scale_max_val))
+            if self.use_scaling:
+                # Ensure scale_min and scale_max are always set (not None)
+                scale_min_val = self.scale_min if self.scale_min is not None else 0.0
+                scale_max_val = self.scale_max if self.scale_max is not None else 1.0
+                # Replace any unformatted scale placeholders in sub-strings to prevent KeyError
+                dataset_context = str(dataset_context).replace('{scale_min}', str(scale_min_val)).replace('{scale_max}', str(scale_max_val))
+                feature_instruction = str(feature_instruction).replace('{scale_min}', str(scale_min_val)).replace('{scale_max}', str(scale_max_val))
+                formula_instruction = str(formula_instruction).replace('{scale_min}', str(scale_min_val)).replace('{scale_max}', str(scale_max_val))
+            else:
+                # No scaling: strip any scaling/clipping mentions from all prompt components,
+                # and do NOT inject numeric defaults like [0,1].
+                main_template = self._strip_scaling_mentions(main_template)
+                dataset_context = self._strip_scaling_mentions(str(dataset_context))
+                feature_instruction = self._strip_scaling_mentions(str(feature_instruction))
+                formula_instruction = self._strip_scaling_mentions(str(formula_instruction))
+                scale_min_val = ""
+                scale_max_val = ""
             
             format_kwargs = {
                 'dataset_context': dataset_context,

@@ -25,6 +25,8 @@ EVAL_BATCH_SIZE = 128
 GRADIENT_BATCH_SIZE = 128
 LLM_GROUP_SIZE = 128  # group multiple inputs per LLM call for prediction
 LLM_COMBINE_MECHANISMS = True  # combine all LLM mechanisms per input group into one call
+K_SHOT_PER_TARGET = 10  # Default number of few-shot examples to include in prompts (set to 0 to disable)
+
 ATTENTION_TEMP = 1.0
 RANDOM_STATE = 42
 IMPROVEMENT_THRESHOLD_CLASSIFICATION = 0.005
