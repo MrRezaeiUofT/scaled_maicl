@@ -590,7 +590,12 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
         
         return "\n".join(patterns)
     
-    def _build_iteration_history_context(self, iteration_history: Optional[List[Dict[str, Any]]] = None) -> str:
+    def _build_iteration_history_context(
+        self,
+        iteration_history: Optional[List[Dict[str, Any]]] = None,
+        mechanism_index: Optional[int] = None,
+        mechanism_local_index: Optional[int] = None
+    ) -> str:
         """Build context from previous iterations to help TextGrad learn from past changes
         
         Args:
@@ -604,6 +609,18 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
                 - reason: str (acceptance/rejection reason)
         """
         if not iteration_history or len(iteration_history) == 0:
+            # Keep empty to avoid prompt bloat; the main prompt already contains full context.
+            return ""
+        
+        # Filter history to the current mechanism when possible.
+        # TrainableMAICL stores full mechanism indices; TextGrad optimization uses local indices (0..num_llm-1).
+        filtered = iteration_history
+        if mechanism_index is not None:
+            filtered = [h for h in iteration_history if h.get('mechanism_index', None) == mechanism_index]
+        elif mechanism_local_index is not None:
+            filtered = [h for h in iteration_history if h.get('mechanism_local_index', None) == mechanism_local_index]
+        
+        if len(filtered) == 0:
             return ""
         
         # Get templates from config
@@ -620,15 +637,28 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
             context_parts.append("Use this to avoid repeating mistakes and build on successful changes.\n")
         
         # Show last N iterations (most recent first) - configurable
-        recent_history = iteration_history[-TEXTGRAD_MAX_ITERATION_HISTORY:] if len(iteration_history) > TEXTGRAD_MAX_ITERATION_HISTORY else iteration_history
+        recent_history = filtered[-TEXTGRAD_MAX_ITERATION_HISTORY:] if len(filtered) > TEXTGRAD_MAX_ITERATION_HISTORY else filtered
+        
+        # Track whether we should escalate change magnitude (stagnation / repeated rejection)
+        accepted_flags = [bool(h.get('accepted', False)) for h in recent_history]
+        rejected_streak = 0
+        for a in reversed(accepted_flags):
+            if not a:
+                rejected_streak += 1
+            else:
+                break
         
         for hist in reversed(recent_history):  # Show most recent first
             iter_num = hist.get('iteration', '?')
             accepted = hist.get('accepted', False)
             reason = hist.get('reason', '')
+            mech_idx_display = hist.get('mechanism_index', None)
+            mech_local_display = hist.get('mechanism_local_index', None)
             
             iter_separator = iteration_templates.get('iteration_separator', f"\n--- Iteration {iter_num} ---")
             context_parts.append(iter_separator.format(iter_num=iter_num))
+            if mech_idx_display is not None or mech_local_display is not None:
+                context_parts.append(f"  Mechanism: full_idx={mech_idx_display}, llm_local_idx={mech_local_display}")
             
             if accepted:
                 accepted_label = iteration_templates.get('accepted_label', f"✓ ACCEPTED: {reason}")
@@ -679,7 +709,8 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
                 
                 # Show what changed in the mechanism
                 mech_before = hist.get('mechanism_before', '')
-                mech_after = hist.get('mechanism_after', '')
+                # Prefer proposed_after if available (what TextGrad actually suggested)
+                mech_after = hist.get('mechanism_proposed_after', hist.get('mechanism_after', ''))
                 
                 if mech_before and mech_after and mech_before != mech_after:
                     # Show a summary of the change (first 200 chars of each)
@@ -719,6 +750,24 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
                 
                 rejected_warning = iteration_templates.get('rejected_warning', "  ⚠️ This change did NOT improve performance - avoid similar changes")
                 context_parts.append(rejected_warning)
+        
+        # Escalation directive if we are stagnating (recent rejections or tiny gains)
+        # This makes TextGrad propose larger, more structural updates (new interactions/nonlinearities),
+        # not just small coefficient tweaks.
+        if rejected_streak >= 1:
+            context_parts.append("\n" + "="*80)
+            context_parts.append("ESCALATION DIRECTIVE (HISTORY-BASED):")
+            context_parts.append(
+                f"- Recent updates were rejected ({rejected_streak} in a row). "
+                "Do NOT repeat the same style of minor edits.\n"
+                "- Make a MORE SIGNIFICANT change: introduce at least TWO structural changes such as:\n"
+                "  (a) add a new intermediate concept capturing a nonlinear interaction (e.g., x*y/(K+x*y))\n"
+                "  (b) change a transform form (linear → saturation/log/exp/inverse-U)\n"
+                "  (c) add a gating or inhibition term (e.g., 1/(1+alpha*z) or saturation(z))\n"
+                "  (d) change which features interact (swap/add/remove interaction pairs)\n"
+                "- Still keep the final formula executable and clipped (for regression) and preserve interpretability."
+            )
+            context_parts.append("="*80 + "\n")
         
         # Analyze patterns
         accepted_count = sum(1 for h in recent_history if h.get('accepted', False))
@@ -762,6 +811,34 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
         
         # Get dataset contexts from config
         dataset_contexts = self.config.get('templates', {}).get('dataset_contexts', {})
+        
+        # Treat enzyme classification/regression datasets as "enzyme" domain context.
+        # These dataset names often look like "aminotransferase_binary", "halogenase_nabr_binary", etc.
+        enzyme_markers = (
+            "aminotransferase",
+            "halogenase",
+            "phosphatase",
+            "nitrilase",
+            "esterase",
+            "olea",
+            "duf",
+            "gt_",
+            "davis",
+        )
+        if any(m in dataset_lower for m in enzyme_markers):
+            enzyme_template = dataset_contexts.get('enzyme')
+            if enzyme_template:
+                features_str_enzyme = ', '.join(self.feature_cols) if self.feature_cols else 'enzyme features'
+                try:
+                    return enzyme_template.format(
+                        features=features_str_enzyme,
+                        scale_min=self.scale_min,
+                        scale_max=self.scale_max,
+                        scale_range=scale_range_str,
+                        scale_info=scale_info
+                    )
+                except (KeyError, ValueError):
+                    return enzyme_template + f"\n\nCRITICAL SCALING INFORMATION:\n{scale_info}\nOutput must be clipped to {scale_range_str}."
         
         # Match dataset name
         for key, template in dataset_contexts.items():
@@ -903,12 +980,16 @@ OPTIMIZATION GUIDANCE:
                 enhanced_feedbacks = error_feedbacks
         
         prompts = []
-        for mechanism, error_feedback in zip(mechanisms, enhanced_feedbacks):
+        for mech_local_idx, (mechanism, error_feedback) in enumerate(zip(mechanisms, enhanced_feedbacks)):
             # Extract dataset-specific context
             dataset_context = self._get_dataset_optimization_context()
             
             # Build iteration history context (memory from previous iterations)
-            iteration_history_context = self._build_iteration_history_context(iteration_history)
+            # Prefer local index filtering (TrainableMAICL will also store full indices if available)
+            iteration_history_context = self._build_iteration_history_context(
+                iteration_history,
+                mechanism_local_index=mech_local_idx
+            )
             
             # Build feature instruction with actual names
             # For DeepChem datasets, don't show ECFP features - use SMILES instead

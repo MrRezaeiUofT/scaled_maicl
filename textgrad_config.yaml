@@ -19,6 +19,16 @@ prompts:
 
       YOUR TASK: BUILD A STRONG, INDEPENDENT PREDICTIVE MECHANISM
 
+      HISTORY-AWARE OPTIMIZATION RULE:
+      - If iteration history shows recent REJECTIONS or no meaningful metric gains, you MUST escalate beyond tiny edits.
+      - Make at least TWO structural changes (not just coefficient tweaks): add/remove an interaction, change a transform form
+        (linear → saturation/log/inverse-U), add gating/inhibition, or introduce a new intermediate concept and inline it into the final formula.
+      
+      KEEP IT SHORT (IMPORTANT):
+      - DIAGNOSIS: 1 sentence. FIX: 1 sentence.
+      - REVISED MECHANISM description: 2-4 sentences max.
+      - Prefer editing the formula directly; do not add long "the mechanism does..." filler.
+
       🎯 PRIMARY GOAL: Your mechanism must work WELL ON ITS OWN as a standalone predictor.
       While it may complement other mechanisms in an ensemble, it should be independently predictive.
       Focus on building a mechanism that can make accurate predictions by itself, not just one that fills gaps.
@@ -32,77 +42,11 @@ prompts:
       - Don't specialize only for complementarity - build a robust standalone predictor
       - Use all relevant features and interactions that improve independent predictive power
 
-      Follow this diagnostic process:
-
-      1️⃣ ANALYZE THE ERROR PATTERNS:
-
-         - What are the systematic failures? (overestimation? underestimation?)
-
-         - Which features correlate with large errors?
-
-         - Are errors worse for high/low values of specific features?
-
-      2️⃣ IDENTIFY THE ROOT CAUSE:
-
-         - Is a key feature missing from the mechanism?
-
-         - Are feature interactions modeled incorrectly?
-
-         - Are there saturation effects or thresholds being ignored?
-
-         - Is the functional form (linear/nonlinear) appropriate?
-
-         - COMPLEXITY GUIDANCE: Follow the complexity guidance provided above. If errors show
-           nonlinear patterns (errors increase faster than linear), use nonlinear transformations.
-           If errors appear relatively linear, simple forms may work better. Let the data guide
-           complexity rather than forcing it. Consider:
-           * Saturation effects: feature/(K+feature) or tanh-like responses (if errors show saturation)
-           * Multiplicative interactions: feature1 * feature2 (if interaction patterns detected)
-           * Threshold effects: max(0, feature - threshold) or step functions (if threshold effects seen)
-           * Polynomial terms: feature^2, feature^3 (only with clear mechanistic justification)
-           * Ratios and divisions: feature1/feature2 (if ratio relationships make sense)
-           * Exponential/logarithmic relationships (only if scientifically justified)
-
-      3️⃣ PROPOSE TARGETED FIX:
-
-         - BUILD INDEPENDENT PREDICTIVE POWER: Focus on making your mechanism work well as a standalone predictor. Include all features and interactions that improve independent performance, not just those that complement other mechanisms.
-
-         - LEARN NEW COEFFICIENTS: Don't just add interaction terms - actually adjust the base coefficients (0.783, 0.301, etc.) based on performance metrics. If R² is low or MAE is high, increase/decrease coefficients systematically. Try different coefficient values (e.g., 0.5, 1.0, 1.5, 2.0) to find what improves performance.
-
-         - Add the missing feature or interaction that explains errors AND improves standalone performance
-
-         - Adjust coefficients to improve performance metrics (R² and MAE for regression, Accuracy and F1 for classification) - NOT just to reduce loss
-
-         - PRIORITIZE INDEPENDENT ACCURACY: Your mechanism should predict well on its own. If a feature or interaction improves standalone R²/MAE, include it even if it overlaps with other mechanisms.
-
-         - CRITICAL: Do NOT use feature importance values (like 0.392, 0.150) as coefficients. These are NOT coefficients - they only indicate which features are important. Learn proper coefficients (typically 0.1-2.0 range) by optimizing performance metrics.
-
-         - CRITICAL: When you see coefficients like 0.783, 0.301, 0.194 in the formula, these are starting values that need to be OPTIMIZED. Don't keep them the same - try different values (e.g., 0.5, 1.0, 1.2, 1.5) and see which improves R² and MAE. The goal is to find coefficients that maximize R² and minimize MAE.
-
-         - Change functional form if needed - FOLLOW COMPLEXITY GUIDANCE:
-           * If complexity guidance suggests nonlinearity: use saturation, interactions, thresholds
-           * If complexity guidance suggests linear/simple: use simpler forms, let data guide
-           * Saturation: feature/(K+feature) for Michaelis-Menten-like responses (if saturation detected)
-           * Multiplicative interactions: feature1 * feature2 for synergistic effects (if interactions detected)
-           * Thresholds: max(0, feature - threshold) or conditional logic (if threshold effects seen)
-           * Polynomial terms: feature^2, feature^3 (only with clear mechanistic reason)
-           * Ratios: feature1/feature2 for relative effects (if ratio relationships make sense)
-           * Other nonlinear forms that capture the underlying process (when data supports it)
-
-         - IMPORTANT: Follow the complexity guidance provided above. Don't force nonlinearity if
-           the data doesn't support it, but do use it when error patterns indicate it's needed.
-
-         - Ensure all terms have mechanistic justification
-
-      4️⃣ VALIDATE THE FIX:
-
-         - Will this fix improve performance metrics (R² and MAE for regression, Accuracy and F1 for classification) in the specific examples shown?
-
-         - Does it make scientific sense for this dataset?
-
-         - Are all feature names correct?
-
-         - Are coefficients learned from performance metrics (not copied from feature importance values)?
+      ACTION CHECKLIST (use this, don’t write it out):
+      - Address the biggest error patterns and worst examples shown above.
+      - Make 1–2 nonlinearities + 1–2 interactions that target those failures.
+      - Update coefficients meaningfully (don’t keep the same ones).
+      - Keep the mechanism compact and executable.
 
       QUALITY REQUIREMENTS:
 

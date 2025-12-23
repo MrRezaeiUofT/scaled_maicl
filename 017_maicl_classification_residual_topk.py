@@ -51,22 +51,51 @@ except Exception:
     _HAS_OPENML = False
 
 try:
-    import pandas as pd
-    _HAS_PANDAS = True
+    import importlib.util as _importlib_util_pandas
+    _HAS_PANDAS = _importlib_util_pandas.find_spec("pandas") is not None
 except Exception:
     _HAS_PANDAS = False
 
+
+def _get_pandas():
+    """Lazily import pandas (it can segfault in some environments if imported at module import time)."""
+    try:
+        import pandas as pd  # type: ignore
+        return pd
+    except Exception as e:
+        raise RuntimeError(
+            "pandas is required for this dataset/loader but could not be imported. "
+            "Try installing a compatible pandas build for your Python environment."
+        ) from e
+
+
+def _is_missing(x: Any) -> bool:
+    """pandas-free missing-value check."""
+    if x is None:
+        return True
+    # NaN
+    try:
+        if isinstance(x, float) and np.isnan(x):
+            return True
+    except Exception:
+        pass
+    # Empty string
+    try:
+        if isinstance(x, str) and x.strip() == "":
+            return True
+    except Exception:
+        pass
+    return False
+
+# IMPORTANT: do NOT import DeepChem at module import time.
+# DeepChem may transitively import TensorFlow/RDKit and can crash/segfault in some environments
+# even when just running `--help`. We import DeepChem lazily inside
+# `load_deepchem_classification_dataset()` when (and only when) needed.
 try:
-    # Import deepchem (TensorFlow will initialize lazily, env vars set above should help)
-    import deepchem as dc
-    # Test that molnet is accessible
-    _ = dc.molnet
-    _HAS_DEEPCHEM = True
-except ImportError as e:
-    _HAS_DEEPCHEM = False
-    _DEEPCHEM_ERROR = str(e)
+    import importlib.util as _importlib_util
+    _HAS_DEEPCHEM = _importlib_util.find_spec("deepchem") is not None
+    _DEEPCHEM_ERROR = None
 except Exception as e:
-    # Other errors (like TensorFlow missing) - still mark as unavailable
     _HAS_DEEPCHEM = False
     _DEEPCHEM_ERROR = str(e)
 
@@ -86,11 +115,14 @@ from maicl_lib_v2 import (
     SCALE_MIN,
     SCALE_MAX,
 )
+from maicl_llm import OpenAIAPIKeyManager
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-MODEL_NAME = os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash")
+# NOTE: this constant is intentionally aligned with the CLI default below.
+# Override via --model_name or MAICL_MODEL_NAME.
+MODEL_NAME = os.environ.get("MAICL_MODEL_NAME", "gpt-4o-mini")
 RANDOM_STATE = 42
 np.random.seed(RANDOM_STATE)
 
@@ -104,11 +136,16 @@ def _load_env():
         # Load explicit path first, then fallback to nearest .env
         if env_path.exists():
             load_dotenv(env_path, override=False)
+            logger.debug(f"Loaded .env from: {env_path}")
         else:
             found = find_dotenv(usecwd=True)
             if found:
                 load_dotenv(found, override=False)
-    except Exception:
+                logger.debug(f"Loaded .env from: {found}")
+            else:
+                logger.debug("No .env file found")
+    except Exception as e:
+        logger.debug(f"Failed to load .env file: {e}")
         pass
 
 def _get_gemini_llm(model_name: str):
@@ -123,6 +160,58 @@ def _get_gemini_llm(model_name: str):
         raise RuntimeError("No Google API key found. Set GOOGLE_API_KEY or GOOGLE_API_KEY_1/2/3")
     km = GoogleAPIKeyManager(keys, model_name=model_name)
     return BatchedLLM(km)
+
+def _get_openai_llm(model_name: str):
+    # Ensure .env is loaded before reading env vars
+    _load_env()
+    keys = []
+    for env_key in ["OPENAI_API_KEY", "OPENAI_API_KEY_1", "OPENAI_API_KEY_2", "OPENAI_API_KEY_3"]:
+        val = os.environ.get(env_key)
+        if val:
+            # Strip whitespace and validate key format
+            val = val.strip()
+            # Remove quotes if present (common .env file issue)
+            if val.startswith('"') and val.endswith('"'):
+                val = val[1:-1]
+            if val.startswith("'") and val.endswith("'"):
+                val = val[1:-1]
+            val = val.strip()  # Strip again after removing quotes
+            
+            if val:
+                # Basic validation: OpenAI keys should start with 'sk-'
+                if not val.startswith('sk-'):
+                    logger.warning(f"Warning: OpenAI API key from {env_key} doesn't start with 'sk-'. "
+                                 f"Key preview: {val[:10]}... (first 10 chars)")
+                keys.append(val)
+    if not keys:
+        raise RuntimeError("No OpenAI API key found. Set OPENAI_API_KEY or OPENAI_API_KEY_1/2/3 in your .env file or environment variables.")
+    
+    # Log key info (masked for security)
+    key_preview = keys[0][:10] + "..." + keys[0][-4:] if len(keys[0]) > 14 else keys[0][:10] + "..."
+    logger.info(f"Using OpenAI API key: {key_preview} (from {len(keys)} key(s))")
+    logger.info(f"Key length: {len(keys[0])} characters")
+    
+    # Validate key format more strictly
+    if len(keys[0]) < 20:
+        logger.warning(f"Warning: API key seems too short ({len(keys[0])} chars). OpenAI keys are typically 50+ characters.")
+    
+    km = OpenAIAPIKeyManager(keys, model_name=model_name)
+    return BatchedLLM(km)
+
+def _get_llm(model_name: str):
+    """Get LLM instance based on model name - automatically detects provider"""
+    model_name_lower = model_name.lower()
+    if model_name_lower.startswith("gpt") or model_name_lower.startswith("o1") or "openai" in model_name_lower:
+        # OpenAI model
+        return _get_openai_llm(model_name)
+    elif model_name_lower.startswith("gemini"):
+        # Gemini model
+        return _get_gemini_llm(model_name)
+    else:
+        # Default to Gemini for backward compatibility
+        logger.warning(f"Unknown model provider for '{model_name}', defaulting to Gemini. "
+                      f"Use 'gpt-4o-mini' or 'gemini-2.0-flash' for explicit provider selection.")
+        return _get_gemini_llm(model_name)
 
 def load_openml_classification(dataset_name: str, max_samples: int):
     if not _HAS_OPENML:
@@ -306,7 +395,7 @@ def load_synthetic_classification_5classes(
 
 def _extract_sequence_features(seq: str) -> Dict[str, float]:
     """Extract numerical features from protein sequence"""
-    if pd.isna(seq) or not seq:
+    if _is_missing(seq) or not seq:
         return {
             'seq_length': 0.0,
             'seq_gc_content': 0.0,
@@ -333,7 +422,7 @@ def _extract_sequence_features(seq: str) -> Dict[str, float]:
 
 def _extract_smiles_features(smiles: str) -> Dict[str, float]:
     """Extract numerical features from SMILES string"""
-    if pd.isna(smiles) or not smiles:
+    if _is_missing(smiles) or not smiles:
         return {
             'smiles_length': 0.0,
             'smiles_ring_count': 0.0,
@@ -368,6 +457,7 @@ def load_enzyme_classification_dataset(dataset_name: str, max_samples: int):
     """
     if not _HAS_PANDAS:
         raise RuntimeError("pandas not installed. pip install pandas")
+    pd = _get_pandas()
     
     try:
         from enzyme_dataset_analysis import EnzymeDatasetLoader
@@ -517,6 +607,7 @@ def load_tabarena_classification_dataset(dataset_name: str, max_samples: int):
     """
     if not _HAS_PANDAS:
         raise RuntimeError("pandas not installed. pip install pandas")
+    pd = _get_pandas()
     
     try:
         from datasets import load_dataset
@@ -910,8 +1001,11 @@ def main():
                              "    - gt_donors_chiral_categorical\n"
                              "    - gt_acceptors_achiral_categorical\n"
                              "    - gt_acceptors_chiral_categorical")
-    parser.add_argument("--model_name", default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-pro"),
-                        help="Gemini model name, e.g., gemini-2.0-flash, gemini-2.0-pro")
+    parser.add_argument(
+        "--model_name",
+        default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash"),
+        help="LLM model name. Examples: Gemini: gemini-2.0-flash, gemini-2.0-pro. OpenAI: gpt-4o-mini, gpt-4o, gpt-4.1-mini."
+    )
     parser.add_argument("--ml_mech", default="linear", help="ML mechanism: logreg|xgboost|tabicl")
     parser.add_argument("--use_ml", type=int, default=1, choices=[0,1], help="Include ML mechanism in ensemble")
     parser.add_argument("--max_samples", type=int, default=200)
@@ -978,7 +1072,7 @@ def main():
     output_dir = set_output_dir(run_name)
     logger.info(f"Output directory: {output_dir}")
 
-    llm = _get_gemini_llm(args.model_name)
+    llm = _get_llm(args.model_name)
 
     if ds_name in ("synthetic5", "syn5", "toy5"):
         X_encoded, y_encoded, X_original, feature_cols, class_names, feature_encoders = load_synthetic_classification_5classes(
@@ -1336,7 +1430,19 @@ def main():
     logger.info("PRE-TRAINING EVALUATION")
     logger.info("=" * 80)
     
-    pre = maicl.evaluate(X_test_s, y_test, X_train_s, y_train, return_details=True, relax_routing=bool(args.relax_eval))
+    pre = maicl.evaluate(
+        X_test_s,
+        y_test,
+        X_train_s,
+        y_train,
+        return_details=True,
+        relax_routing=bool(args.relax_eval),
+        # IMPORTANT (DeepChem molecular classification):
+        # - ML uses vectorized features (e.g., ECFP bits in X_*_s)
+        # - LLM/TextGrad should see SMILES (X_original_*), not the vectorized bits
+        X_original=X_original_test,
+        X_pool_original=X_original_train,
+    )
     pre_acc = float(pre.get('accuracy', 0.0))
     pre_f1 = float(pre.get('f1', 0.0))
     pre_loss = float(pre.get('loss', 1.0))
@@ -1362,7 +1468,15 @@ def main():
     logger.info("\n[LLM-only Evaluation (Pre-training)] Evaluating MA-ICL with only LLM mechanisms (excluding ML)...")
     llm_only_pre_metrics = None
     try:
-        llm_only_pre_metrics = maicl.evaluate_llm_only(X_test_s, y_test, X_train_s, y_train, return_details=True)
+        llm_only_pre_metrics = maicl.evaluate_llm_only(
+            X_test_s,
+            y_test,
+            X_train_s,
+            y_train,
+            return_details=True,
+            X_original=X_original_test,
+            X_pool_original=X_original_train,
+        )
         llm_only_pre_acc = float(llm_only_pre_metrics.get('accuracy', 0.0))
         llm_only_pre_f1 = float(llm_only_pre_metrics.get('f1', 0.0))
         llm_only_pre_loss = float(llm_only_pre_metrics.get('loss', 1.0))
@@ -1386,9 +1500,24 @@ def main():
     # Use selected set (test/validation/train) for acceptance; pass only TRAIN residuals to LLM
     # accept_eval_max=None means use full acceptance set
     # Use residuals_topk to ensure consistency with training data (X_topk)
-    maicl.train(X_topk, y_topk, X_val_s, y_val, iterations=args.iterations, ml_residuals=residuals_topk,
-                accept_eval_max=None, X_test=X_test_s, y_test=y_test,
-                acceptance_set=args.acceptance_set, output_dir=output_dir)
+    maicl.train(
+        X_topk,
+        y_topk,
+        X_val_s,
+        y_val,
+        iterations=args.iterations,
+        ml_residuals=residuals_topk,
+        accept_eval_max=None,
+        X_test=X_test_s,
+        y_test=y_test,
+        acceptance_set=args.acceptance_set,
+        # IMPORTANT: provide original (non-vectorized) inputs for LLM/TextGrad.
+        # For DeepChem these are SMILES dicts: {"SMILES": "..."}.
+        X_train_original=X_original_topk,
+        X_val_original=X_original_val,
+        X_test_original=X_original_test,
+        output_dir=output_dir,
+    )
     
     # Ensure training artifacts (training progress plots) are exported
     logger.info("\n[Training Artifacts] Exporting training history and progress plots...")
@@ -1414,8 +1543,17 @@ def main():
     logger.info("  Note: Mechanism performance will be PRESERVED from best snapshot (not recalculated) to ensure consistent routing")
     # CRITICAL: Explicitly preserve mechanism performance from best snapshot to ensure consistent routing
     # This ensures final evaluation uses the same routing weights as the best iteration during training
-    post = maicl.evaluate(X_test_s, y_test, X_train_s, y_train, return_details=True, relax_routing=final_relax_routing, 
-                          preserve_mechanism_performance=True)
+    post = maicl.evaluate(
+        X_test_s,
+        y_test,
+        X_train_s,
+        y_train,
+        return_details=True,
+        relax_routing=final_relax_routing,
+        preserve_mechanism_performance=True,
+        X_original=X_original_test,
+        X_pool_original=X_original_train,
+    )
     post_acc = float(post.get('accuracy', 0.0))
     post_f1 = float(post.get('f1', 0.0))
     post_loss = float(post.get('loss', 1.0))
@@ -1453,7 +1591,15 @@ def main():
     logger.info("\n[LLM-only Evaluation] Evaluating MA-ICL with only LLM mechanisms (excluding ML)...")
     llm_only_metrics = None
     try:
-        llm_only_metrics = maicl.evaluate_llm_only(X_test_s, y_test, X_train_s, y_train, return_details=True)
+        llm_only_metrics = maicl.evaluate_llm_only(
+            X_test_s,
+            y_test,
+            X_train_s,
+            y_train,
+            return_details=True,
+            X_original=X_original_test,
+            X_pool_original=X_original_train,
+        )
         llm_only_acc = float(llm_only_metrics.get('accuracy', 0.0))
         llm_only_f1 = float(llm_only_metrics.get('f1', 0.0))
         llm_only_loss = float(llm_only_metrics.get('loss', 1.0))
@@ -1841,7 +1987,7 @@ def main():
                     
                     # Also save CSV summary
                     try:
-                        import pandas as pd
+                        pd = _get_pandas()
                         csv_data = []
                         for r in individual_results:
                             csv_data.append({

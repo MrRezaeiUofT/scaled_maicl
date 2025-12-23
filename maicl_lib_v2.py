@@ -933,20 +933,26 @@ class VariationalMechanismGenerator:
         """Initialize encoder prompt - checks for dataset-specific prompts first"""
         dataset_name_clean = self._normalize_dataset_name(self.dataset_name)
         
-        # Try dataset-specific encoder prompt first (suppress warning if not found)
-        dataset_specific_key = f'mechanism_generation.dataset_specific.{dataset_name_clean}.encoder'
+        # Try task-specific dataset prompt first (prevents classification prompts from breaking regression and vice-versa)
+        # Preferred keys:
+        # - mechanism_generation.dataset_specific.<dataset>.<task_type>.encoder
+        # - mechanism_generation.dataset_specific.<dataset>.encoder (legacy fallback)
+        dataset_specific_key_task = f'mechanism_generation.dataset_specific.{dataset_name_clean}.{self.task_type}.encoder'
+        dataset_specific_key_legacy = f'mechanism_generation.dataset_specific.{dataset_name_clean}.encoder'
         config = load_maicl_config()
         prompts = config.get('prompts', {})
         dataset_specific_prompt = None
         
         # Navigate through nested keys without warnings
         try:
-            keys = dataset_specific_key.split('.')
-            value = prompts
-            for key in keys:
-                value = value.get(key, {})
-            if value and isinstance(value, str):
-                dataset_specific_prompt = value.format(dataset_name=dataset_name_clean.upper()) if '{dataset_name}' in value else value
+            for key_path in (dataset_specific_key_task, dataset_specific_key_legacy):
+                keys = key_path.split('.')
+                value = prompts
+                for key in keys:
+                    value = value.get(key, {})
+                if value and isinstance(value, str):
+                    dataset_specific_prompt = value.format(dataset_name=dataset_name_clean.upper()) if '{dataset_name}' in value else value
+                    break
         except (KeyError, AttributeError):
             pass
         
@@ -966,20 +972,26 @@ class VariationalMechanismGenerator:
         """Initialize decoder prompt - checks for dataset-specific prompts first"""
         dataset_name_clean = self._normalize_dataset_name(self.dataset_name)
         
-        # Try dataset-specific decoder prompt first (suppress warning if not found)
-        dataset_specific_key = f'mechanism_generation.dataset_specific.{dataset_name_clean}.decoder'
+        # Try task-specific dataset prompt first (prevents classification prompts from breaking regression and vice-versa)
+        # Preferred keys:
+        # - mechanism_generation.dataset_specific.<dataset>.<task_type>.decoder
+        # - mechanism_generation.dataset_specific.<dataset>.decoder (legacy fallback)
+        dataset_specific_key_task = f'mechanism_generation.dataset_specific.{dataset_name_clean}.{self.task_type}.decoder'
+        dataset_specific_key_legacy = f'mechanism_generation.dataset_specific.{dataset_name_clean}.decoder'
         config = load_maicl_config()
         prompts = config.get('prompts', {})
         dataset_specific_prompt = None
         
         # Navigate through nested keys without warnings
         try:
-            keys = dataset_specific_key.split('.')
-            value = prompts
-            for key in keys:
-                value = value.get(key, {})
-            if value and isinstance(value, str):
-                dataset_specific_prompt = value
+            for key_path in (dataset_specific_key_task, dataset_specific_key_legacy):
+                keys = key_path.split('.')
+                value = prompts
+                for key in keys:
+                    value = value.get(key, {})
+                if value and isinstance(value, str):
+                    dataset_specific_prompt = value
+                    break
         except (KeyError, AttributeError):
             pass
         
@@ -997,12 +1009,51 @@ class VariationalMechanismGenerator:
         """Normalize dataset name for prompt lookup (handles variations)"""
         # Remove common prefixes/suffixes and convert to lowercase
         name = dataset_name.lower()
+        # Normalize separators
+        name = name.replace(":", " ").replace("/", " ").replace("\\", " ")
+        name = " ".join(name.split())
+        
+        # Strip common label prefixes used by runners/loaders
+        # e.g. "Enzyme Dataset: aminotransferase" -> "aminotransferase"
+        for prefix in (
+            "enzyme dataset",
+            "tabarena",
+            "sklearn",
+            "deepchem",
+        ):
+            if name.startswith(prefix):
+                name = name[len(prefix):].strip()
+                # Remove leading punctuation leftover (e.g., ":" or "-")
+                name = name.lstrip(":").lstrip("-").strip()
+                break
+        
+        # Map common dataset label patterns back to dataset_specific keys
+        # Protein expression runner uses labels like "Protein Expression (plate_X)"
+        if name.startswith("protein expression"):
+            name = "protein_expression"
+        elif name.startswith("combined protein expression"):
+            # If you later add a specific prompt for this, keep it stable
+            name = "protein_expression_all"
+        elif name.startswith("gfp"):
+            # Handles "GFP yield", etc.
+            name = "gfp_yield"
+        elif name.startswith("dataset 102"):
+            name = "dataset_102"
+        
         # Remove common patterns
         name = name.replace(" dataset", "").replace(" (", " ").replace(")", "")
         # Remove task type indicators
         name = name.replace(" classification", "").replace(" regression", "")
         # Remove extra whitespace
         name = name.strip()
+        
+        # Strip common enzyme dataset suffixes used by loaders/runners
+        # e.g. "aminotransferase_binary" -> "aminotransferase"
+        for suf in ("_binary", "_categorical"):
+            if name.endswith(suf):
+                name = name[: -len(suf)].strip()
+                break
+        
         # Handle specific dataset name variations
         name_mappings = {
             "esol (water solubility)": "esol",
@@ -1330,6 +1381,52 @@ FINAL PREDICTION:
 
 """
             decoder_prompt_enhanced = decoder_prompt_enhanced + classification_instruction
+        
+        # Add regression-specific instructions (ensure rich text + single-line Formula for extraction)
+        if self.task_type == "regression":
+            if self.use_scaling:
+                scale_min, scale_max = self._get_scaling_range()
+                if scale_min is None or scale_max is None:
+                    scale_min, scale_max = SCALE_MIN, SCALE_MAX
+                scaling_line = f'Formula: ŷ = clip(<expression>, {scale_min:.1f}, {scale_max:.1f})'
+                scaling_note = f'Output MUST be clipped to [{scale_min:.1f}, {scale_max:.1f}]'
+            else:
+                scaling_line = 'Formula: ŷ = <expression>'
+                scaling_note = 'Scaling/clipping is disabled; output can be any real number.'
+            
+            regression_instruction = f"""
+
+CRITICAL FOR REGRESSION TASKS:
+1. Be concise and useful: write a clear MECHANISM DESCRIPTION (3-5 sentences) explaining:
+   - What latent process you hypothesize and how it maps inputs to the target
+   - Which features are primary drivers vs secondary modulators
+   - At least 1 nonlinearity (saturation, diminishing returns, inverse-U, log/exp, soft-thresholds)
+   - At least 1 interaction (synergy, inhibition, ratio effects, gating)
+
+2. Introduce 1–3 INTERMEDIATE CONCEPTS (combinatory variables) in text, e.g.:
+   - effective_substrate = x*y/(K+x*y) (nonlinear synergy)
+   - capacity_limit = x/(K+x) (saturation)
+   - inhibition = 1/(1+alpha*z) (inhibition/gating)
+   Explain what each intermediate represents mechanistically.
+
+3. FINAL FORMULA REQUIREMENTS (do not violate):
+   - Provide EXACTLY ONE SINGLE-LINE formula starting with "Formula:" so it can be extracted programmatically.
+   - Do NOT output Python code blocks, def statements, or multi-line equations.
+   - Do NOT reference intermediate names in the final Formula line; inline/expand them in the expression.
+   - {scaling_note}
+   - Use stable coefficients and reasonable constants (avoid extreme values).
+
+OUTPUT FORMAT (exact order):
+MECHANISM DESCRIPTION:
+<3-5 sentences>
+
+INTERMEDIATE CONCEPTS (text; you may include short inline equations):
+- <name>: <meaning>, <optional inline equation>
+- ...
+
+{scaling_line}
+"""
+            decoder_prompt_enhanced = decoder_prompt_enhanced + regression_instruction
         
         if is_deepchem and has_smiles:
             deepchem_instruction = """
@@ -1936,9 +2033,18 @@ class TrainableMAICL:
         att_temp = attention_temp if attention_temp is not None else self.attention_temp
         # Optionally relax ML routing during training/acceptance to allow LLM impact
         if relax_routing:
+            # IMPORTANT: "relax_routing" means *less* ML dominance, not more.
+            # If the caller doesn't specify overrides, use safer defaults that still allow LLM mechanisms
+            # to influence predictions on low-confidence ML regions.
             hard_gate = hard_ml_gate_threshold if hard_ml_gate_threshold is not None else max(0.90, HARD_ML_GATE_THRESHOLD)
-            min_w = min_ml_weight if min_ml_weight is not None else 0.85
-            max_w = max_ml_weight if max_ml_weight is not None else 0.95
+            if self.task_type == "classification":
+                # Allow LLM to override ML when ML confidence is low
+                min_w = min_ml_weight if min_ml_weight is not None else max(0.20, MIN_ML_WEIGHT - 0.15)
+                max_w = max_ml_weight if max_ml_weight is not None else min(0.90, MAX_ML_WEIGHT)
+            else:
+                # Regression: keep defaults unless overridden; LLM already contributes by default
+                min_w = min_ml_weight if min_ml_weight is not None else MIN_ML_WEIGHT
+                max_w = max_ml_weight if max_ml_weight is not None else MAX_ML_WEIGHT
         else:
             hard_gate = hard_ml_gate_threshold if hard_ml_gate_threshold is not None else HARD_ML_GATE_THRESHOLD
             min_w = min_ml_weight if min_ml_weight is not None else MIN_ML_WEIGHT
@@ -2064,7 +2170,9 @@ class TrainableMAICL:
                     hasattr(self.mech_generator.ml_mechanism, 'is_trained') and
                     self.mech_generator.ml_mechanism.is_trained):
                     try:
-                        _, _, ml_residuals_pool, _ = compute_ml_residuals(
+                        # compute_ml_residuals returns: (sorted_indices, residuals, predictions, probas)
+                        # We need residuals (2nd return) for prioritizing few-shot examples.
+                        _, ml_residuals_pool, _, _ = compute_ml_residuals(
                             self.mech_generator.ml_mechanism,
                             X_pool, y_pool, self.feature_cols,
                             class_names=self.class_names,
@@ -2365,7 +2473,9 @@ class TrainableMAICL:
                     hasattr(self.mech_generator.ml_mechanism, 'is_trained') and
                     self.mech_generator.ml_mechanism.is_trained):
                     try:
-                        _, _, ml_residuals_pool, _ = compute_ml_residuals(
+                        # compute_ml_residuals returns: (sorted_indices, residuals, predictions, probas)
+                        # We need residuals (2nd return) for prioritizing few-shot examples.
+                        _, ml_residuals_pool, _, _ = compute_ml_residuals(
                             self.mech_generator.ml_mechanism,
                             X_pool, y_pool, self.feature_cols,
                             class_names=self.class_names,
@@ -3327,7 +3437,10 @@ class TrainableMAICL:
                 # Build iteration history for TextGrad (memory from previous iterations)
                 # Only include history from previous iterations (not current)
                 iteration_history_for_textgrad = self.textgrad_iteration_history.copy() if hasattr(self, 'textgrad_iteration_history') else []
-                
+
+                # Will be filled after TextGrad returns updated mechanisms (so we can store proposals even if rejected)
+                proposed_after_by_full_idx = {}
+
                 updated_mechanisms = self.textgrad.optimize_batch(
                     llm_mechanisms, error_feedbacks, ml_residuals=ml_residuals,
                     X_train=X_train, y_train=y_train,
@@ -3336,6 +3449,12 @@ class TrainableMAICL:
                     mechanism_metrics=mechanism_metrics_for_textgrad,
                     iteration_history=iteration_history_for_textgrad
                 )
+                
+                # Capture proposed updates so we can store them in history even if rejected
+                llm_indices_full = [idx for idx, mtype in enumerate(self.mechanism_types) if mtype == "llm"]
+                for llm_local_idx, full_idx in enumerate(llm_indices_full):
+                    if llm_local_idx < len(updated_mechanisms):
+                        proposed_after_by_full_idx[full_idx] = updated_mechanisms[llm_local_idx]
                 
                 # Keep a copy for potential rollback
                 prev_mechanisms = copy.deepcopy(self.mechanisms)
@@ -3369,6 +3488,9 @@ class TrainableMAICL:
                 new_metrics = self.evaluate(X_accept_consistent, y_accept_consistent, X_train, y_train, relax_routing=True,
                                             k_shot=self.k_shot, **routing_kwargs)
                 new_loss = new_metrics['loss']
+                # Snapshot "before" metrics for correct history bookkeeping
+                metrics_before_snapshot = metrics if metrics is not None else {}
+                loss_before_snapshot = metrics_before_snapshot.get('loss', None)
                 
                 # Get current metrics for comparison (accuracy, F1)
                 current_acc = metrics.get('accuracy', 0.0) if metrics else 0.0
@@ -3466,19 +3588,22 @@ class TrainableMAICL:
                         if llm_local_idx < len(prev_mechanisms) and llm_local_idx < len(self.mechanisms):
                             mech_before = prev_mechanisms[full_idx] if full_idx < len(prev_mechanisms) else ""
                             mech_after = self.mechanisms[full_idx] if full_idx < len(self.mechanisms) else ""
+                            mech_proposed_after = proposed_after_by_full_idx.get(full_idx, mech_after)
                             
                             # Build iteration history entry
                             hist_entry = {
                                 'iteration': i + 1,
                                 'mechanism_index': full_idx,
+                                'mechanism_local_index': llm_local_idx,
                                 'mechanism_before': mech_before,
                                 'mechanism_after': mech_after,
+                                'mechanism_proposed_after': mech_proposed_after,
                                 'metrics_before': {
-                                    'loss': current_loss,
-                                    'r2': metrics.get('r2', None),
-                                    'mae': metrics.get('mae', None),
-                                    'accuracy': metrics.get('accuracy', None),
-                                    'f1': metrics.get('f1', None)
+                                    'loss': loss_before_snapshot,
+                                    'r2': metrics_before_snapshot.get('r2', None),
+                                    'mae': metrics_before_snapshot.get('mae', None),
+                                    'accuracy': metrics_before_snapshot.get('accuracy', None),
+                                    'f1': metrics_before_snapshot.get('f1', None)
                                 },
                                 'metrics_after': {
                                     'loss': new_loss,
@@ -3495,9 +3620,9 @@ class TrainableMAICL:
                             if not hasattr(self, 'textgrad_iteration_history'):
                                 self.textgrad_iteration_history = []
                             
-                            # Add to history (keep last 5 iterations to avoid prompt bloat)
+                            # Add to history (keep a larger buffer; TextGrad will filter per-mechanism and cap what it shows)
                             self.textgrad_iteration_history.append(hist_entry)
-                            if len(self.textgrad_iteration_history) > 5:
+                            if len(self.textgrad_iteration_history) > 200:
                                 self.textgrad_iteration_history.pop(0)
                     
                     # CRITICAL: Update the generator's mechanisms so changes persist across iterations
@@ -3705,19 +3830,23 @@ class TrainableMAICL:
                     for llm_local_idx, full_idx in enumerate(llm_indices):
                         if llm_local_idx < len(prev_mechanisms):
                             mech_before = prev_mechanisms[full_idx] if full_idx < len(prev_mechanisms) else ""
+                            # For rejected updates, preserve what TextGrad proposed (valuable negative signal)
                             mech_after = self.mechanisms[full_idx] if full_idx < len(self.mechanisms) else ""
+                            mech_proposed_after = proposed_after_by_full_idx.get(full_idx, mech_after)
                             
                             hist_entry = {
                                 'iteration': i + 1,
                                 'mechanism_index': full_idx,
+                                'mechanism_local_index': llm_local_idx,
                                 'mechanism_before': mech_before,
                                 'mechanism_after': mech_after,
+                                'mechanism_proposed_after': mech_proposed_after,
                                 'metrics_before': {
-                                    'loss': current_loss,
-                                    'r2': metrics.get('r2', None),
-                                    'mae': metrics.get('mae', None),
-                                    'accuracy': metrics.get('accuracy', None),
-                                    'f1': metrics.get('f1', None)
+                                    'loss': loss_before_snapshot,
+                                    'r2': metrics_before_snapshot.get('r2', None),
+                                    'mae': metrics_before_snapshot.get('mae', None),
+                                    'accuracy': metrics_before_snapshot.get('accuracy', None),
+                                    'f1': metrics_before_snapshot.get('f1', None)
                                 },
                                 'metrics_after': {
                                     'loss': new_loss,
@@ -3734,7 +3863,7 @@ class TrainableMAICL:
                                 self.textgrad_iteration_history = []
                             
                             self.textgrad_iteration_history.append(hist_entry)
-                            if len(self.textgrad_iteration_history) > 5:
+                            if len(self.textgrad_iteration_history) > 200:
                                 self.textgrad_iteration_history.pop(0)
                     
                     # CRITICAL: After rejecting an update, check if the current state (before rejection) is better than best_snapshot

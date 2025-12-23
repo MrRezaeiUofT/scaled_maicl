@@ -16,6 +16,12 @@ except Exception:
     from langchain_core.messages import HumanMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 
+try:
+    # Optional dependency (only needed for --llm_provider openai)
+    from langchain_openai import ChatOpenAI
+except Exception:
+    ChatOpenAI = None
+
 from maicl_config import MAX_BATCH_SIZE, BATCH_TIMEOUT, MAX_PROMPT_PREVIEW_LENGTH
 
 logger = logging.getLogger(__name__)
@@ -95,13 +101,102 @@ class GoogleAPIKeyManager:
 
 
 # =========================
+# OPENAI API KEY MANAGEMENT
+# =========================
+
+class OpenAIAPIKeyManager:
+    """Thread-safe OpenAI API key manager with rotation and basic rate-limit handling."""
+
+    # NOTE: keep this default conservative and widely available.
+    # Users can override via CLI/config (e.g., --model_name or MAICL_MODEL_NAME).
+    def __init__(self, api_keys: List[str], model_name: str = "gpt-4o-mini"):
+        # We allow any OpenAI model name, but explicitly disallow Gemini names here to avoid confusion.
+        if model_name.lower().startswith("gemini"):
+            raise ValueError(f"OpenAIAPIKeyManager is for OpenAI models, not {model_name}")
+
+        if ChatOpenAI is None:
+            raise RuntimeError(
+                "OpenAI provider requested but langchain_openai is not installed.\n"
+                "Install with: pip install langchain-openai openai"
+            )
+
+        self.api_keys = api_keys
+        self.model_name = model_name
+        self.current_key_index = 0
+        self.exhausted_keys = set()
+        self.llm_cache = {}
+        self.key_lock = threading.Lock()
+        self.cache_lock = threading.Lock()
+
+        if not self.api_keys or self.api_keys == [None]:
+            raise ValueError("No valid OpenAI API keys provided.")
+
+        logger.info(f"✓ Initialized OpenAI API Key Manager with {len(self.api_keys)} key(s)")
+
+    def get_current_llm(self):
+        """Get current OpenAI LLM instance (thread-safe)."""
+        with self.key_lock:
+            current_key = self.api_keys[self.current_key_index]
+
+        with self.cache_lock:
+            if current_key not in self.llm_cache:
+                # Keep temperature aligned with Gemini usage for now.
+                self.llm_cache[current_key] = ChatOpenAI(
+                    model=self.model_name,
+                    temperature=0.8,
+                    api_key=current_key,
+                )
+            return self.llm_cache[current_key]
+
+    def switch_to_next_key(self) -> bool:
+        """Thread-safe key switching."""
+        with self.key_lock:
+            if len(self.exhausted_keys) >= len(self.api_keys):
+                logger.warning("⚠️ All OpenAI API keys exhausted!")
+                return False
+
+            self.exhausted_keys.add(self.current_key_index)
+            logger.warning(f"⚠️ OpenAI API key {self.current_key_index + 1} exhausted")
+
+            for i in range(len(self.api_keys)):
+                next_index = (self.current_key_index + i + 1) % len(self.api_keys)
+                if next_index not in self.exhausted_keys:
+                    self.current_key_index = next_index
+                    logger.info(f"✓ Switched to OpenAI API key {next_index + 1}/{len(self.api_keys)}")
+                    return True
+
+        return False
+
+    def is_quota_error(self, error: Exception) -> bool:
+        """Check if error is a rate-limit/quota error."""
+        error_str = str(error).lower()
+        error_type = type(error).__name__.lower()
+
+        quota_indicators = [
+            "rate limit",
+            "ratelimit",
+            "429",
+            "insufficient_quota",
+            "quota",
+            "exceeded your current quota",
+            "too many requests",
+        ]
+
+        # langchain/openai exceptions vary; string matching is the most robust here.
+        if "ratelimit" in error_type or "rate_limit" in error_type:
+            return True
+
+        return any(indicator in error_str for indicator in quota_indicators)
+
+
+# =========================
 # BATCHED LLM
 # =========================
 
 class BatchedLLM:
     """Batched LLM wrapper with quota management and retry logic"""
     def __init__(self, llm_or_key_manager, print_samples: bool = None, max_samples_to_print: int = 2):
-        if isinstance(llm_or_key_manager, GoogleAPIKeyManager):
+        if isinstance(llm_or_key_manager, (GoogleAPIKeyManager, OpenAIAPIKeyManager)):
             self.key_manager = llm_or_key_manager
             self.llm = self.key_manager.get_current_llm()
             self.use_key_manager = True

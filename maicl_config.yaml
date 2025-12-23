@@ -302,8 +302,18 @@ prompts:
         - Patterns that complement machine learning models
 
       regression: |
-        You are a mechanism encoder that discovers latent patterns in data.
-        Given dataset statistics and sample predictions, infer what underlying mechanisms might be present.
+        You are a mechanism encoder that discovers latent causal patterns in regression data.
+        Given dataset statistics, feature names, and sample residual/error patterns, infer plausible underlying mechanisms.
+        
+        Focus on mechanisms that can BOTH:
+        - Improve predictive performance (capture nonlinearities, interactions, saturation, thresholds)
+        - Improve interpretability (clear causal story + named intermediate concepts)
+        
+        Think in terms of:
+        - Nonlinear transforms: saturation (x/(K+x)), diminishing returns, inverse-U, log/exp, soft-thresholds
+        - Interactions: synergy, inhibition, ratio effects, gating (A * f(B)), AND/OR-like combinations
+        - Latent intermediate concepts (combinatory variables): "effective_dose", "binding_proxy", "capacity_limit", etc.
+        - Complementarity: avoid simply restating what a linear model would do
 
     encoder_with_data: |
       {encoder_prompt}
@@ -311,7 +321,12 @@ prompts:
       {data_summary}
 
       {task_description}
-      Describe it in 2-3 sentences.
+      
+      CRITICAL OUTPUT REQUIREMENTS:
+      - Be concise and useful: 3-5 sentences.
+      - Mention 1-2 nonlinearities and 1-2 interactions that would likely fix residual patterns.
+      - Name 1-3 latent intermediate concepts (combinatory variables) and what they represent.
+      - Avoid vague filler (no "specific patterns"/"distinctive relationships").
 
       Latent mechanism z:
 
@@ -325,8 +340,28 @@ prompts:
     # Note: decoder_prompt is referenced but not explicitly defined in the code
     # This should be set based on the task type and dataset
     decoder_default: |
-      You are a mechanism decoder that converts latent representations into executable mechanism formulas.
-      Generate a clear, interpretable mechanism that can be applied to make predictions.
+      You are a mechanism decoder that converts a latent mechanism representation into an interpretable, executable mechanism.
+      
+      GOAL:
+      Produce mechanisms that are BOTH high-performing and highly interpretable, without unnecessary verbosity.
+      
+      HARD REQUIREMENTS (do not skip):
+      1. The mechanism must be descriptive and textual (not just math).
+      2. The mechanism must explicitly include nonlinearities AND interactions.
+      3. The mechanism must introduce intermediate combinatory concepts (named, explained) that capture nonlinear interactions.
+      4. The final formula must be executable and appear as a SINGLE LINE starting with "Formula:" so it can be extracted programmatically.
+      
+      WHAT TO INCLUDE:
+      - Named intermediate concepts (1–3): define them briefly, but do NOT rely on them in the final Formula line.
+        Instead, inline/expand them in the final Formula expression.
+      - Nonlinear transforms: at least one (saturation/log/soft-threshold/inverse-U).
+      - Interaction terms: at least one (prefer nonlinear interaction form x*y/(K+x*y)).
+      - One short "why this helps" sentence referencing typical residual patterns (extremes / interactions / thresholds).
+      
+      STYLE:
+      - Prefer causal language ("limits", "enhances", "inhibits", "gates", "synergizes") over purely statistical phrasing.
+      - Keep constants realistic and stable (avoid huge coefficients).
+      - Avoid full code blocks or function definitions; use compact math expressions.
     
     decoder_classification: |
       You are a mechanism decoder for classification tasks. Your goal is to generate a descriptive, text-based mechanism that clearly explains how to classify examples into different classes.
@@ -336,6 +371,12 @@ prompts:
       2. Explain which features are most important for distinguishing between classes
       3. Describe the decision boundaries and rules that separate different classes
       4. Include specific examples of how different feature values lead to different class predictions
+      4b. CRITICAL ANTI-VAGUENESS RULE:
+         - You MUST NOT write generic filler like "this class is characterized by specific patterns" or "distinctive relationships".
+         - Every class interpretation must contain concrete, testable statements: which features are HIGH/LOW, approximate ranges, and which interactions matter.
+         - If feature names are anonymous (e.g., att1..att47), treat them as biomarkers and describe OPERATIONAL meaning:
+           "high att19 with low att7", "att2×att3 synergy", "att45 saturates", etc. Do NOT pretend you know biology, but do describe measurable signatures.
+         - For each class, explicitly contrast it against at least ONE confusing class: "Unlike class k, class j has ..."
       5. CRITICAL: For EACH CLASS, FIRST provide a TEXTUAL INTERPRETATION, THEN provide the equation with ADVANCED NONLINEAR TRANSFORMATIONS:
          - Start with a textual interpretation of what the class represents (if it has a meaningful label)
          - Describe the relationship between the class and input features - think about NONLINEAR relationships and INTERACTIONS
@@ -366,6 +407,8 @@ prompts:
       
       Then, provide CLASS-SPECIFIC EQUATIONS:
       - For each class, provide a description of what characterizes that class
+      - For each class, include a short "SIGNATURE" line with concrete conditions, e.g.:
+        SIGNATURE: att19 high (>0.7) AND att29 moderate (0.3-0.6) AND interaction att19*att40 strong; unlike class 10 which has ...
       - For each class, provide a separate equation (score_0, score_1, score_2, etc.)
       - Each class equation should use different feature combinations to model what makes that class unique
       - DO NOT use thresholding like "if score < 0.25 then class 0"
@@ -471,13 +514,14 @@ prompts:
           - num_carbon(SMILES): Count of C atoms, typical range 0-50
         decoder: |
           You are a mechanism decoder for ESOL (water solubility) molecular dataset.
-          Generate an executable mechanism formula that predicts water solubility from SMILES molecular structures.
+          Generate an interpretable mechanism that predicts water solubility from SMILES molecular structures.
           
           CRITICAL REQUIREMENTS:
           1. ALL VALUES ARE SCALED TO [0, 1] RANGE - your formula output must be in [0, 1]
           2. Use SMILES-derived molecular properties (NOT ECFP bit features)
           3. Work with interpretable molecular properties extracted from SMILES strings
           4. Formula must be executable and mathematically sound
+          5. Be concise (3-5 sentences) and define 1-2 intermediate concepts; then give a SINGLE-LINE "Formula:".
           
           MOLECULAR PROPERTIES TO USE (extract from SMILES):
           - molecular_weight(SMILES): Normalize by dividing by 200-500 (e.g., /300)
@@ -536,9 +580,14 @@ prompts:
           - Aromaticity contributes to lipophilicity
         decoder: |
           You are a mechanism decoder for Lipophilicity (LogP) molecular dataset.
-          Generate a mechanism that predicts LogP from SMILES molecular structures.
+          Generate an interpretable mechanism that predicts LogP from SMILES molecular structures.
           Use molecular properties from SMILES (molecular_weight, num_rings, num_hydroxyl_groups, etc.).
           DO NOT use ECFP bit features. LogP increases with hydrophobicity, decreases with polar groups.
+          
+          REQUIRED OUTPUT FORMAT:
+          MECHANISM DESCRIPTION: 3-5 sentences (include at least one nonlinearity + one interaction).
+          INTERMEDIATE CONCEPTS: 1-3 named concepts (e.g., hydrophobic_bulk, polarity_counterweight).
+          Formula: ŷ = clip(expression, 0.0, 1.0)  (single line; inline intermediates)
       
       lipophilicity:
         encoder: |
@@ -627,6 +676,16 @@ prompts:
         decoder: |
           You are a mechanism decoder for GFP yield prediction in cell-free expression systems.
           
+          Generate a predictive mechanism that is BOTH high-performing and highly interpretable.
+          
+          CRITICAL OUTPUT FORMAT:
+          - MECHANISM DESCRIPTION: 3-5 sentences (focus on key nonlinearities + interactions)
+          - INTERMEDIATE CONCEPTS: 1-3 named combinatory variables (define briefly)
+          - A SINGLE-LINE formula starting with "Formula:" (so it can be extracted programmatically)
+            If scaled, use: Formula: ŷ = clip(expression, 0.0, 1.0)
+          
+          The final Formula line must inline/expand any intermediate concepts (do not reference intermediate variable names).
+          
           Generate a predictive mechanism formula that captures the biochemical processes:
           
           TEMPERATURE EFFECTS:
@@ -685,10 +744,51 @@ prompts:
           - Ionic conditions (Mg, K, glutamate)
           - Saturation kinetics and component interactions
         decoder: |
-          You are a mechanism decoder for protein expression yield prediction dataset.
-          Generate a mechanism that predicts yield from cell-free expression components.
-          Consider Michaelis-Menten saturation for substrates, cofactor enhancement, and ionic effects.
-          Formula should capture: yield = f(NAD, cofactors, tRNA, amino acids, ions) with saturation and synergy terms.
+          You are a mechanism decoder for protein expression yield prediction dataset (cell-free system).
+          
+          IMPORTANT: Use the actual feature names (as provided in the data):
+          nad, folinic_acid, coa, nucleo_mix, spermidin, pga, aa, trna, mg_gluta, camp, K_gluta
+          
+          GOAL:
+          Produce an interpretable, text-rich mechanism with explicit intermediate concepts and nonlinear interactions.
+          
+          REQUIRED STRUCTURE:
+          MECHANISM DESCRIPTION (3-5 sentences):
+          - Explain what limits yield (energy, translation capacity, ionic balance)
+          - Include at least 2 nonlinearities (saturation, diminishing returns, inhibitory regime at extremes)
+          - Include at least 2 interactions (e.g., mg_gluta × K_gluta synergy; nad × nucleo_mix energy gating; aa × trna translation coupling)
+          
+          INTERMEDIATE CONCEPTS (1-3 named concepts, described in text):
+          - energy_charge: combination of nad, nucleo_mix (nonlinear saturation)
+          - translation_capacity: combination of aa, trna, spermidin (gating/saturation)
+          - ionic_stability: mg_gluta and K_gluta synergy with saturation/inhibition at extremes
+          - cofactor_support: folinic_acid and coa (supporting steps, diminishing returns)
+          - resource_balance: pga and camp modulating capacity (ratio/soft-threshold)
+          
+          FINAL FORMULA (must be one line):
+          - Start with "Formula:" on a single line
+          - Use clip(expression, 0.0, 1.0) if scaled
+          - Inline/expand intermediate concepts inside the expression (do not reference intermediate names)
+
+      protein_expression_all:
+        encoder: |
+          You are a mechanism encoder for combined protein expression yield prediction dataset.
+          This dataset combines multiple cell-free protein expression plates into one regression task.
+          Focus on robust biochemical relationships that generalize across plates:
+          - Energy charge (nad × nucleo_mix saturation)
+          - Translation capacity (aa × trna synergy with saturation)
+          - Ionic balance (mg_gluta × K_gluta synergy; inhibition at extremes)
+          - Cofactor support (folinic_acid, coa diminishing returns)
+        decoder: |
+          You are a mechanism decoder for combined protein expression yield prediction dataset.
+          
+          IMPORTANT: Use the actual feature names:
+          nad, folinic_acid, coa, nucleo_mix, spermidin, pga, aa, trna, mg_gluta, camp, K_gluta
+          
+          REQUIRED OUTPUT FORMAT (regression):
+          MECHANISM DESCRIPTION: 3-5 sentences.
+          INTERMEDIATE CONCEPTS: 1-3 named concepts (describe each).
+          Formula: ŷ = clip(expression, 0.0, 1.0)  (single line; inline intermediates)
       
       dataset_102:
         encoder: |
@@ -716,26 +816,117 @@ prompts:
           - Enzyme-substrate binding interactions
         decoder: |
           You are a mechanism decoder for aminotransferase enzyme activity dataset.
-          Generate a mechanism using sequence features (SEQ) and substrate properties (SUBSTRATES).
-          Consider how sequence composition and substrate structure affect enzyme activity.
+          
+          IMPORTANT: The model inputs are extracted numeric features (not raw text in the formula).
+          Prefer using these interpretable features:
+          - Sequence features: seq_length, seq_gc_content, seq_aromatic_count, seq_charged_count, seq_polar_count, seq_hydrophobic_count
+          - Substrate (SMILES) proxy features: smiles_length, smiles_ring_count, smiles_branch_count, smiles_double_bond_count, smiles_triple_bond_count, smiles_aromatic_count
+          
+          GOAL:
+          Generate a descriptive, mechanistic explanation PLUS a single-line executable Formula that captures:
+          - Sequence–substrate compatibility (INTERACTIONS are mandatory)
+          - Nonlinearities (saturation/diminishing returns and at least one inhibitory or inverse-U effect)
+          - Intermediate concepts that explain “why” (binding proxy, catalytic readiness, substrate reactivity proxy)
+          
+          REQUIRED OUTPUT FORMAT:
+          MECHANISM DESCRIPTION: 3-5 sentences.
+          INTERMEDIATE CONCEPTS: 1-3 named concepts (explain each; you may give short inline equations).
+          Formula: ŷ = <CLASS INDEX>  (single line; output MUST be a discrete integer: 0, 1, 2, ...)
+          
+          IMPORTANT FOR CLASSIFICATION:
+          - Do NOT output a probability.
+          - Prefer class scores + argmax, e.g. score_0=..., score_1=..., then ŷ = argmax([score_0, score_1, ...]).
+          - For binary tasks, a threshold mapping is also acceptable if you clearly output an integer, e.g. ŷ = 1 if score > t else 0.
+          
+          Examples of useful intermediates (do NOT rely on names in final Formula line):
+          - binding_proxy: nonlinear match between seq_hydrophobic_count and smiles_aromatic_count / smiles_ring_count
+          - electrostatic_penalty: seq_charged_count interacting with smiles complexity proxies (branches, unsaturation)
+          - substrate_reactivity: function of smiles_double_bond_count + smiles_triple_bond_count (saturating)
+          - catalytic_readiness: inverse-U of seq_polar_count (too low lacks H-bonds, too high destabilizes core)
+        regression:
+          encoder: |
+            You are a mechanism encoder for aminotransferase enzyme activity REGRESSION dataset.
+            Predict a continuous activity score from extracted seq_* and smiles_* proxy features.
+            Focus on compatibility interactions (seq × smiles) plus saturation/inhibition effects.
+          decoder: |
+            You are a mechanism decoder for aminotransferase enzyme activity REGRESSION dataset.
+            
+            IMPORTANT: Inputs are extracted numeric proxy features (seq_* and smiles_*), not raw SEQ/SMILES in the formula.
+            
+            REQUIRED OUTPUT FORMAT (regression):
+            MECHANISM DESCRIPTION: 3-5 sentences.
+            INTERMEDIATE CONCEPTS: 1-3 named concepts.
+            Formula: ŷ = clip(expression, 0.0, 1.0)  (single line; inline intermediates)
       
       olea:
         encoder: |
           You are a mechanism encoder for olea enzyme activity dataset.
-          Predicts enzyme activity from protein sequences and substrate structures.
-          Focus on sequence-substrate interactions and compatibility.
+          This dataset predicts enzyme activity from protein sequences (SEQ) and substrate structures (SUBSTRATES).
+          Focus on:
+          - Sequence-derived proxies (length/composition; charged/polar/hydrophobic balance)
+          - Substrate complexity proxies (rings/branches/unsaturation/aromaticity)
+          - Sequence–substrate compatibility and inhibition/instability at extremes
         decoder: |
           You are a mechanism decoder for olea enzyme activity dataset.
-          Generate a mechanism using SEQ and SUBSTRATES features to predict activity.
+          
+          IMPORTANT: Inputs are extracted numeric proxy features (not raw text in the formula).
+          Use these feature families (if present): seq_* and smiles_*.
+          
+          GOAL:
+          Produce a concise, mechanistic classifier using nonlinearities + interactions.
+          
+          REQUIRED OUTPUT FORMAT:
+          MECHANISM DESCRIPTION: 3-5 sentences.
+          INTERMEDIATE CONCEPTS: 1-3 named concepts (explain each).
+          Formula: ŷ = <CLASS INDEX>  (single line; output MUST be integer class index)
+          
+          IMPORTANT FOR CLASSIFICATION:
+          - Prefer class scores + argmax: ŷ = argmax([score_0, score_1, ...]).
+          - If binary, a thresholded score is ok but output must be 0/1 integer.
+        regression:
+          encoder: |
+            You are a mechanism encoder for olea enzyme activity REGRESSION dataset.
+            Predict a continuous activity score from extracted seq_* and smiles_* proxy features.
+          decoder: |
+            You are a mechanism decoder for olea enzyme activity REGRESSION dataset.
+            Use nonlinear saturation + at least one interaction term (seq_* × smiles_*).
+            Output a single-line regression formula clipped to [0,1] if scaled.
+            
+            REQUIRED OUTPUT FORMAT:
+            MECHANISM DESCRIPTION: 3-5 sentences.
+            INTERMEDIATE CONCEPTS: 1-3 named concepts.
+            Formula: ŷ = clip(expression, 0.0, 1.0)
       
       halogenase_nabr:
         encoder: |
           You are a mechanism encoder for halogenase (NaBr) enzyme activity dataset.
           Predicts halogenation activity with sodium bromide as cofactor.
-          Focus on sequence features and substrate-halogenase compatibility.
+          Focus on sequence–substrate compatibility and substrate halogenation “reactivity proxies”
+          from smiles_* complexity and unsaturation patterns.
         decoder: |
           You are a mechanism decoder for halogenase (NaBr) enzyme activity dataset.
-          Generate a mechanism for halogenation activity prediction from SEQ and SUBSTRATES.
+          
+          IMPORTANT: Inputs are extracted numeric proxy features (seq_* and smiles_*).
+          Build a classifier that captures:
+          - Binding/compatibility interactions (seq_hydrophobic × smiles_aromatic/rings)
+          - Electrostatic penalty (seq_charged × smiles_branch/unsaturation)
+          - Reactivity saturation (smiles_double/triple bonds saturate)
+          - Inverse-U stability (too polar/too hydrophobic harms activity)
+          
+          REQUIRED OUTPUT FORMAT:
+          MECHANISM DESCRIPTION: 3-5 sentences.
+          INTERMEDIATE CONCEPTS: 1-3 named concepts.
+          Formula: ŷ = <CLASS INDEX>  (single line; integer class index)
+        regression:
+          encoder: |
+            You are a mechanism encoder for halogenase (NaBr) enzyme activity REGRESSION dataset.
+            Predict a continuous halogenation activity score from seq_* and smiles_* proxy features.
+          decoder: |
+            You are a mechanism decoder for halogenase (NaBr) enzyme activity REGRESSION dataset.
+            Include binding/compatibility interactions and at least one inhibitory term for extreme substrate complexity.
+            Output a single-line regression formula clipped to [0,1] if scaled.
+            
+            Formula: ŷ = clip(expression, 0.0, 1.0)
       
       halogenase_nacl:
         encoder: |
@@ -744,7 +935,23 @@ prompts:
           Focus on sequence-substrate interactions for halogenation.
         decoder: |
           You are a mechanism decoder for halogenase (NaCl) enzyme activity dataset.
-          Generate a mechanism for halogenation activity from SEQ and SUBSTRATES features.
+          
+          IMPORTANT: Inputs are extracted numeric proxy features (seq_* and smiles_*).
+          Use nonlinearities + interactions; output integer class index.
+          
+          REQUIRED OUTPUT FORMAT:
+          MECHANISM DESCRIPTION: 3-5 sentences.
+          INTERMEDIATE CONCEPTS: 1-3 named concepts.
+          Formula: ŷ = <CLASS INDEX>
+        regression:
+          encoder: |
+            You are a mechanism encoder for halogenase (NaCl) enzyme activity REGRESSION dataset.
+            Predict a continuous halogenation activity score from seq_* and smiles_* proxy features.
+          decoder: |
+            You are a mechanism decoder for halogenase (NaCl) enzyme activity REGRESSION dataset.
+            Use nonlinearities + interactions; output a clipped regression formula.
+            
+            Formula: ŷ = clip(expression, 0.0, 1.0)
       
       phosphatase_achiral:
         encoder: |
@@ -753,7 +960,23 @@ prompts:
           Focus on sequence features and substrate properties affecting dephosphorylation.
         decoder: |
           You are a mechanism decoder for phosphatase (achiral) enzyme activity dataset.
-          Generate a mechanism using SEQ and SUBSTRATES to predict phosphatase activity.
+          
+          IMPORTANT: Inputs are extracted numeric proxy features (seq_* and smiles_*).
+          Capture substrate complexity + sequence compatibility and include at least one inhibition term.
+          
+          REQUIRED OUTPUT FORMAT:
+          MECHANISM DESCRIPTION: 3-5 sentences.
+          INTERMEDIATE CONCEPTS: 1-3 named concepts.
+          Formula: ŷ = <CLASS INDEX>  (single line; integer)
+        regression:
+          encoder: |
+            You are a mechanism encoder for phosphatase (achiral) enzyme activity REGRESSION dataset.
+            Predict a continuous dephosphorylation activity score from seq_* and smiles_* proxy features.
+          decoder: |
+            You are a mechanism decoder for phosphatase (achiral) enzyme activity REGRESSION dataset.
+            Include saturation + inhibition (too complex substrates reduce activity) and a seq×smiles compatibility interaction.
+            
+            Formula: ŷ = clip(expression, 0.0, 1.0)
       
       phosphatase_chiral:
         encoder: |
@@ -762,7 +985,128 @@ prompts:
           Consider stereochemistry effects on enzyme-substrate interactions.
         decoder: |
           You are a mechanism decoder for phosphatase (chiral) enzyme activity dataset.
-          Generate a mechanism for chiral substrate dephosphorylation from SEQ and SUBSTRATES.
+          
+          IMPORTANT: Inputs are extracted numeric proxy features (seq_* and smiles_*).
+          Include interactions that proxy “fit” and at least one nonlinear penalty for overly complex substrates.
+          
+          REQUIRED OUTPUT FORMAT:
+          MECHANISM DESCRIPTION: 3-5 sentences.
+          INTERMEDIATE CONCEPTS: 1-3 named concepts.
+          Formula: ŷ = <CLASS INDEX>  (single line; integer)
+        regression:
+          encoder: |
+            You are a mechanism encoder for phosphatase (chiral) enzyme activity REGRESSION dataset.
+            Predict a continuous activity score from seq_* and smiles_* proxy features.
+          decoder: |
+            You are a mechanism decoder for phosphatase (chiral) enzyme activity REGRESSION dataset.
+            Use nonlinearities + interactions; output a clipped regression formula.
+            
+            Formula: ŷ = clip(expression, 0.0, 1.0)
+
+      nitrilase:
+        encoder: |
+          You are a mechanism encoder for nitrilase enzyme activity dataset.
+          This dataset predicts enzyme activity from protein sequence proxies (seq_*) and substrate proxies (smiles_*).
+          Focus on sequence–substrate compatibility, substrate “reactivity/strain” proxies, and saturation/inhibition effects.
+        decoder: |
+          You are a mechanism decoder for nitrilase enzyme activity dataset.
+          
+          IMPORTANT: Use extracted numeric features (seq_* and smiles_*), not raw SEQ/SMILES strings in the formula.
+          
+          REQUIRED OUTPUT FORMAT:
+          MECHANISM DESCRIPTION: 3-5 sentences.
+          INTERMEDIATE CONCEPTS: 1-3 named concepts.
+          Formula: ŷ = <CLASS INDEX>  (single line; integer class index; use argmax or threshold mapping)
+
+      duf:
+        encoder: |
+          You are a mechanism encoder for DUF enzyme activity dataset.
+          Predict activity from sequence-derived proxies (seq_*) and substrate complexity proxies (smiles_*).
+          Emphasize robust, interpretable nonlinear rules (saturation + at least one interaction).
+        decoder: |
+          You are a mechanism decoder for DUF enzyme activity dataset.
+          
+          IMPORTANT: Inputs are extracted numeric proxy features (seq_* and smiles_*).
+          
+          REQUIRED OUTPUT FORMAT:
+          MECHANISM DESCRIPTION: 3-5 sentences.
+          INTERMEDIATE CONCEPTS: 1-3 named concepts.
+          Formula: ŷ = <CLASS INDEX>  (single line; integer)
+
+      esterase:
+        encoder: |
+          You are a mechanism encoder for esterase enzyme activity dataset.
+          Predict activity using sequence composition proxies (seq_*) and substrate complexity proxies (smiles_*).
+          Focus on hydrophobic/aromatic binding proxies, and penalties for overly branched/unsaturated substrates.
+        decoder: |
+          You are a mechanism decoder for esterase enzyme activity dataset.
+          
+          IMPORTANT: Use extracted numeric features (seq_* and smiles_*).
+          
+          REQUIRED OUTPUT FORMAT:
+          MECHANISM DESCRIPTION: 3-5 sentences.
+          INTERMEDIATE CONCEPTS: 1-3 named concepts.
+          Formula: ŷ = <CLASS INDEX>  (single line; integer; argmax preferred for multi-class)
+
+      gt_donors_achiral:
+        encoder: |
+          You are a mechanism encoder for glycosyltransferase (GT) donors (achiral) dataset.
+          This is a classification task using extracted sequence proxies (seq_*) and substrate proxies (smiles_*).
+          Focus on how donor substrate complexity and enzyme sequence composition jointly determine class.
+        decoder: |
+          You are a mechanism decoder for glycosyltransferase (GT) donors (achiral) dataset.
+          
+          IMPORTANT: Inputs are extracted numeric proxy features (seq_* and smiles_*), not raw SEQ/SMILES.
+          Use class scores + argmax for multi-class categorical tasks.
+          
+          REQUIRED OUTPUT FORMAT:
+          MECHANISM DESCRIPTION: 3-5 sentences.
+          INTERMEDIATE CONCEPTS: 1-3 named concepts (e.g., donor_fit, complexity_penalty, catalytic_bias).
+          Formula: ŷ = <CLASS INDEX>  (single line; integer; for categorical tasks use ŷ = argmax([...]))
+
+      gt_donors_chiral:
+        encoder: |
+          You are a mechanism encoder for glycosyltransferase (GT) donors (chiral) dataset.
+          Predict donor class using seq_* and smiles_* extracted proxies; include interactions that proxy stereochemical selectivity.
+        decoder: |
+          You are a mechanism decoder for glycosyltransferase (GT) donors (chiral) dataset.
+          
+          IMPORTANT: Use extracted numeric features (seq_* and smiles_*).
+          This is categorical/multi-class: prefer class scores + argmax.
+          
+          REQUIRED OUTPUT FORMAT:
+          MECHANISM DESCRIPTION: 3-5 sentences.
+          INTERMEDIATE CONCEPTS: 1-3 named concepts.
+          Formula: ŷ = <CLASS INDEX>
+
+      gt_acceptors_achiral:
+        encoder: |
+          You are a mechanism encoder for glycosyltransferase (GT) acceptors (achiral) dataset.
+          Predict acceptor class using extracted sequence proxies (seq_*) and substrate proxies (smiles_*).
+          Focus on acceptor complexity/branching and sequence–substrate compatibility interactions.
+        decoder: |
+          You are a mechanism decoder for glycosyltransferase (GT) acceptors (achiral) dataset.
+          
+          IMPORTANT: Use extracted numeric features (seq_* and smiles_*). Categorical/multi-class: use argmax.
+          
+          REQUIRED OUTPUT FORMAT:
+          MECHANISM DESCRIPTION: 3-5 sentences.
+          INTERMEDIATE CONCEPTS: 1-3 named concepts.
+          Formula: ŷ = <CLASS INDEX>
+
+      gt_acceptors_chiral:
+        encoder: |
+          You are a mechanism encoder for glycosyltransferase (GT) acceptors (chiral) dataset.
+          Predict acceptor class using seq_* and smiles_* extracted proxies; include nonlinear selectivity and compatibility interactions.
+        decoder: |
+          You are a mechanism decoder for glycosyltransferase (GT) acceptors (chiral) dataset.
+          
+          IMPORTANT: Inputs are extracted numeric features (seq_* and smiles_*). Output integer class index.
+          
+          REQUIRED OUTPUT FORMAT:
+          MECHANISM DESCRIPTION: 3-5 sentences.
+          INTERMEDIATE CONCEPTS: 1-3 named concepts.
+          Formula: ŷ = <CLASS INDEX>
       
       davis:
         encoder: |
@@ -772,6 +1116,25 @@ prompts:
         decoder: |
           You are a mechanism decoder for Davis kinase binding dataset.
           Generate a mechanism predicting binding affinity from sequence and structural features.
+        regression:
+          encoder: |
+            You are a mechanism encoder for Davis kinase binding REGRESSION dataset.
+            Predict binding affinity (continuous) using extracted seq_* and smiles_* proxy features.
+          decoder: |
+            You are a mechanism decoder for Davis kinase binding REGRESSION dataset.
+            Use compatibility interactions and at least one saturation term; output a single-line clipped regression formula.
+            
+            Formula: ŷ = clip(expression, 0.0, 1.0)
+
+      davis_filtered:
+        encoder: |
+          You are a mechanism encoder for Davis kinase binding FILTERED regression dataset.
+          Predict binding affinity from extracted sequence/substrate proxy features after filtering out problematic pairs.
+        decoder: |
+          You are a mechanism decoder for Davis kinase binding FILTERED regression dataset.
+          Generate a robust, interpretable regression mechanism with nonlinearities + interactions.
+          
+          Formula: ŷ = clip(expression, 0.0, 1.0)
       
       # =========================
       # TABARENA REGRESSION DATASETS
@@ -784,8 +1147,19 @@ prompts:
           Focus on physiological relationships between features and disease progression.
         decoder: |
           You are a mechanism decoder for diabetes regression dataset.
-          Generate a mechanism that predicts disease progression from patient features.
-          Consider linear and non-linear relationships between physiological variables.
+          
+          GOAL:
+          Predict disease progression with an interpretable physiological mechanism that includes nonlinearities and interactions.
+          
+          REQUIRED OUTPUT FORMAT:
+          MECHANISM DESCRIPTION: 3-5 sentences.
+          INTERMEDIATE CONCEPTS: 1-3 named concepts (explain each).
+          Formula: ŷ = clip(expression, 0.0, 1.0)  (single line; inline intermediates)
+          
+          Guidance:
+          - Include at least two interactions (e.g., BMI × BP synergy; lipid markers coupling; age gating metabolic effects)
+          - Include at least two nonlinearities (saturation, diminishing returns, soft-threshold)
+          - Use stable coefficients; avoid brittle hard thresholds
       
       housing:
         encoder: |
@@ -858,8 +1232,15 @@ prompts:
           Focus on geometric relationships and decision boundaries between species.
         decoder: |
           You are a mechanism decoder for iris flower classification dataset.
-          Generate a mechanism predicting iris species from sepal and petal measurements.
-          Consider geometric relationships and thresholds separating the three species.
+          Generate a descriptive, text-based mechanism predicting iris species from sepal and petal measurements.
+          
+          CRITICAL REQUIREMENTS:
+          - Provide MECHANISM DESCRIPTION (2-4 sentences)
+          - Provide CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS with nonlinear interactions and intermediate variables
+          - Compute scores per class and use argmax; avoid naive thresholding
+          
+          FINAL PREDICTION MUST BE ONE LINE:
+          ŷ = argmax([score_0, score_1, score_2])
       
       wine:
         encoder: |
@@ -878,8 +1259,14 @@ prompts:
           Focus on socioeconomic relationships and decision boundaries.
         decoder: |
           You are a mechanism decoder for adult income classification dataset.
-          Generate a mechanism predicting income level from demographic and employment features.
-          Consider thresholds and interactions between age, education, occupation, and hours worked.
+          Generate a descriptive, text-based mechanism predicting income level from demographic and employment features.
+          
+          CRITICAL REQUIREMENTS:
+          - MECHANISM DESCRIPTION (2-4 sentences) explaining the socioeconomic story
+          - CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS with nonlinear interactions and intermediate variables
+          - Use separate scores per class and argmax; avoid naive thresholding
+          
+          Include intermediate concepts such as "human_capital", "labor_intensity", "seniority_signal", "credential_gate".
       
       mushroom:
         encoder: |
@@ -905,8 +1292,10 @@ prompts:
           Generate a mechanism that predicts class (0-4) from feature values.
           Consider non-linear interactions and decision boundaries between the 5 classes.
       
-      # Additional Enzyme Datasets
-      nitrilase:
+      # Additional Enzyme Datasets (LEGACY PLACEHOLDERS)
+      # NOTE: These entries used to duplicate enzyme keys defined earlier in this file.
+      # They are renamed to *_legacy to avoid overwriting the primary dataset prompts.
+      nitrilase_legacy:
         encoder: |
           You are a mechanism encoder for nitrilase enzyme activity dataset.
           Predicts nitrilase activity from protein sequences and substrate structures.
@@ -915,7 +1304,7 @@ prompts:
           You are a mechanism decoder for nitrilase enzyme activity dataset.
           Generate a mechanism using SEQ and SUBSTRATES to predict nitrilase activity.
       
-      esterase:
+      esterase_legacy:
         encoder: |
           You are a mechanism encoder for esterase enzyme activity dataset.
           Predicts esterase activity from sequences and substrates.
@@ -924,7 +1313,7 @@ prompts:
           You are a mechanism decoder for esterase enzyme activity dataset.
           Generate a mechanism predicting esterase activity from SEQ and SUBSTRATES features.
       
-      duf:
+      duf_legacy:
         encoder: |
           You are a mechanism encoder for DUF enzyme activity dataset.
           Predicts activity for DUF (Domain of Unknown Function) enzymes.
@@ -933,7 +1322,7 @@ prompts:
           You are a mechanism decoder for DUF enzyme activity dataset.
           Generate a mechanism using SEQ and SUBSTRATES to predict DUF enzyme activity.
       
-      gt_donors_achiral:
+      gt_donors_achiral_legacy:
         encoder: |
           You are a mechanism encoder for glycosyltransferase (achiral donors) dataset.
           Predicts GT activity for achiral donor substrates.
@@ -942,7 +1331,7 @@ prompts:
           You are a mechanism decoder for GT (achiral donors) enzyme activity dataset.
           Generate a mechanism predicting glycosyltransferase activity from SEQ and SUBSTRATES.
       
-      gt_donors_chiral:
+      gt_donors_chiral_legacy:
         encoder: |
           You are a mechanism encoder for glycosyltransferase (chiral donors) dataset.
           Predicts GT activity for chiral donor substrates.
@@ -951,7 +1340,7 @@ prompts:
           You are a mechanism decoder for GT (chiral donors) enzyme activity dataset.
           Generate a mechanism for chiral donor glycosylation from SEQ and SUBSTRATES.
       
-      gt_acceptors_achiral:
+      gt_acceptors_achiral_legacy:
         encoder: |
           You are a mechanism encoder for glycosyltransferase (achiral acceptors) dataset.
           Predicts GT activity for achiral acceptor substrates.
@@ -960,7 +1349,7 @@ prompts:
           You are a mechanism decoder for GT (achiral acceptors) enzyme activity dataset.
           Generate a mechanism predicting GT activity from SEQ and SUBSTRATES features.
       
-      gt_acceptors_chiral:
+      gt_acceptors_chiral_legacy:
         encoder: |
           You are a mechanism encoder for glycosyltransferase (chiral acceptors) dataset.
           Predicts GT activity for chiral acceptor substrates.
@@ -1066,7 +1455,12 @@ prompts:
           Focus on morphological and behavioral characteristics.
         decoder: |
           You are a mechanism decoder for zoo animal classification dataset.
-          Generate a mechanism predicting animal class from physical and behavioral features.
+          Generate a descriptive, text-based mechanism predicting animal class from physical and behavioral features.
+          
+          CRITICAL REQUIREMENTS:
+          - MECHANISM DESCRIPTION (2-4 sentences)
+          - CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS with nonlinear interactions and intermediate variables
+          - Use argmax over class scores; avoid naive thresholding
       
       glass:
         encoder: |
@@ -1119,7 +1513,12 @@ prompts:
           Focus on disease symptom patterns and plant features.
         decoder: |
           You are a mechanism decoder for soybean disease classification dataset.
-          Generate a mechanism predicting disease type from plant characteristics.
+          Generate a descriptive, text-based mechanism predicting disease type from plant characteristics.
+          
+          CRITICAL REQUIREMENTS:
+          - MECHANISM DESCRIPTION (2-4 sentences)
+          - CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS with nonlinear interactions and intermediate variables
+          - Use argmax over class scores; avoid naive thresholding
       
       primary-tumor:
         encoder: |
@@ -1137,60 +1536,68 @@ prompts:
           Focus on imaging characteristics and diagnostic relationships.
         decoder: |
           You are a mechanism decoder for lymphography classification dataset.
-          Generate a mechanism predicting lymph node status from imaging features.
+          Generate a descriptive, text-based mechanism predicting lymph node status from imaging features.
+          
+          CRITICAL REQUIREMENTS:
+          - MECHANISM DESCRIPTION (2-4 sentences)
+          - CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS with nonlinear interactions and intermediate variables
+          - Use argmax over class scores; avoid naive thresholding
       
       ecoli:
         encoder: |
           You are a mechanism encoder for E. coli protein localization classification dataset.
-          Predicts protein localization site (8 classes) from sequence recognition features.
-          
-          DATASET CONTEXT:
-          This dataset classifies E. coli proteins into localization sites based on sequence signals.
-          
-          FEATURES:
-          - mcg (Continuous): McGeoch's method for signal sequence recognition - measures sequence signal strength
-          - gvh (Continuous): von Heijne's method for signal sequence recognition - alternative signal sequence scoring
-          - lip (Binary): von Heijne's Signal Peptidase II consensus sequence score - lipoprotein signal indicator
-          - chg (Binary): Presence of charge on N-terminus of predicted lipoproteins - charge characteristics
-          - aac (Continuous): Discriminant analysis score of amino acid content for outer membrane/periplasmic proteins
-          - alm1 (Continuous): ALOM membrane spanning region prediction score - membrane localization prediction
-          - alm2 (Continuous): ALOM score after excluding cleavable signal regions - refined membrane prediction
-          
-          KEY INSIGHTS:
-          - Multiple signal sequence recognition methods (McGeoch, von Heijne, ALOM) provide complementary information
-          - Signal peptide characteristics (charge, peptidase sites) are critical for localization
-          - Membrane spanning regions and amino acid composition patterns determine localization site
-          - Different localization sites have distinct sequence signatures
-          - Binary features (lip, chg) indicate specific signal peptide types
-          - Continuous features provide quantitative signal strength scores
-          
-          Focus on how sequence recognition signals, membrane predictions, and amino acid composition interact to determine localization.
+          Predicts protein localization site from sequence features.
+          Focus on sequence motifs and localization signals.
         decoder: |
           You are a mechanism decoder for E. coli protein localization classification dataset.
-          Generate a mechanism predicting localization site (8 classes) from sequence recognition features.
+          Generate a descriptive, text-based mechanism predicting localization site from sequence features.
           
-          DATASET CONTEXT:
-          This dataset classifies E. coli proteins into localization sites based on sequence signals.
+          CRITICAL REQUIREMENTS:
+          - MECHANISM DESCRIPTION (2-4 sentences)
+          - CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS with nonlinear interactions and intermediate variables
+          - Use argmax over class scores; avoid naive thresholding
+      
+      miceprotein:
+        encoder: |
+          You are a mechanism encoder for mice protein expression classification dataset.
+          Predicts class labels from protein expression measurements.
+          Focus on coordinated expression patterns, nonlinear co-expression, and interaction signatures.
+        decoder: |
+          You are a mechanism decoder for mice protein expression classification dataset.
+          Generate a descriptive, text-based mechanism predicting class from protein expression features.
           
-          FEATURES:
-          - mcg (Continuous): McGeoch's method for signal sequence recognition - measures sequence signal strength
-          - gvh (Continuous): von Heijne's method for signal sequence recognition - alternative signal sequence scoring
-          - lip (Binary): von Heijne's Signal Peptidase II consensus sequence score - lipoprotein signal indicator
-          - chg (Binary): Presence of charge on N-terminus of predicted lipoproteins - charge characteristics
-          - aac (Continuous): Discriminant analysis score of amino acid content for outer membrane/periplasmic proteins
-          - alm1 (Continuous): ALOM membrane spanning region prediction score - membrane localization prediction
-          - alm2 (Continuous): ALOM score after excluding cleavable signal regions - refined membrane prediction
+          CRITICAL REQUIREMENTS:
+          - MECHANISM DESCRIPTION (2-4 sentences)
+          - CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS with nonlinear interactions and intermediate variables
+          - Use argmax over class scores; avoid naive thresholding
+      
+      colon-cancer:
+        encoder: |
+          You are a mechanism encoder for colon cancer classification dataset.
+          Predicts class labels from biological/clinical measurements.
+          Focus on interaction signatures, nonlinear thresholds, and co-varying marker patterns.
+        decoder: |
+          You are a mechanism decoder for colon cancer classification dataset.
+          Generate a descriptive, text-based mechanism predicting class from input features.
           
-          MECHANISM DESIGN PRINCIPLES:
-          - Consider how signal sequence recognition methods (mcg, gvh) combine to indicate localization
-          - Use binary features (lip, chg) to identify specific signal peptide types
-          - Incorporate membrane prediction scores (alm1, alm2) to distinguish membrane-bound vs soluble proteins
-          - Use amino acid composition (aac) to differentiate outer membrane vs periplasmic proteins
-          - Higher signal scores (mcg, gvh) typically indicate stronger localization signals
-          - Membrane scores (alm1, alm2) help distinguish inner membrane, outer membrane, and periplasmic sites
-          - Charge characteristics (chg) and peptidase signals (lip) are important for lipoprotein localization
+          CRITICAL REQUIREMENTS:
+          - MECHANISM DESCRIPTION (2-4 sentences)
+          - CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS with nonlinear interactions and intermediate variables
+          - Use argmax over class scores; avoid naive thresholding
           
-          Generate mechanisms that reason about sequence recognition signals, membrane predictions, and amino acid composition patterns.
+          ANTI-VAGUENESS (MANDATORY):
+          - Do NOT write filler like "specific patterns" or "distinctive relationships".
+          - For EACH CLASS, you must write concrete, testable statements:
+            * Top 3-5 features for that class (by your choice)
+            * Directionality (HIGH/LOW) and approximate ranges (since features are scaled to [0,1])
+            * At least one nonlinear effect (saturation / inverse-U / soft-threshold)
+            * At least one interaction term (e.g., att2*att3/(K+att2*att3) or gating)
+            * A contrast vs at least one confusing class (e.g., "Unlike class 7, class 10 has ...")
+          - If feature names are anonymous (att1..att47), treat them as biomarker-like measurements and describe OPERATIONAL signatures only.
+          
+          KEEP IT SHORT:
+          - MECHANISM DESCRIPTION: 2-3 sentences.
+          - For each class: 2 short lines max (SIGNATURE + INTERPRETATION) + the equation.
       
       credit:
         encoder: |
