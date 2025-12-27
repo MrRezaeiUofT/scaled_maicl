@@ -418,30 +418,8 @@ templates:
       - Missing competitive resource allocation
       FEATURES: {features}
     # Regression biotech datasets (018)
-    protein_expression: |
-      DATASET: {dataset_name} (Cell-free Protein Expression Yield)
-      DOMAIN: Synthetic Biology / Cell-Free Expression (Regression)
-      TASK: Predict continuous yield from reagent/cofactor concentrations.
-      MECHANISTIC PRIORS (use saturations + gating):
-      - Energy/cofactor gating: NAD and nucleotide mix often act as limiting resources (use saturation and interaction).
-      - Translation coupling: amino acids × tRNA (multiplicative, saturating).
-      - Polyamine effect: spermidine can boost translation but saturates.
-      - Ionic balance: magnesium and potassium/glutamate can be synergistic; too low limits ribosome/polymerase activity.
-      COMMON PATTERNS TO MODEL:
-      - Saturation: x/(K+x) on limiting reagents
-      - Synergy: sat(a)*sat(b) or (a*b)/(K+a*b)
-      - Soft inhibition: 1 - sat(x) when a component competes for resources at high values
-      FEATURES: {features}
-      {scale_info}
-    protein_expression_all: |
-      DATASET: {dataset_name} (Cell-free Protein Expression Yield - multi-plate)
-      DOMAIN: Synthetic Biology / Cell-Free Expression (Regression)
-      TASK: Predict continuous yield robustly across plates/conditions.
-      GUIDANCE:
-      - Prefer stable, monotone saturations and a few interpretable interactions (avoid brittle thresholds).
-      - Use the same “limiting factor” structure as protein_expression: energy gating + translation coupling + ionic stability.
-      FEATURES: {features}
-      {scale_info}
+    protein_expression: *tabular_regression
+    protein_expression_all: *tabular_regression
     dataset_102: *tabular_regression
     gfp_yield: |
       DATASET: GFP Yield Prediction (Cell-Free Expression)

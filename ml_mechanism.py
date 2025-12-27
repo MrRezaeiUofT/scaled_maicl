@@ -6,6 +6,7 @@ for training and using ML models as mechanisms in the MA-ICL system.
 """
 
 import os
+import json
 import numpy as np
 import pandas as pd
 from typing import List, Dict, Any, Tuple, Optional
@@ -83,6 +84,8 @@ class MLModelMechanism:
         self._tabicl_regression_bins = None  # Number of bins for TabICL regression quantization
         self._tabicl_bin_edges = None  # Bin edges for regression quantization
         self._tabicl_bin_centers = None  # Bin centers for regression dequantization
+        self._tabpfn_use_subprocess = False  # Use subprocess isolation for TabPFN
+        self._tabpfn_training_data_path = None  # Path to saved training data for TabPFN subprocess
     
     def train(self, X_train: np.ndarray, y_train: np.ndarray, feature_cols: List[str], y_scaler: Any = None):
         """Train the ML model with calibration and stable class mapping for classification"""
@@ -150,6 +153,19 @@ class MLModelMechanism:
                 ) from e
             # Store feature columns for DataFrame conversion
             self._tabicl_feature_cols = feature_cols
+        elif self.model_name == "TabPFN":
+            # Use subprocess isolation for TabPFN to prevent segmentation faults
+            logger.info("=" * 80)
+            logger.info("ℹ️  TabPFN ML mechanism: Using subprocess isolation for safety")
+            logger.info("=" * 80)
+            logger.info("TabPFN will run in isolated subprocess to prevent segmentation faults.")
+            logger.info("This is slower than direct execution but ensures stability.")
+            logger.info("=" * 80)
+            # Store feature columns for DataFrame conversion (TabPFN expects DataFrames)
+            self._tabpfn_feature_cols = feature_cols
+            self._tabpfn_use_subprocess = True
+            # Model will be None - we'll use subprocess for all operations
+            self.model = None
         elif self.model_name == "Baticl":
             # Lazy import to avoid hard crashes on environments where baticl import is unstable.
             try:
@@ -171,44 +187,99 @@ class MLModelMechanism:
         
         # Fit the model with error handling
         try:
-            # TabICL expects DataFrame, convert if needed
+            # TabICL and TabPFN expect DataFrame, convert if needed
             if self.model_name == "TabICL":
                 X_train_df = pd.DataFrame(X_train, columns=self._tabicl_feature_cols)
-                # For regression, quantize y_train into bins
-                if self.task_type == "regression" and hasattr(self, '_tabicl_regression_bins') and self._tabicl_regression_bins:
-                    n_bins = self._tabicl_regression_bins
-                    logger.info(f"Quantizing regression targets into {n_bins} bins for TabICL classification")
-                    # Create bins from min to max of y_train
-                    self._tabicl_bin_edges = np.linspace(y_train.min(), y_train.max(), n_bins + 1)
-                    # Compute bin centers for dequantization
-                    self._tabicl_bin_centers = (self._tabicl_bin_edges[:-1] + self._tabicl_bin_edges[1:]) / 2.0
-                    # Quantize y_train to bin indices
-                    y_train_quantized = np.digitize(y_train, self._tabicl_bin_edges[1:-1], right=True)
-                    # Ensure all values are in valid range [0, n_bins-1]
-                    y_train_quantized = np.clip(y_train_quantized, 0, n_bins - 1)
-                    logger.info(f"  Target range: [{y_train.min():.4f}, {y_train.max():.4f}]")
-                    logger.info(f"  Quantized to {len(np.unique(y_train_quantized))} unique bins")
-                    self.model.fit(X_train_df, y_train_quantized)
-                else:
-                    # Classification: use y_train as-is
-                    self.model.fit(X_train_df, y_train)
+            elif self.model_name == "TabPFN":
+                # Use subprocess isolation for TabPFN training
+                X_train_df = pd.DataFrame(X_train, columns=self._tabpfn_feature_cols)
+                logger.info(f"Training TabPFN on {len(X_train_df)} samples using subprocess isolation...")
+                
+                try:
+                    import subprocess
+                    import tempfile
+                    from pathlib import Path
+                    import sys
+                    
+                    # Create temporary directory for data exchange
+                    temp_dir = tempfile.mkdtemp(prefix="tabpfn_ml_")
+                    temp_path = Path(temp_dir)
+                    
+                    X_train_path = temp_path / "X_train.csv"
+                    y_train_path = temp_path / "y_train.npy"
+                    output_path = temp_path / "train_result.json"
+                    
+                    # Save training data
+                    X_train_df.to_csv(X_train_path, index=False)
+                    np.save(y_train_path, y_train)
+                    
+                    # Find subprocess script
+                    script_path = Path(__file__).parent / "run_tabpfn_ml_mechanism.py"
+                    if not script_path.exists():
+                        raise RuntimeError(f"TabPFN subprocess script not found at {script_path}")
+                    
+                    # Run training in subprocess
+                    result = subprocess.run(
+                        [sys.executable, str(script_path), "train",
+                         str(X_train_path), str(y_train_path), 
+                         self.task_type, str(output_path)],
+                        capture_output=True,
+                        text=True,
+                        timeout=600  # 10 minute timeout for training
+                    )
+                    
+                    if result.returncode != 0:
+                        error_msg = result.stderr[:500] if result.stderr else "Unknown error"
+                        raise RuntimeError(f"TabPFN training subprocess failed: {error_msg}")
+                    
+                    if not output_path.exists():
+                        raise RuntimeError("TabPFN training subprocess completed but no output file found")
+                    
+                    # Load training result
+                    with open(output_path, 'r') as f:
+                        train_result = json.load(f)
+                    
+                    if not train_result.get('success', False):
+                        error_msg = train_result.get('error', 'Unknown error')
+                        raise RuntimeError(f"TabPFN training failed: {error_msg}")
+                    
+                    # Store paths for later predictions
+                    self._tabpfn_training_data_path = {
+                        'X_train_path': str(X_train_path),
+                        'y_train_path': str(y_train_path),
+                        'temp_dir': temp_dir
+                    }
+                    
+                    logger.info("  ✓ TabPFN training completed successfully (via subprocess)")
+                    
+                except subprocess.TimeoutExpired:
+                    raise RuntimeError("TabPFN training subprocess timed out (>10 minutes)")
+                except Exception as e:
+                    raise RuntimeError(f"TabPFN training via subprocess failed: {e}. Try using --ml_mech linear or --ml_mech xgboost instead.") from e
             else:
                 self.model.fit(X_train, y_train)
         except Exception as e:
-            if self.model_name in ["TabICL", "Baticl"]:
+            if self.model_name in ["TabICL", "TabPFN", "Baticl"]:
                 raise RuntimeError(
                     f"{self.model_name} training failed. This may be due to a segmentation fault "
                     f"(which cannot be caught in Python) or other system-level issues. "
-                    f"Try using --ml_mech logreg or --ml_mech xgboost instead. "
+                    f"Try using --ml_mech linear or --ml_mech xgboost instead. "
                     f"Original error: {e}"
                 ) from e
             raise
         
         # For classification: ensure calibrated probabilities and build stable class mapping
         if self.task_type == "classification":
+            # TabPFN uses subprocess, so skip calibration (handled in subprocess)
             # TabICL typically has predict_proba, so skip calibration for it
             # Check if model has predict_proba; if not, wrap with calibration
-            if self.model_name != "TabICL" and not hasattr(self.model, "predict_proba"):
+            if self.model_name == "TabPFN":
+                # TabPFN uses subprocess - class mapping will be inferred from training data
+                unique_train = np.unique(y_train)
+                self._class_order = sorted(unique_train.tolist())
+                self._class_to_idx = {c: i for i, c in enumerate(self._class_order)}
+                logger.info(f"  [ClassMap] Built class mapping for TabPFN (subprocess): {len(self._class_order)} classes")
+            elif self.model_name != "TabICL" and not hasattr(self.model, "predict_proba"):
                 try:
                     from sklearn.calibration import CalibratedClassifierCV
                     n_classes = len(np.unique(y_train))
@@ -225,7 +296,10 @@ class MLModelMechanism:
                     logger.warning(f"  [Calibration] Could not add calibration wrapper: {e}")
             
             # Build stable class→index mapping from the trained estimator
-            if hasattr(self.model, "classes_"):
+            if self.model_name == "TabPFN":
+                # TabPFN class mapping already handled above
+                pass
+            elif hasattr(self.model, "classes_"):
                 self._class_order = self.model.classes_.tolist()
                 self._class_to_idx = {c: i for i, c in enumerate(self._class_order)}
                 logger.info(f"  [ClassMap] Built class mapping: {len(self._class_order)} classes")
@@ -322,6 +396,80 @@ class MLModelMechanism:
                 return float(class_idx)
             except Exception as e:
                 logger.warning(f"TabICL prediction failed: {e}")
+                return 0.0
+        
+        if self.model_name == "TabPFN":
+            # TabPFN uses subprocess isolation for predictions
+            if not self._tabpfn_use_subprocess or self._tabpfn_training_data_path is None:
+                logger.warning("TabPFN not properly initialized with subprocess isolation")
+                return 0.0
+            
+            try:
+                import subprocess
+                import tempfile
+                from pathlib import Path
+                import sys
+                import json
+                
+                # Convert to DataFrame
+                x_df = pd.DataFrame(x_array, columns=self._tabpfn_feature_cols)
+                
+                # Create temporary file for prediction data
+                temp_dir = Path(self._tabpfn_training_data_path['temp_dir'])
+                X_pred_path = temp_dir / "X_pred.csv"
+                output_path = temp_dir / "pred_result.json"
+                
+                # Save prediction data
+                x_df.to_csv(X_pred_path, index=False)
+                
+                # Find subprocess script
+                script_path = Path(__file__).parent / "run_tabpfn_ml_mechanism.py"
+                if not script_path.exists():
+                    logger.warning("TabPFN subprocess script not found")
+                    return 0.0
+                
+                # Run prediction in subprocess
+                result = subprocess.run(
+                    [sys.executable, str(script_path), "predict",
+                     self._tabpfn_training_data_path['X_train_path'],
+                     self._tabpfn_training_data_path['y_train_path'],
+                     str(X_pred_path),
+                     self.task_type,
+                     str(output_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=60  # 1 minute timeout for prediction
+                )
+                
+                if result.returncode != 0:
+                    logger.warning(f"TabPFN prediction subprocess failed: {result.stderr[:200] if result.stderr else 'Unknown error'}")
+                    return 0.0
+                
+                if not output_path.exists():
+                    logger.warning("TabPFN prediction subprocess completed but no output file found")
+                    return 0.0
+                
+                # Load prediction result
+                with open(output_path, 'r') as f:
+                    pred_result = json.load(f)
+                
+                if not pred_result.get('success', False):
+                    error_msg = pred_result.get('error', 'Unknown error')
+                    logger.warning(f"TabPFN prediction failed: {error_msg}")
+                    return 0.0
+                
+                predictions = pred_result.get('predictions', [])
+                if not predictions:
+                    logger.warning("TabPFN prediction returned empty results")
+                    return 0.0
+                
+                return float(predictions[0])
+                
+            except subprocess.TimeoutExpired:
+                logger.warning("TabPFN prediction subprocess timed out")
+                return 0.0
+            except Exception as e:
+                logger.warning(f"TabPFN prediction failed: {e}")
                 return 0.0
         
         if self.model_name == "Baticl":
@@ -424,6 +572,7 @@ class MLModelMechanism:
             "LogisticRegression": "ML Mechanism (LogisticRegression): Data-driven logistic regression classifier",
             "XGBoost": "ML Mechanism (XGBoost): Gradient-boosted decision trees with calibrated probabilities",
             "TabICL": "ML Mechanism (TabICL): Tabular in-context learning baseline using transformer architecture",
+            "TabPFN": "ML Mechanism (TabPFN): Prior-data Fitted Networks for tabular data using transformer architecture",
             "Baticl": "ML Mechanism (Baticl): Tabular in-context learning baseline using transformer architecture",
             "KNN": "ML Mechanism (KNN): K-nearest neighbors classifier using distance-based similarity",
             "KernelRidge": "ML Mechanism (KernelRidge): Kernel-based ridge regression with RBF kernel"
@@ -593,16 +742,34 @@ def compute_ml_residuals(
     
     # For both classification and regression: use batch prediction when possible
     try:
+        # TabPFN and TabICL require DataFrames
+        requires_dataframe = ml_model.model_name in ["TabPFN", "TabICL"]
+        
+        # TabPFN uses subprocess isolation, so model is None - must use per-sample prediction
+        # Check if model exists and is not None before attempting batch prediction
+        can_use_batch = (
+            hasattr(ml_model, "model") 
+            and ml_model.model is not None 
+            and hasattr(ml_model.model, "predict")
+            and ml_model.model_name != "TabPFN"  # TabPFN always uses subprocess, model is None
+        )
+        
         if task_type == "classification":
             # Classification: only get class predictions, no probabilities
-            if hasattr(ml_model, "model") and hasattr(ml_model.model, "predict"):
+            if can_use_batch:
                 # Direct batch prediction for efficiency
-                predictions_batch = ml_model.model.predict(X_train)
+                if requires_dataframe:
+                    # TabICL needs DataFrame
+                    X_train_df = pd.DataFrame(X_train, columns=ml_model._tabicl_feature_cols)
+                    predictions_batch = ml_model.model.predict(X_train_df)
+                else:
+                    predictions_batch = ml_model.model.predict(X_train)
                 predictions = predictions_batch.tolist()
                 # No probabilities needed for classification
                 probas = [None] * len(predictions)
             else:
-                # Fallback to per-sample prediction
+                # Fallback to per-sample prediction (required for TabPFN, or when model is None)
+                logger.info(f"[Residuals] Using per-sample prediction for {ml_model.model_name} (model={'None' if ml_model.model is None else 'available'})")
                 for i in range(len(X_train)):
                     x_dict = {feature_cols[j]: float(X_train[i, j]) for j in range(len(feature_cols))}
                     try:
@@ -613,13 +780,19 @@ def compute_ml_residuals(
                     probas.append(None)  # No probabilities for classification
         else:
             # Regression: use batch prediction for efficiency and accuracy (matching baseline evaluation)
-            if hasattr(ml_model, "model") and hasattr(ml_model.model, "predict"):
+            if can_use_batch:
                 # Direct batch prediction for efficiency (same as baseline evaluation)
-                predictions_batch = ml_model.model.predict(X_train)
+                if requires_dataframe:
+                    # TabICL needs DataFrame
+                    X_train_df = pd.DataFrame(X_train, columns=ml_model._tabicl_feature_cols)
+                    predictions_batch = ml_model.model.predict(X_train_df)
+                else:
+                    predictions_batch = ml_model.model.predict(X_train)
                 predictions = predictions_batch.tolist()
                 probas = [None] * len(predictions)
             else:
-                # Fallback to per-sample prediction (for models without direct sklearn interface)
+                # Fallback to per-sample prediction (required for TabPFN, or when model is None)
+                logger.info(f"[Residuals] Using per-sample prediction for {ml_model.model_name} (model={'None' if ml_model.model is None else 'available'})")
                 for i in range(len(X_train)):
                     x_dict = {feature_cols[j]: float(X_train[i, j]) for j in range(len(feature_cols))}
                     try:

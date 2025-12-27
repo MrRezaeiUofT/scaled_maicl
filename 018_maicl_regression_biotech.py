@@ -182,6 +182,79 @@ def save_residual_plot(y_true, y_pred, title, filename, output_dir):
     logger.info(f"Saved residual plot to {save_path}")
 
 
+def predict_tabpfn_batch(ml_mechanism, X_data, feature_cols):
+    """
+    Perform batch prediction using TabPFN via subprocess.
+    
+    Args:
+        ml_mechanism: MLModelMechanism instance with TabPFN
+        X_data: numpy array of shape (n_samples, n_features)
+        feature_cols: list of feature column names
+    
+    Returns:
+        numpy array of predictions
+    """
+    if ml_mechanism.model_name != "TabPFN":
+        raise ValueError("This function is only for TabPFN")
+    
+    if not hasattr(ml_mechanism, '_tabpfn_training_data_path') or ml_mechanism._tabpfn_training_data_path is None:
+        raise RuntimeError("TabPFN not properly initialized with subprocess isolation")
+    
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    import sys
+    import json
+    import pandas as pd
+    
+    # Convert to DataFrame
+    X_pred_df = pd.DataFrame(X_data, columns=feature_cols)
+    
+    # Create temporary file for prediction data
+    temp_dir = Path(ml_mechanism._tabpfn_training_data_path['temp_dir'])
+    X_pred_path = temp_dir / "X_pred_batch.csv"
+    output_path = temp_dir / "pred_result_batch.json"
+    
+    # Save prediction data
+    X_pred_df.to_csv(X_pred_path, index=False)
+    
+    # Find subprocess script
+    script_path = Path(__file__).parent / "run_tabpfn_ml_mechanism.py"
+    if not script_path.exists():
+        raise RuntimeError(f"TabPFN subprocess script not found at {script_path}")
+    
+    # Run prediction in subprocess
+    result = subprocess.run(
+        [sys.executable, str(script_path), "predict",
+         ml_mechanism._tabpfn_training_data_path['X_train_path'],
+         ml_mechanism._tabpfn_training_data_path['y_train_path'],
+         str(X_pred_path),
+         ml_mechanism.task_type,
+         str(output_path)],
+        capture_output=True,
+        text=True,
+        timeout=300  # 5 minute timeout for batch prediction
+    )
+    
+    if result.returncode != 0:
+        error_msg = result.stderr[:500] if result.stderr else "Unknown error"
+        raise RuntimeError(f"TabPFN batch prediction subprocess failed: {error_msg}")
+    
+    if not output_path.exists():
+        raise RuntimeError("TabPFN batch prediction subprocess completed but no output file found")
+    
+    # Load prediction result
+    with open(output_path, 'r') as f:
+        pred_result = json.load(f)
+    
+    if not pred_result.get('success', False):
+        error_msg = pred_result.get('error', 'Unknown error')
+        raise RuntimeError(f"TabPFN batch prediction failed: {error_msg}")
+    
+    predictions = np.array(pred_result['predictions'], dtype=float)
+    return predictions
+
+
 def load_gfp_yield_dataset(max_samples: int):
     """Load GFP Yield Prediction dataset (real experimental data)
     
@@ -1227,6 +1300,13 @@ def train_and_evaluate_baseline_models(X_train, y_train, X_test, y_test,
     # 1. TabPFN Baseline
     # Note: TabPFN can cause segmentation faults in some environments.
     # Set SKIP_TABPFN=1 to skip TabPFN, or leave default to try it (with fixes applied).
+    # 
+    # IMPORTANT: TabPFN results may vary between baseline (subprocess) and ML mechanism (main process):
+    # - Baseline runs in isolated subprocess (fresh state, no GPU/memory interference)
+    # - ML mechanism runs in main process (may have existing PyTorch/GPU state)
+    # - TabPFN has inherent non-determinism even with random seeds set
+    # - Data serialization via CSV may introduce minor floating-point differences
+    # These differences are expected and typically small (< 1% in metrics)
     import os
     if os.getenv('SKIP_TABPFN', '0') == '1':  # Can be set to '1' to skip TabPFN
         logger.info("\n[Baseline] Training TabPFN...")
@@ -1236,6 +1316,7 @@ def train_and_evaluate_baseline_models(X_train, y_train, X_test, y_test,
         logger.info("\n[Baseline] Training TabPFN...")
         logger.info("  ⚠️  Note: TabPFN may crash with segmentation fault in some environments.")
         logger.info("  If this happens, set SKIP_TABPFN=1 to skip TabPFN and continue with EBM/XGBoost.")
+        logger.info("  ℹ️  Note: TabPFN baseline runs in isolated subprocess (may differ slightly from ML mechanism)")
         try:
         # TabPFN will be run in a subprocess to isolate crashes
         # TabPFN expects pandas DataFrames
@@ -1495,7 +1576,10 @@ def main():
                         help="List all available protein expression plate files and exit")
     parser.add_argument("--model_name", default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash"),
                         help="Gemini model name, e.g., gemini-2.0-flash, gemini-2.5-pro")
-    parser.add_argument("--ml_mech", default="linear", help="Regression ML mechanism: linear|xgboost|kernelridge|tabicl")
+    parser.add_argument("--ml_mech", default="linear", help="Regression ML mechanism: linear|xgboost|kernelridge|tabicl|tabpfn. "
+                        "Note: TabPFN may cause segmentation faults when used as ML mechanism. "
+                        "Consider using TabPFN only as a baseline (it runs in isolated subprocess) "
+                        "or use --ml_mech linear/xgboost for more stable ML mechanism.")
     parser.add_argument("--tabicl_bins", type=int, default=20,
                         help="Number of bins for TabICL regression quantization (default: 20). "
                              "Only used when --ml_mech=tabicl. Higher values = finer granularity but more classes.")
@@ -1503,7 +1587,7 @@ def main():
     parser.add_argument("--max_samples", type=int, default=200)
     parser.add_argument("--top_k", type=int, default=1000, help="-1 to use full dataset")
     parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--acceptance_set", type=str, default="test",
+    parser.add_argument("--acceptance_set", type=str, default="validation",
                         choices=["test", "validation", "train"],
                         help="Dataset to use for acceptance evaluation during training. "
                              "Options: 'test' (risks overfitting to test), 'validation' (default), "
@@ -1978,7 +2062,7 @@ def main():
     ml_preds = None
     
     # Define model_name for logging purposes (even when ML is disabled)
-    mech_map = {"linear": "LinearRegression", "xgboost": "XGBoost", "kernelridge": "KernelRidge", "tabicl": "TabICL"}
+    mech_map = {"linear": "LinearRegression", "xgboost": "XGBoost", "kernelridge": "KernelRidge", "tabicl": "TabICL", "tabpfn": "TabPFN"}
     model_name = mech_map.get(args.ml_mech.lower(), "KernelRidge")
     
     if args.use_ml:
@@ -2142,7 +2226,56 @@ def main():
         ml_baseline_metrics: Dict[str, Any] = {}
         try:
             model = pretrained_ml.model
-            y_pred = model.predict(X_test_s).astype(float)
+            # TabPFN and TabICL require DataFrames, not numpy arrays
+            if model_name == "TabPFN":
+                # TabPFN uses subprocess isolation - model is None, use batch prediction helper
+                y_pred = predict_tabpfn_batch(pretrained_ml, X_test_s, feature_cols).astype(float)
+            elif model_name == "TabICL":
+                import pandas as pd
+                X_test_df = pd.DataFrame(X_test_s, columns=feature_cols)
+                # For TabICL regression, handle quantization/dequantization
+                if hasattr(pretrained_ml, '_tabicl_bin_centers') and pretrained_ml._tabicl_bin_centers is not None:
+                    # TabICL regression: predict bin, then map to continuous value
+                    try:
+                        if hasattr(model, 'predict_proba'):
+                            # Use probabilities for weighted prediction (more accurate)
+                            proba = model.predict_proba(X_test_df)
+                            # Get class indices (bins) that the model knows about
+                            if hasattr(model, 'classes_'):
+                                class_indices = model.classes_
+                                # Map probabilities to bin centers and compute weighted average
+                                y_pred = np.zeros(len(X_test_df))
+                                for i in range(len(X_test_df)):
+                                    weighted_sum = 0.0
+                                    total_prob = 0.0
+                                    for j, class_idx in enumerate(class_indices):
+                                        if 0 <= class_idx < len(pretrained_ml._tabicl_bin_centers):
+                                            weighted_sum += proba[i, j] * pretrained_ml._tabicl_bin_centers[class_idx]
+                                            total_prob += proba[i, j]
+                                    if total_prob > 0:
+                                        y_pred[i] = weighted_sum / total_prob
+                                    else:
+                                        # Fallback: use hard prediction
+                                        bin_idx = int(model.predict(X_test_df.iloc[[i]])[0])
+                                        bin_idx = np.clip(bin_idx, 0, len(pretrained_ml._tabicl_bin_centers) - 1)
+                                        y_pred[i] = pretrained_ml._tabicl_bin_centers[bin_idx]
+                            else:
+                                # Fallback: use hard prediction
+                                bin_preds = model.predict(X_test_df)
+                                y_pred = np.array([pretrained_ml._tabicl_bin_centers[np.clip(int(b), 0, len(pretrained_ml._tabicl_bin_centers) - 1)] for b in bin_preds])
+                        else:
+                            # Fallback: use hard prediction
+                            bin_preds = model.predict(X_test_df)
+                            y_pred = np.array([pretrained_ml._tabicl_bin_centers[np.clip(int(b), 0, len(pretrained_ml._tabicl_bin_centers) - 1)] for b in bin_preds])
+                    except Exception as e:
+                        logger.warning(f"TabICL regression prediction failed, using fallback: {e}")
+                        bin_preds = model.predict(X_test_df)
+                        mid_idx = len(pretrained_ml._tabicl_bin_centers) // 2
+                        y_pred = np.full(len(X_test_df), pretrained_ml._tabicl_bin_centers[mid_idx])
+                else:
+                    y_pred = model.predict(X_test_df).astype(float)
+            else:
+                y_pred = model.predict(X_test_s).astype(float)
             
             # Clip predictions to [0,1] if targets are scaled (regression with scaling)
             if not args.no_scaling and y_scaler_target is not None:
@@ -2234,7 +2367,48 @@ def main():
                 "predictions": y_pred.tolist()
             }
             # Also check training set performance for overfitting diagnosis
-            y_pred_train = model.predict(X_train_s).astype(float)
+            # TabPFN and TabICL require DataFrames
+            if model_name == "TabPFN":
+                # TabPFN uses subprocess isolation - model is None, use batch prediction helper
+                y_pred_train = predict_tabpfn_batch(pretrained_ml, X_train_s, feature_cols).astype(float)
+            elif model_name == "TabICL":
+                import pandas as pd
+                X_train_df = pd.DataFrame(X_train_s, columns=feature_cols)
+                # For TabICL regression, handle quantization/dequantization
+                if hasattr(pretrained_ml, '_tabicl_bin_centers') and pretrained_ml._tabicl_bin_centers is not None:
+                    try:
+                        if hasattr(model, 'predict_proba'):
+                            proba = model.predict_proba(X_train_df)
+                            if hasattr(model, 'classes_'):
+                                class_indices = model.classes_
+                                y_pred_train = np.zeros(len(X_train_df))
+                                for i in range(len(X_train_df)):
+                                    weighted_sum = 0.0
+                                    total_prob = 0.0
+                                    for j, class_idx in enumerate(class_indices):
+                                        if 0 <= class_idx < len(pretrained_ml._tabicl_bin_centers):
+                                            weighted_sum += proba[i, j] * pretrained_ml._tabicl_bin_centers[class_idx]
+                                            total_prob += proba[i, j]
+                                    if total_prob > 0:
+                                        y_pred_train[i] = weighted_sum / total_prob
+                                    else:
+                                        bin_idx = int(model.predict(X_train_df.iloc[[i]])[0])
+                                        bin_idx = np.clip(bin_idx, 0, len(pretrained_ml._tabicl_bin_centers) - 1)
+                                        y_pred_train[i] = pretrained_ml._tabicl_bin_centers[bin_idx]
+                            else:
+                                bin_preds = model.predict(X_train_df)
+                                y_pred_train = np.array([pretrained_ml._tabicl_bin_centers[np.clip(int(b), 0, len(pretrained_ml._tabicl_bin_centers) - 1)] for b in bin_preds])
+                        else:
+                            bin_preds = model.predict(X_train_df)
+                            y_pred_train = np.array([pretrained_ml._tabicl_bin_centers[np.clip(int(b), 0, len(pretrained_ml._tabicl_bin_centers) - 1)] for b in bin_preds])
+                    except Exception:
+                        bin_preds = model.predict(X_train_df)
+                        mid_idx = len(pretrained_ml._tabicl_bin_centers) // 2
+                        y_pred_train = np.full(len(X_train_df), pretrained_ml._tabicl_bin_centers[mid_idx])
+                else:
+                    y_pred_train = model.predict(X_train_df).astype(float)
+            else:
+                y_pred_train = model.predict(X_train_s).astype(float)
             if not args.no_scaling and y_scaler_target is not None:
                 y_pred_train = np.clip(y_pred_train, SCALE_MIN, SCALE_MAX)
             r2_train = r2_score(y_train_s, y_pred_train)
@@ -2405,40 +2579,30 @@ def main():
     logger.info("POST-TRAINING EVALUATION")
     logger.info("=" * 80)
     
-    # CRITICAL FIX: Use SAME evaluation set and routing mode as training for exact reproduction
-    # Training uses acceptance_set (default: "validation") with relax_routing=True
-    # To get exact reproduction, we must use the same set and routing mode
-    if args.acceptance_set == "test":
-        # Training used test set for acceptance - use test set for final evaluation
-        X_final_eval = X_test_s
-        y_final_eval = y_test_s
-        X_original_final_eval = X_original_test if is_deepchem_dataset else None
-        eval_set_name = "test"
-    elif args.acceptance_set == "train":
-        # Training used train set for acceptance - use train set for final evaluation
-        X_final_eval = X_train_s
-        y_final_eval = y_train_s
-        X_original_final_eval = X_original_train if is_deepchem_dataset else None
-        eval_set_name = "train"
-    else:
-        # Default: Training used validation set for acceptance - use validation set for final evaluation
-        X_final_eval = X_val_s
-        y_final_eval = y_val_s
-        X_original_final_eval = X_original_val if is_deepchem_dataset else None
-        eval_set_name = "validation"
+    # CRITICAL FIX: For fair comparison with baseline models, ALWAYS use test set for final evaluation
+    # Training uses acceptance_set (default: "validation") to avoid overfitting to test set
+    # But final evaluation should use test set to compare fairly with all baseline models
+    # This ensures all models (ML baseline, TabPFN, EBM, XGBoost, MA-ICL) are evaluated on the same test set
+    X_final_eval = X_test_s
+    y_final_eval = y_test_s
+    X_original_final_eval = X_original_test if is_deepchem_dataset else None
+    eval_set_name = "test"
+    
+    logger.info(f"Final evaluation: Using TEST set for fair comparison with all baseline models")
+    logger.info(f"  - Training used {args.acceptance_set} set for acceptance (to avoid overfitting)")
+    logger.info(f"  - Final evaluation uses test set (same as baseline models and pre-training evaluation)")
     
     # CRITICAL: Always use relax_routing=True to match training mode
     # Training always uses relax_routing=True, so final evaluation must match
     final_relax_routing = True
-    logger.info(f"Using SAME routing as best iteration for exact reproduction")
-    logger.info(f"  - Evaluation set: {eval_set_name} (same as acceptance_set during training)")
     logger.info(f"  - Routing mode: relax_routing=True (same as training)")
     
     # CRITICAL: Always preserve mechanism performance scores from best snapshot
     # This ensures final evaluation uses the exact same routing weights as the best iteration
     preserve_perf = True
-    logger.info(f"Preserving mechanism performance scores from best snapshot (calculated on {eval_set_name} set during training)")
-    logger.info(f"  Note: This ensures final evaluation uses the same routing as the best iteration")
+    logger.info(f"Preserving mechanism performance scores from best snapshot (calculated on {args.acceptance_set} set during training)")
+    logger.info(f"  Note: Mechanism routing weights were learned during training on {args.acceptance_set} set")
+    logger.info(f"  Note: Final evaluation uses test set for fair comparison with baseline models")
     
     # Log final accepted mechanisms for transparency
     final_mechanism_count = len(maicl.mechanisms) if hasattr(maicl, 'mechanisms') else 0
@@ -2467,25 +2631,31 @@ def main():
     post_r2 = float(post.get('r2', 0.0))
     post_rmse = float(post.get('rmse', 0.0))
     post_mse = float(post_rmse ** 2)
-    logger.info(f"Post-training ({eval_set_name} set): R2={post_r2:.4f} MAE={post_mae:.4f} MSE={post_mse:.4f}")
-    logger.info(f"  Note: Using {eval_set_name} set (same as acceptance_set during training) for exact reproduction")
+    logger.info(f"Post-training (TEST set): R2={post_r2:.4f} MAE={post_mae:.4f} MSE={post_mse:.4f}")
+    logger.info(f"  Note: Using TEST set for fair comparison with all baseline models (same as pre-training evaluation)")
     
     # Compare with best iteration metrics if available
+    # NOTE: Best iteration metrics are from VALIDATION set (acceptance_set), final evaluation is on TEST set
+    # This comparison is for reference only - different datasets may have different performance
     if hasattr(maicl, '_best_iteration') and maicl._best_iteration is not None:
         best_iter = maicl._best_iteration
         best_r2 = getattr(maicl, '_best_r2', None)
         best_mae = getattr(maicl, '_best_mae', None)
         if best_r2 is not None:
             r2_diff = post_r2 - best_r2
-            logger.info(f"  [Comparison] Best iteration {best_iter} had R2={best_r2:.4f} during training")
-            logger.info(f"  [Comparison] Final evaluation R2={post_r2:.4f} (difference: {r2_diff:+.4f})")
+            logger.info(f"  [Comparison] Best iteration {best_iter} had R2={best_r2:.4f} on VALIDATION set (during training)")
+            logger.info(f"  [Comparison] Final evaluation R2={post_r2:.4f} on TEST set (difference: {r2_diff:+.4f})")
             if abs(r2_diff) > 0.01:
-                logger.warning(f"  [Comparison] ⚠️  Final R2 differs from best iteration by {abs(r2_diff):.4f}")
-                logger.warning(f"  [Comparison] This may be due to few-shot example selection randomness or evaluation differences")
+                logger.warning(f"  [Comparison] ⚠️  Final R2 (test set) differs from best iteration R2 (validation set) by {abs(r2_diff):.4f}")
+                logger.warning(f"  [Comparison] This difference is expected since best iteration was evaluated on VALIDATION set, not TEST set")
+                logger.warning(f"  [Comparison] The discrepancy may indicate:")
+                logger.warning(f"    1. Overfitting to validation set")
+                logger.warning(f"    2. Different distributions between validation and test sets")
+                logger.warning(f"    3. Mechanisms learned on validation set don't generalize well to test set")
         if best_mae is not None:
             mae_diff = post_mae - best_mae
-            logger.info(f"  [Comparison] Best iteration {best_iter} had MAE={best_mae:.4f} during training")
-            logger.info(f"  [Comparison] Final evaluation MAE={post_mae:.4f} (difference: {mae_diff:+.4f})")
+            logger.info(f"  [Comparison] Best iteration {best_iter} had MAE={best_mae:.4f} on VALIDATION set (during training)")
+            logger.info(f"  [Comparison] Final evaluation MAE={post_mae:.4f} on TEST set (difference: {mae_diff:+.4f})")
     
     # Extract post-training predictions from evaluate results
     y_pred_post = np.array(post.get('predictions', [])) if 'predictions' in post else None

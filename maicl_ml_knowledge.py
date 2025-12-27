@@ -44,6 +44,11 @@ def extract_ml_knowledge(ml_mechanism, feature_cols: List[str], task_type: str =
         model = ml_mechanism.model
         model_name = getattr(ml_mechanism, "model_name", "unknown")
         
+        # TabPFN uses subprocess isolation - model is None, skip feature extraction
+        if model_name == "TabPFN" and model is None:
+            logger.debug("TabPFN model is None (subprocess isolation) - skipping feature extraction")
+            return knowledge
+        
         # Extract feature importance/coefficients based on model type
         if model_name in ["LinearRegression", "LogisticRegression"]:
             # Linear models: use coefficients
@@ -751,14 +756,40 @@ def analyze_ml_failure_patterns(ml_mechanism,
     try:
         model = ml_mechanism.model
         
+        # Handle TabPFN specially (uses subprocess, model is None)
+        if ml_mechanism.model_name == "TabPFN" and model is None:
+            # Use per-sample prediction via ml_mechanism.predict() method
+            # This is slower but works for TabPFN subprocess isolation
+            y_pred = []
+            for i in range(len(X)):
+                x_dict = {feature_cols[j]: float(X[i, j]) for j in range(len(feature_cols))}
+                try:
+                    pred = ml_mechanism.predict(x_dict, return_class_index=(task_type == "classification"))
+                    y_pred.append(pred)
+                except Exception:
+                    y_pred.append(0.0)
+            y_pred = np.array(y_pred, dtype=float)
+        else:
+            # Standard models: use batch prediction
+            # TabPFN and TabICL require DataFrames
+            if ml_mechanism.model_name in ["TabPFN", "TabICL"]:
+                import pandas as pd
+                if ml_mechanism.model_name == "TabPFN":
+                    X_df = pd.DataFrame(X, columns=ml_mechanism._tabpfn_feature_cols)
+                else:  # TabICL
+                    X_df = pd.DataFrame(X, columns=ml_mechanism._tabicl_feature_cols)
+                y_pred = model.predict(X_df).astype(float)
+            else:
+                y_pred = model.predict(X).astype(float)
+        
         # Get predictions and compute errors
         if task_type == "classification":
-            y_pred = model.predict(X).astype(int)
+            y_pred = y_pred.astype(int)
             y_true = y.astype(int)
             errors = (y_pred != y_true).astype(float)
             error_magnitude = errors  # 0 or 1
         else:
-            y_pred = model.predict(X).astype(float)
+            y_pred = y_pred.astype(float)
             y_true = y.astype(float)
             errors = y_true - y_pred
             error_magnitude = np.abs(errors)

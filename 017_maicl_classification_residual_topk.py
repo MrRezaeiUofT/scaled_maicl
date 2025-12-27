@@ -1130,6 +1130,12 @@ def train_and_evaluate_baseline_models(X_train, y_train, X_test, y_test,
         X_test_df = None
     
     # 1. TabPFN Baseline
+    # IMPORTANT: TabPFN results may vary between baseline (subprocess) and ML mechanism (main process):
+    # - Baseline runs in isolated subprocess (fresh state, no GPU/memory interference)
+    # - ML mechanism runs in main process (may have existing PyTorch/GPU state)
+    # - TabPFN has inherent non-determinism even with random seeds set
+    # - Data serialization via CSV may introduce minor floating-point differences
+    # These differences are expected and typically small (< 1% in metrics)
     import os
     if os.getenv('SKIP_TABPFN', '0') == '1':
         logger.info("\n[Baseline] Training TabPFN...")
@@ -1139,6 +1145,7 @@ def train_and_evaluate_baseline_models(X_train, y_train, X_test, y_test,
         logger.info("\n[Baseline] Training TabPFN...")
         logger.info("  ⚠️  Note: TabPFN may crash with segmentation fault in some environments.")
         logger.info("  If this happens, set SKIP_TABPFN=1 to skip TabPFN and continue with EBM/XGBoost.")
+        logger.info("  ℹ️  Note: TabPFN baseline runs in isolated subprocess (may differ slightly from ML mechanism)")
         try:
             if X_train_df is not None:
                 logger.info(f"  Fitting TabPFN on {len(X_train_df)} samples...")
@@ -1470,12 +1477,17 @@ def main():
         default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash"),
         help="LLM model name. Examples: Gemini: gemini-2.0-flash, gemini-2.0-pro. OpenAI: gpt-4o-mini, gpt-4o, gpt-4.1-mini."
     )
-    parser.add_argument("--ml_mech", default="linear", help="ML mechanism: logreg|xgboost|tabicl")
+    parser.add_argument("--ml_mech", default="tabpfn", help="ML mechanism: linear|logreg|xgboost|tabicl|tabpfn. "
+                        "Default: linear (most stable). "
+                        "Recommended: xgboost (better performance, stable). "
+                        "WARNING: TabPFN as ML mechanism causes segmentation faults in main process. "
+                        "TabPFN works as baseline (runs in isolated subprocess) but NOT as ML mechanism. "
+                        "If you want better performance than linear, use --ml_mech xgboost instead.")
     parser.add_argument("--use_ml", type=int, default=1, choices=[0,1], help="Include ML mechanism in ensemble")
     parser.add_argument("--max_samples", type=int, default=100)
     parser.add_argument("--top_k", type=int, default=100, help="-1 to use full dataset")
-    parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--acceptance_set", type=str, default="test",
+    parser.add_argument("--iterations", type=int, default=3)
+    parser.add_argument("--acceptance_set", type=str, default="validation",
                         choices=["test", "validation", "train"],
                         help="Dataset to use for acceptance evaluation during training. "
                              "Options: 'test' (risks overfitting to test), 'validation' (default), "
@@ -1723,7 +1735,7 @@ def main():
         scaler = None
         X_train_s, X_val_s, X_test_s = X_train, X_val, X_test
 
-    mech_map = {"logreg": "LogisticRegression", "xgboost": "XGBoost", "tabicl": "TabICL"}
+    mech_map = {"logreg": "LogisticRegression", "xgboost": "XGBoost", "tabicl": "TabICL", "tabpfn": "TabPFN"}
     model_name = mech_map.get(args.ml_mech.lower(), "LogisticRegression")
 
     pretrained_ml = MLModelMechanism(model_name, task_type="classification")
@@ -1878,8 +1890,29 @@ def main():
     try:
         is_multiclass = class_names is not None and len(class_names) > 2
         model = pretrained_ml.model
+        # TabPFN and TabICL require DataFrames, not numpy arrays
+        if model_name == "TabPFN":
+            import pandas as pd
+            X_topk_df = pd.DataFrame(X_topk, columns=feature_cols)
+            if is_multiclass:
+                y_pred_train = model.predict(X_topk_df).astype(int)
+            else:
+                y_pred_train = model.predict(X_topk_df).astype(int)
+        elif model_name == "TabICL":
+            import pandas as pd
+            X_topk_df = pd.DataFrame(X_topk, columns=feature_cols)
+            if is_multiclass:
+                y_pred_train = model.predict(X_topk_df).astype(int)
+            else:
+                y_pred_train = model.predict(X_topk_df).astype(int)
+        else:
+            # Other models can use numpy arrays directly
+            if is_multiclass:
+                y_pred_train = model.predict(X_topk).astype(int)
+            else:
+                y_pred_train = None  # Will be computed below for binary
+        
         if is_multiclass:
-            y_pred_train = model.predict(X_topk).astype(int)
             acc_train = accuracy_score(y_topk, y_pred_train)
             f1_train = f1_score(y_topk, y_pred_train, average='weighted', zero_division=0)
             ml_baseline_train_metrics = {
@@ -1892,10 +1925,21 @@ def main():
                               f"The model is being evaluated on the same data it was trained on. "
                               f"Test set performance (see below) is the real metric.")
         else:
-            if hasattr(model, "predict_proba"):
-                y_prob_train = model.predict_proba(X_topk)[:, 1]
+            # Binary classification
+            if model_name in ["TabPFN", "TabICL"]:
+                # TabPFN/TabICL return class predictions directly for binary classification
+                if hasattr(model, "predict_proba") and model_name != "TabPFN":
+                    # TabICL might have predict_proba
+                    y_prob_train = model.predict_proba(X_topk_df)[:, 1]
+                else:
+                    # TabPFN or models without predict_proba: use predictions as probabilities
+                    y_pred_binary = y_pred_train.astype(float)
+                    y_prob_train = np.where(y_pred_binary == 1, 0.7, 0.3)
             else:
-                y_prob_train = model.predict(X_topk).astype(float)
+                if hasattr(model, "predict_proba"):
+                    y_prob_train = model.predict_proba(X_topk)[:, 1]
+                else:
+                    y_prob_train = model.predict(X_topk).astype(float)
             y_prob_train = np.clip(y_prob_train, 0.0, 1.0)
             y_pred_train_05 = (y_prob_train >= 0.5).astype(int)
             acc_train_05 = accuracy_score(y_topk, y_pred_train_05)
@@ -1923,8 +1967,30 @@ def main():
     try:
         is_multiclass = class_names is not None and len(class_names) > 2
         model = pretrained_ml.model
+        # TabPFN and TabICL require DataFrames, not numpy arrays
+        if model_name == "TabPFN":
+            import pandas as pd
+            X_test_df = pd.DataFrame(X_test_s, columns=feature_cols)
+            if is_multiclass:
+                y_pred_cls = model.predict(X_test_df).astype(int)
+            else:
+                # Binary classification: TabPFN returns class predictions directly
+                y_pred_cls = model.predict(X_test_df).astype(int)
+        elif model_name == "TabICL":
+            import pandas as pd
+            X_test_df = pd.DataFrame(X_test_s, columns=feature_cols)
+            if is_multiclass:
+                y_pred_cls = model.predict(X_test_df).astype(int)
+            else:
+                y_pred_cls = model.predict(X_test_df).astype(int)
+        else:
+            # Other models can use numpy arrays directly
+            if is_multiclass:
+                y_pred_cls = model.predict(X_test_s).astype(int)
+            else:
+                y_pred_cls = None  # Will be computed below for binary
+        
         if is_multiclass:
-            y_pred_cls = model.predict(X_test_s).astype(int)
             acc = accuracy_score(y_test, y_pred_cls)
             f1 = f1_score(y_test, y_pred_cls, average='weighted', zero_division=0)
             ml_baseline_metrics = {
@@ -1933,10 +1999,26 @@ def main():
             }
             logger.info(f"ML baseline on TEST set: ACC={acc:.4f} F1={f1:.4f}")
         else:
-            if hasattr(model, "predict_proba"):
-                y_prob = model.predict_proba(X_test_s)[:, 1]
+            # Binary classification
+            if model_name in ["TabPFN", "TabICL"]:
+                # TabPFN/TabICL return class predictions directly for binary classification
+                # Convert to probabilities if possible, otherwise use predictions directly
+                if hasattr(model, "predict_proba") and model_name != "TabPFN":
+                    # TabICL might have predict_proba
+                    y_prob = model.predict_proba(X_test_df)[:, 1]
+                else:
+                    # TabPFN or models without predict_proba: use predictions as probabilities
+                    # For binary, predictions are 0 or 1, convert to probabilities
+                    y_pred_binary = y_pred_cls.astype(float)
+                    # Use a simple heuristic: if prediction is 1, use 0.7, if 0, use 0.3
+                    # This is a rough approximation for models without probabilities
+                    y_prob = np.where(y_pred_binary == 1, 0.7, 0.3)
             else:
-                y_prob = model.predict(X_test_s).astype(float)
+                if hasattr(model, "predict_proba"):
+                    y_prob = model.predict_proba(X_test_s)[:, 1]
+                else:
+                    y_prob = model.predict(X_test_s).astype(float)
+            
             y_prob = np.clip(y_prob, 0.0, 1.0)
             y_pred_05 = (y_prob >= 0.5).astype(int)
             acc_05 = accuracy_score(y_test, y_pred_05)

@@ -13,6 +13,20 @@ from pathlib import Path
 def run_tabpfn(X_train_path, y_train_path, X_test_path, output_path):
     """Run TabPFN classifier and save results to JSON file."""
     try:
+        # Set random seeds for reproducibility (TabPFN may still have some non-determinism)
+        RANDOM_STATE = 42
+        np.random.seed(RANDOM_STATE)
+        try:
+            import torch
+            torch.manual_seed(RANDOM_STATE)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(RANDOM_STATE)
+                torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+        except:
+            pass
+        
         # Load data
         X_train = pd.read_csv(X_train_path)
         y_train = np.load(y_train_path)
@@ -22,7 +36,7 @@ def run_tabpfn(X_train_path, y_train_path, X_test_path, output_path):
         from tabpfn import TabPFNClassifier
         from tabpfn.constants import ModelVersion
         
-        # Clear PyTorch cache
+        # Clear PyTorch cache again after import
         try:
             import torch
             if torch.cuda.is_available():
@@ -33,6 +47,10 @@ def run_tabpfn(X_train_path, y_train_path, X_test_path, output_path):
             pass
         
         # Initialize and train TabPFN
+        # NOTE: TabPFN may still produce slightly different results due to:
+        # 1. Non-deterministic operations in PyTorch (even with seeds)
+        # 2. Different execution contexts (subprocess vs main process)
+        # 3. GPU state differences
         classifier = TabPFNClassifier.create_default_for_version(ModelVersion.V2)
         classifier.fit(X_train, y_train)
         

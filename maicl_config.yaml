@@ -638,7 +638,7 @@ prompts:
           This dataset predicts water solubility (log S in mols/L) from molecular SMILES structures.
           
           CRITICAL CONTEXT:
-          - All data (inputs and outputs) are scaled to [0, 1] range
+          - {scale_info}
           - ML model uses ECFP fingerprints internally, but YOU must work with SMILES strings
           - You will receive SMILES strings as input, NOT ECFP bit features
           
@@ -679,7 +679,7 @@ prompts:
           Generate an interpretable mechanism that predicts water solubility from SMILES molecular structures.
           
           CRITICAL REQUIREMENTS:
-          1. ALL VALUES ARE SCALED TO [0, 1] RANGE - your formula output must be in [0, 1]
+          1. {scale_info}
           2. Use SMILES-derived molecular properties (NOT ECFP bit features)
           3. Work with interpretable molecular properties extracted from SMILES strings
           4. Formula must be executable and mathematically sound
@@ -702,14 +702,14 @@ prompts:
           - Halogen: -0.05 to -0.15 per halogen atom (negative effect)
           - Aromatic rings: -0.05 to -0.15 per ring (strong negative effect)
           - Nitrogen/Oxygen: +0.02 to +0.08 per atom (moderate positive effect)
-          - Use clip(expression, 0.0, 1.0) to ensure output in [0, 1] range
+          - {scaling_note}
           
           EXAMPLE GOOD FORMULA:
-          Formula: ŷ = clip(0.5 + 0.25 * num_hydroxyl_groups(SMILES) - 0.001 * molecular_weight(SMILES) / 100 - 0.08 * num_halogen(SMILES) - 0.1 * num_aromatic_rings(SMILES) + 0.05 * num_nitrogen(SMILES) + 0.04 * num_oxygen(SMILES), 0.0, 1.0)
+          Formula: ŷ = {example_formula}
           
           DO NOT:
           - Use ECFP bit features (ecfp_bit_0, ecfp_bit_1, etc.)
-          - Output values outside [0, 1] range
+          - {output_range_warning}
           - Use coefficients that are too large (>0.5 for single features)
           - Create overly complex formulas with many interaction terms
           
@@ -717,7 +717,7 @@ prompts:
           - Use simple, interpretable molecular properties
           - Normalize molecular_weight appropriately (divide by 200-500)
           - Keep coefficients in reasonable ranges
-          - Ensure formula outputs values in [0, 1] using clip()
+          - {ensure_output_range}
           - Focus on the key solubility factors: hydroxyl groups (positive), halogens/rings (negative), molecular weight (negative)
       
       delaney:
@@ -749,7 +749,7 @@ prompts:
           REQUIRED OUTPUT FORMAT:
           MECHANISM DESCRIPTION: 3-5 sentences (include at least one nonlinearity + one interaction).
           INTERMEDIATE CONCEPTS: 1-3 named concepts (e.g., hydrophobic_bulk, polarity_counterweight).
-          Formula: ŷ = clip(expression, 0.0, 1.0)  (single line; inline intermediates)
+          Formula: ŷ = {formula_template}  (single line; inline intermediates)
       
       lipophilicity:
         encoder: |
@@ -844,7 +844,7 @@ prompts:
           - MECHANISM DESCRIPTION: 3-5 sentences (focus on key nonlinearities + interactions)
           - INTERMEDIATE CONCEPTS: 1-3 named combinatory variables (define briefly)
           - A SINGLE-LINE formula starting with "Formula:" (so it can be extracted programmatically)
-            If scaled, use: Formula: ŷ = clip(expression, 0.0, 1.0)
+            If scaled, use: Formula: ŷ = clip(expression, {scale_min}, {scale_max})
           
           The final Formula line must inline/expand any intermediate concepts (do not reference intermediate variable names).
           
@@ -890,7 +890,7 @@ prompts:
           
           Use actual feature names: "Temperature (deg C)", "Potassium concentration (mM)", "Magnesium concentration (mM)", "NTPs concentration (mM)", "DNA concentration (nM)"
           
-          All values are scaled to [0, 1]. Adjust Km values accordingly (e.g., if Mg is scaled, Km_Mg should be ~0.08-0.12 for 8-12 mM).
+          {scale_info} Adjust Km values accordingly based on the scaling range.
           
           Output a formula that captures these biochemical relationships with appropriate coefficients and saturation constants.
       
@@ -929,7 +929,7 @@ prompts:
           
           FINAL FORMULA (must be one line):
           - Start with "Formula:" on a single line
-          - Use clip(expression, 0.0, 1.0) if scaled
+          - Use clip(expression, {scale_min}, {scale_max}) if scaled
           - Inline/expand intermediate concepts inside the expression (do not reference intermediate names)
 
       protein_expression_all:
@@ -950,7 +950,7 @@ prompts:
           REQUIRED OUTPUT FORMAT (regression):
           MECHANISM DESCRIPTION: 3-5 sentences.
           INTERMEDIATE CONCEPTS: 1-3 named concepts (describe each).
-          Formula: ŷ = clip(expression, 0.0, 1.0)  (single line; inline intermediates)
+          Formula: ŷ = {formula_template}  (single line; inline intermediates)
       
       dataset_102:
         encoder: |
@@ -1018,7 +1018,7 @@ prompts:
             REQUIRED OUTPUT FORMAT (regression):
             MECHANISM DESCRIPTION: 3-5 sentences.
             INTERMEDIATE CONCEPTS: 1-3 named concepts.
-            Formula: ŷ = clip(expression, 0.0, 1.0)  (single line; inline intermediates)
+            Formula: ŷ = {formula_template}  (single line; inline intermediates)
       
       olea:
         encoder: |
@@ -1057,7 +1057,7 @@ prompts:
             REQUIRED OUTPUT FORMAT:
             MECHANISM DESCRIPTION: 3-5 sentences.
             INTERMEDIATE CONCEPTS: 1-3 named concepts.
-            Formula: ŷ = clip(expression, 0.0, 1.0)
+            Formula: ŷ = {formula_template}
       
       halogenase_nabr:
         encoder: |
@@ -1088,7 +1088,7 @@ prompts:
             Include binding/compatibility interactions and at least one inhibitory term for extreme substrate complexity.
             Output a single-line regression formula clipped to [0,1] if scaled.
             
-            Formula: ŷ = clip(expression, 0.0, 1.0)
+            Formula: ŷ = {formula_template}
       
       halogenase_nacl:
         encoder: |
@@ -1113,7 +1113,7 @@ prompts:
             You are a mechanism decoder for halogenase (NaCl) enzyme activity REGRESSION dataset.
             Use nonlinearities + interactions; output a clipped regression formula.
             
-            Formula: ŷ = clip(expression, 0.0, 1.0)
+            Formula: ŷ = {formula_template}
       
       phosphatase_achiral:
         encoder: |
@@ -1138,7 +1138,7 @@ prompts:
             You are a mechanism decoder for phosphatase (achiral) enzyme activity REGRESSION dataset.
             Include saturation + inhibition (too complex substrates reduce activity) and a seq×smiles compatibility interaction.
             
-            Formula: ŷ = clip(expression, 0.0, 1.0)
+            Formula: ŷ = {formula_template}
       
       phosphatase_chiral:
         encoder: |
@@ -1163,7 +1163,7 @@ prompts:
             You are a mechanism decoder for phosphatase (chiral) enzyme activity REGRESSION dataset.
             Use nonlinearities + interactions; output a clipped regression formula.
             
-            Formula: ŷ = clip(expression, 0.0, 1.0)
+            Formula: ŷ = {formula_template}
 
       nitrilase:
         encoder: |
@@ -1286,7 +1286,7 @@ prompts:
             You are a mechanism decoder for Davis kinase binding REGRESSION dataset.
             Use compatibility interactions and at least one saturation term; output a single-line clipped regression formula.
             
-            Formula: ŷ = clip(expression, 0.0, 1.0)
+            Formula: ŷ = {formula_template}
 
       davis_filtered:
         encoder: |
@@ -1379,18 +1379,45 @@ prompts:
           - Step 2: Apply age amplification to metabolic_stress
           - Step 3: Incorporate HDL (s3) modulation of risk factors
           - Step 4: Add contributions from other blood markers (s1, s2, s4, s5, s6)
-          - Step 5: Combine all terms and clip to [0, 1]
+          - Step 5: Combine all terms{clip_instruction}
           
-          Formula: ŷ = clip(<single-line expression with all intermediates inlined>, 0.0, 1.0)
+          Formula: ŷ = {formula_template_with_expression}
           
           EXAMPLE STRUCTURE (adapt coefficients based on performance):
           metabolic_stress = (bmi * bp) / (0.2 + bmi * bp)  # Nonlinear BMI×BP synergy with saturation
           age_effect = 1 + 0.5 * age  # Age amplifies metabolic stress
           hdl_protection = 1 / (0.3 + s3)  # Low HDL makes risk worse (inverse relationship)
           lipid_risk = 0.3 * s1 + 0.2 * s2 + 0.2 * s5 - 0.1 * s4  # Combined lipid effects
-          ŷ = clip(metabolic_stress * age_effect * hdl_protection + lipid_risk + 0.1 * s6, 0.0, 1.0)
+          ŷ = {example_final_formula}
           
-          CRITICAL: Your formula must be a SINGLE LINE starting with "Formula: ŷ = clip(..." with all intermediates expanded/inlined.
+          CRITICAL: Your formula must be a SINGLE LINE starting with "Formula: ŷ = {formula_start}..." with all intermediates expanded/inlined.
+          
+          PERFORMANCE OPTIMIZATION GUIDANCE:
+          - The linear ML model achieves R²≈0.47, MAE≈0.14 on this dataset
+          - Your mechanism should target R²>0.50 and MAE<0.13 to improve over baseline
+          - Focus on capturing the high BMI+BP+low HDL cases where ML underestimates (residuals +0.4 to +0.5)
+          - The mechanism from iteration 4 achieved R²=0.54 by using: BMI×BP saturation interaction, age×sex damping, HDL modulation
+          - Key insight: ML fails when multiple risk factors combine (BMI×BP synergy) and when protective factors are low (HDL)
+          - Use coefficients in 0.5-2.0 range for interaction terms, 0.1-0.5 for individual features
+          - Test different saturation constants (K): 0.1-0.5 for normalized features
+          - The best mechanism used: 1.5 * (BMI×BP saturation) * (1 - 0.3*age*sex) * (0.6 + 0.4/(0.1+s3)) + linear terms
+          
+          CRITICAL MECHANISM DESIGN PRINCIPLES:
+          1. BMI×BP INTERACTION IS ESSENTIAL: The linear model fails most on samples with BOTH high BMI AND high BP
+             - Use: (bmi * bp) / (K + bmi * bp) for saturation
+             - Coefficient should be 1.0-2.0 to capture the synergy
+          2. HDL (s3) MODULATION IS CRITICAL: Low HDL makes other risk factors worse
+             - Use: 1 / (K + s3) or (0.6 + 0.4 / (0.1 + s3)) for protective effect
+             - This should MULTIPLY the metabolic stress term, not just add
+          3. AGE AMPLIFICATION: Age makes metabolic stress worse, but can also cause overestimation
+             - Use: (1 + age_factor * age) for amplification OR (1 - damping * age * sex) for correction
+             - The best mechanism used damping: (1 - 0.3 * age * sex) to prevent overestimation
+          4. BLOOD MARKERS (s1-s6): Include with moderate coefficients (0.1-0.3)
+             - s1 (TC), s2 (LDL), s5 (LTG) typically positive
+             - s4 (TCH) may be negative
+             - s6 (GLU) contributes but less than metabolic factors
+          5. AVOID OVERCOMPLICATING: The best mechanism had 1 main interaction (BMI×BP), 1 modulation (HDL), 1 damping (age×sex), plus linear terms
+             - Don't add too many interactions - focus on the key ones that explain the largest residuals
       
       housing:
         encoder: |
@@ -1861,7 +1888,7 @@ prompts:
           - Do NOT write filler like "specific patterns" or "distinctive relationships".
           - For EACH CLASS, you must write concrete, testable statements:
             * Top 3-5 features for that class (by your choice)
-            * Directionality (HIGH/LOW) and approximate ranges (since features are scaled to [0,1])
+            * Directionality (HIGH/LOW) and approximate ranges{feature_range_note}
             * At least one nonlinear effect (saturation / inverse-U / soft-threshold)
             * At least one interaction term (e.g., att2*att3/(K+att2*att3) or gating)
             * A contrast vs at least one confusing class (e.g., "Unlike class 7, class 10 has ...")

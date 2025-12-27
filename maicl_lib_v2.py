@@ -1029,13 +1029,79 @@ class VariationalMechanismGenerator:
         
         if dataset_specific_prompt:
             logger.info(f"Using dataset-specific decoder prompt for '{dataset_name_clean}'")
+            # Format prompt with scaling parameters if available
+            dataset_specific_prompt = self._format_decoder_prompt_with_scaling(dataset_specific_prompt)
             return dataset_specific_prompt
         
         # Fall back to task-type-specific decoder prompt
         logger.debug(f"No dataset-specific decoder prompt found for '{dataset_name_clean}', using general {self.task_type} decoder prompt")
         if self.task_type == "classification":
-            return get_prompt('mechanism_generation.decoder_classification')
-        return get_prompt('mechanism_generation.decoder_default')
+            prompt = get_prompt('mechanism_generation.decoder_classification')
+        else:
+            prompt = get_prompt('mechanism_generation.decoder_default')
+        # Format prompt with scaling parameters if available
+        return self._format_decoder_prompt_with_scaling(prompt)
+    
+    def _format_decoder_prompt_with_scaling(self, prompt: str) -> str:
+        """Format decoder prompt with scaling parameters, replacing placeholders"""
+        if not prompt:
+            return prompt
+        
+        # Get scaling range
+        if self.use_scaling:
+            scale_min, scale_max = self._get_scaling_range()
+            if scale_min is None or scale_max is None:
+                scale_min, scale_max = SCALE_MIN, SCALE_MAX
+            scale_range_str = f"[{scale_min:.1f}, {scale_max:.1f}]"
+            scale_info = f"All data (inputs and outputs) are scaled to {scale_range_str} range."
+            scaling_note = f"Output MUST be clipped to {scale_range_str} using clip(expression, {scale_min:.1f}, {scale_max:.1f})"
+            formula_template = f"clip(expression, {scale_min:.1f}, {scale_max:.1f})"
+            formula_template_with_expression = f"clip(<single-line expression with all intermediates inlined>, {scale_min:.1f}, {scale_max:.1f})"
+            example_formula = f"clip(0.5 + 0.25 * num_hydroxyl_groups(SMILES) - 0.001 * molecular_weight(SMILES) / 100 - 0.08 * num_halogen(SMILES) - 0.1 * num_aromatic_rings(SMILES) + 0.05 * num_nitrogen(SMILES) + 0.04 * num_oxygen(SMILES), {scale_min:.1f}, {scale_max:.1f})"
+            example_final_formula = f"clip(metabolic_stress * age_effect * hdl_protection + lipid_risk + 0.1 * s6, {scale_min:.1f}, {scale_max:.1f})"
+            formula_start = "clip("
+            clip_instruction = f" and clip to {scale_range_str}"
+            output_range_warning = f"- Output values outside {scale_range_str} range"
+            ensure_output_range = f"- Ensure formula outputs values in {scale_range_str} using clip()"
+            feature_range_note = " (since features are scaled)"
+        else:
+            scale_min, scale_max = None, None
+            scale_range_str = "raw/unscaled"
+            scale_info = "Data is NOT normalized; use raw feature and target values. Do NOT clip outputs to any fixed range."
+            scaling_note = "Clipping is disabled; output can be any real number."
+            formula_template = "expression"
+            formula_template_with_expression = "<single-line expression with all intermediates inlined>"
+            example_formula = "0.5 + 0.25 * num_hydroxyl_groups(SMILES) - 0.001 * molecular_weight(SMILES) / 100 - 0.08 * num_halogen(SMILES) - 0.1 * num_aromatic_rings(SMILES) + 0.05 * num_nitrogen(SMILES) + 0.04 * num_oxygen(SMILES)"
+            example_final_formula = "metabolic_stress * age_effect * hdl_protection + lipid_risk + 0.1 * s6"
+            formula_start = ""
+            clip_instruction = ""
+            output_range_warning = "- Do not assume any output range constraints"
+            ensure_output_range = "- Use raw target values (no clipping)"
+            feature_range_note = ""
+        
+        # Replace placeholders
+        replacements = {
+            '{scale_min}': str(scale_min) if scale_min is not None else 'N/A',
+            '{scale_max}': str(scale_max) if scale_max is not None else 'N/A',
+            '{scale_range}': scale_range_str,
+            '{scale_info}': scale_info,
+            '{scaling_note}': scaling_note,
+            '{formula_template}': formula_template,
+            '{formula_template_with_expression}': formula_template_with_expression,
+            '{example_formula}': example_formula,
+            '{example_final_formula}': example_final_formula,
+            '{formula_start}': formula_start,
+            '{clip_instruction}': clip_instruction,
+            '{output_range_warning}': output_range_warning,
+            '{ensure_output_range}': ensure_output_range,
+            '{feature_range_note}': feature_range_note,
+        }
+        
+        formatted = prompt
+        for placeholder, value in replacements.items():
+            formatted = formatted.replace(placeholder, value)
+        
+        return formatted
     
     def _normalize_dataset_name(self, dataset_name: str) -> str:
         """Normalize dataset name for prompt lookup (handles variations)"""
@@ -2864,7 +2930,15 @@ class TrainableMAICL:
                 return {"accuracy": 0.0, "f1": 0.0, "loss": 1.0, "predictions": [], "true_values": []}
             return {"r2": -1.0, "mae": 1e9, "loss": 1e9, "predictions": [], "true_values": []}
         
-        logger.info(f"[LLM-only evaluation] Using {len(llm_mechanisms)} LLM mechanism(s) (excluding ML)")
+        # Count known vs LLM mechanisms for clearer logging
+        num_known = sum(1 for t in llm_mechanism_types if t == "known")
+        num_llm = sum(1 for t in llm_mechanism_types if t == "llm")
+        if num_known > 0 and num_llm > 0:
+            logger.info(f"[LLM-only evaluation] Using {len(llm_mechanisms)} textual mechanism(s) ({num_known} known + {num_llm} LLM, excluding ML)")
+        elif num_known > 0:
+            logger.info(f"[LLM-only evaluation] Using {len(llm_mechanisms)} known mechanism(s) (excluding ML)")
+        else:
+            logger.info(f"[LLM-only evaluation] Using {len(llm_mechanisms)} LLM mechanism(s) (excluding ML)")
         
         # Use provided k_shot or instance default
         if k_shot is not None:
