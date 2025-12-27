@@ -11,10 +11,16 @@ This module provides functions to:
 import re
 import os
 import numpy as np
-import matplotlib.pyplot as plt
 from typing import List, Tuple, Optional, Dict, Any
 import math
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+
+# Matplotlib is optional (avoid hard import crashes in some environments)
+try:
+    import matplotlib.pyplot as plt
+    _HAS_MPL = True
+except Exception:
+    _HAS_MPL = False
 
 # Try to import RDKit for molecular property computation
 try:
@@ -50,20 +56,46 @@ def parse_mechanisms_file(filepath: str) -> List[Tuple[str, str]]:
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read()
     
-    # Split by double newlines (mechanism separator)
-    sections = content.split('\n\n')
-    
-    for section in sections:
-        section = section.strip()
-        if not section:
-            continue
-        
-        # Match pattern: [TYPE] text
-        match = re.match(r'\[(\w+)\]\s*(.*)', section, re.DOTALL)
-        if match:
-            mech_type = match.group(1).lower()
-            mech_text = match.group(2).strip()
-            mechanisms.append((mech_type, mech_text))
+    # Robust parsing:
+    # (1) Standard files: mechanisms_iter_*.txt use headers like [LLM], [ML], [KNOWN]
+    # (2) Rejected files: rejected_mechanisms_iter_*.txt use headers like:
+    #       [REJECTED LLM MECHANISM 1]
+    # Both contain blank lines within a mechanism; so we must NOT split on '\n\n'.
+    header_re = re.compile(r'^\[(LLM|ML|KNOWN)\]\s*', re.IGNORECASE | re.MULTILINE)
+    rejected_header_re = re.compile(r'^\[REJECTED\s+(LLM|ML|KNOWN)\s+MECHANISM\s+\d+\]\s*$', re.IGNORECASE | re.MULTILINE)
+
+    matches = list(header_re.finditer(content))
+    mode = "standard"
+    if not matches:
+        matches = list(rejected_header_re.finditer(content))
+        mode = "rejected" if matches else "none"
+
+    if not matches:
+        # Fallback to legacy behavior (best effort)
+        sections = content.split('\n\n')
+        for section in sections:
+            section = section.strip()
+            if not section:
+                continue
+            match = re.match(r'\[(\w+)\]\s*(.*)', section, re.DOTALL)
+            if match:
+                mech_type = match.group(1).lower()
+                mech_text = match.group(2).strip()
+                mechanisms.append((mech_type, mech_text))
+        return mechanisms
+
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+        block = content[start:end].strip()
+        # Extract type from the header match, then remove the header prefix from the block
+        mech_type = m.group(1).lower()
+        if mode == "standard":
+            mech_text = header_re.sub('', block, count=1).strip()
+        else:
+            # Remove the first rejected header line only
+            mech_text = rejected_header_re.sub('', block, count=1).strip()
+        mechanisms.append((mech_type, mech_text))
     
     return mechanisms
 
@@ -83,15 +115,32 @@ def extract_formula_from_llm_mechanism(mechanism_text: str) -> Optional[str]:
     Returns:
         Extracted formula string, or None if not found
     """
-    # Look for "Formula:" pattern
-    formula_match = re.search(
-        r'(?:Formula|FORMULA|formula)[:\s]*(.*?)(?:\n|$|ŷ\s*=|Map|Class)', 
-        mechanism_text, 
-        re.IGNORECASE | re.DOTALL
-    )
+    # Find ALL "Formula:" lines (some mechanisms have intermediate formulas)
+    all_formula_matches = list(re.finditer(
+        r'^\s*(?:Formula|FORMULA|formula)\s*:\s*(.+?)\s*$',
+        mechanism_text,
+        re.IGNORECASE | re.MULTILINE
+    ))
     
+    # If multiple formulas found, prefer the one with "ŷ" or near "STEP 4"/"FINAL"
+    if len(all_formula_matches) > 1:
+        # Check from end (most recent formulas are usually at the end)
+        for match in reversed(all_formula_matches):
+            formula_candidate = match.group(1).strip()
+            # Prefer formulas that contain "ŷ" or "clip" (final prediction formulas)
+            if 'ŷ' in formula_candidate or 'clip' in formula_candidate.lower():
+                formula_match = match
+                break
+        else:
+            # If no match with ŷ/clip, use the last one
+            formula_match = all_formula_matches[-1]
+    elif len(all_formula_matches) == 1:
+        formula_match = all_formula_matches[0]
+    else:
+        formula_match = None
+    
+    # Fallback: Try to find "score = " or "ŷ = " directly if no "Formula:" line found
     if not formula_match:
-        # Try to find "score = " or "ŷ = " directly
         formula_match = re.search(
             r'(?:score|ŷ)\s*=\s*(.*?)(?:\n|$|Map|Class|ŷ\s*=|if\s+score)', 
             mechanism_text, 
@@ -100,6 +149,19 @@ def extract_formula_from_llm_mechanism(mechanism_text: str) -> Optional[str]:
     
     if formula_match:
         formula = formula_match.group(1).strip()
+        # Some mechanisms write "Formula: ŷ = <expr>" (or just "ŷ = <expr>").
+        # Normalize to the pure RHS expression so evaluation doesn't choke on unicode ŷ / assignment.
+        formula = re.sub(
+            r'^\s*(?:Formula|FORMULA|formula)\s*:\s*', '',
+            formula,
+            flags=re.IGNORECASE
+        ).strip()
+        formula = re.sub(
+            r'^\s*(?:ŷ|ŷ|y_hat|y)\s*=\s*',
+            '',
+            formula,
+            flags=re.IGNORECASE
+        ).strip()
         # Remove trailing punctuation or extra text
         formula = re.sub(r'[.;,]$', '', formula)
         return formula
@@ -224,13 +286,29 @@ def evaluate_llm_formula(
     Returns:
         Array of predictions
     """
+    # Normalize formula: strip leading "Formula:" and any "ŷ ="/"y =" prefix
+    # so the remaining string is a valid Python expression.
+    if isinstance(formula, str):
+        formula = re.sub(r'^\s*(?:Formula|FORMULA|formula)\s*:\s*', '', formula, flags=re.IGNORECASE).strip()
+        formula = re.sub(r'^\s*(?:ŷ|ŷ|y_hat|y)\s*=\s*', '', formula, flags=re.IGNORECASE).strip()
+
     predictions = []
     
-    # Check if this is a DeepChem dataset (formula uses molecular properties)
-    is_deepchem = 'molecular_weight(SMILES)' in formula or 'num_rings(SMILES)' in formula or 'num_hydroxyl_groups(SMILES)' in formula
+    # Detect "molecular" formulas.
+    # We treat the formula as SMILES/RDKit-based if it mentions:
+    # - any molecular property function call, e.g. molecular_weight(SMILES)
+    # - or any molecular property variable name, e.g. molecular_weight/500
+    # - or the literal token SMILES
+    mol_prop_functions = [
+        'molecular_weight', 'num_rings', 'num_hydroxyl_groups', 'num_halogen',
+        'num_nitrogen', 'num_oxygen', 'num_atoms', 'is_aromatic', 'num_hbd'
+    ]
+    is_deepchem = ('SMILES' in formula) or any(
+        (f"{fn}(" in formula) or re.search(rf'\b{re.escape(fn)}\b', formula) for fn in mol_prop_functions
+    )
     
     for i in range(len(X)):
-        # For DeepChem datasets, use SMILES from X_original
+        # For SMILES/RDKit-style formulas, use SMILES from X_original and compute mol properties.
         if is_deepchem and X_original is not None and i < len(X_original):
             # Extract SMILES string
             if isinstance(X_original[i], dict):
@@ -242,9 +320,28 @@ def evaluate_llm_formula(
             
             # Compute molecular properties from SMILES
             mol_props = _compute_molecular_properties(smiles)
-            
-            # Create x_dict with molecular properties
+
+            # If the trained model used scaled RDKit feature columns (e.g., num_rings, num_atoms, ...)
+            # we must scale the computed properties with the SAME scaler, otherwise evaluation is in
+            # a different feature space and results will look extremely poor.
+            #
+            # Only do this when feature_cols align with mol_props keys (i.e., not ECFP bits).
             x_dict = mol_props.copy()
+            try:
+                if scaler is not None and feature_cols:
+                    # Check whether feature_cols look like RDKit property names
+                    n_match = sum(1 for c in feature_cols if isinstance(c, str) and c in mol_props)
+                    # Require at least a few matches to avoid accidentally scaling ECFP-bit datasets.
+                    if n_match >= min(3, len(feature_cols)):
+                        raw_vec = np.array([[float(mol_props.get(c, 0.0)) for c in feature_cols]], dtype=float)
+                        scaled_vec = scaler.transform(raw_vec)[0]
+                        for j, c in enumerate(feature_cols):
+                            # Overwrite only numeric mol-prop features; keep other keys as-is.
+                            if isinstance(c, str) and c in mol_props:
+                                x_dict[c] = float(scaled_vec[j])
+            except Exception:
+                pass
+
             # Also add SMILES as a variable (for formulas that reference it)
             x_dict['SMILES'] = smiles
         else:
@@ -440,6 +537,8 @@ def save_mechanism_scatter_plot(
         mae: Optional MAE to display
         mse: Optional MSE to display
     """
+    if not _HAS_MPL:
+        return
     os.makedirs(output_dir, exist_ok=True)
     
     plt.figure(figsize=(8, 6))

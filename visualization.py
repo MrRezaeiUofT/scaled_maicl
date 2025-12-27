@@ -67,7 +67,10 @@ def plot_confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray, class_names: L
         return
     
     try:
-        cm = confusion_matrix(y_true, y_pred)
+        # Ensure confusion matrix shape matches the full class list even if some classes
+        # are missing in y_true/y_pred for a particular split.
+        labels = np.arange(len(class_names)) if class_names is not None else None
+        cm = confusion_matrix(y_true, y_pred, labels=labels)
         
         fig, ax = plt.subplots(figsize=(10, 8))
         im = ax.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
@@ -109,8 +112,9 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
                                 task_type: str = "classification",
                                 output_path: Optional[str] = None,
                                 llm_only_pre: Optional[Dict[str, Any]] = None,
-                                llm_only_post: Optional[Dict[str, Any]] = None):
-    """Plot performance comparison between ML baseline, pre-training MA-ICL, post-training MA-ICL, and LLM-only mechanisms
+                                llm_only_post: Optional[Dict[str, Any]] = None,
+                                baseline_models: Optional[Dict[str, Dict[str, Any]]] = None):
+    """Plot performance comparison between ML baseline, pre-training MA-ICL, post-training MA-ICL, LLM-only mechanisms, and additional baseline models
     
     Args:
         ml_baseline: ML baseline metrics
@@ -120,6 +124,7 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
         output_path: Output file path
         llm_only_pre: Optional LLM-only metrics for pre-training
         llm_only_post: Optional LLM-only metrics for post-training
+        baseline_models: Optional dictionary of baseline model metrics (e.g., {'tabpfn': {...}, 'ebm': {...}, 'xgboost': {...}})
     """
     if not _HAS_MPL:
         logger.warning("Matplotlib not available, skipping performance comparison plot")
@@ -140,9 +145,34 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
         # Determine which models to include
         has_llm_pre = llm_only_pre is not None
         has_llm_post = llm_only_post is not None
+        has_baselines = baseline_models is not None and len(baseline_models) > 0
         
-        models = ['ML Baseline', 'MA-ICL\n(Pre-train)']
-        colors = ['#3498db', '#e74c3c']
+        # Baseline model names and colors
+        baseline_model_names = {
+            'tabpfn': 'TabPFN',
+            'ebm': 'EBM',
+            'xgboost': 'XGBoost'
+        }
+        baseline_model_colors = {
+            'tabpfn': '#e67e22',  # Dark orange
+            'ebm': '#16a085',     # Teal
+            'xgboost': '#27ae60'  # Green
+        }
+        
+        # Build model list: Start with ML baseline and other baselines grouped together
+        models = ['ML Baseline']
+        colors = ['#3498db']
+        
+        # Add baseline models right after ML baseline for better comparison
+        if has_baselines:
+            for model_key in ['tabpfn', 'ebm', 'xgboost']:
+                if model_key in baseline_models:
+                    models.append(baseline_model_names[model_key])
+                    colors.append(baseline_model_colors[model_key])
+        
+        # Then add MA-ICL models
+        models.append('MA-ICL\n(Pre-train)')
+        colors.append('#e74c3c')
         
         if has_llm_pre:
             models.append('LLM-only\n(Pre-train)')
@@ -162,8 +192,16 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
         for idx, (metric, metric_label) in enumerate(zip(metrics, metric_labels)):
             ax = axes[idx]
             
-            # Get values, handling missing data
+            # Get values, handling missing data - order must match models list
             values = [ml_baseline.get(metric, 0)]
+            
+            # Add baseline model values right after ML baseline
+            if has_baselines:
+                for model_key in ['tabpfn', 'ebm', 'xgboost']:
+                    if model_key in baseline_models:
+                        values.append(baseline_models[model_key].get(metric, 0))
+            
+            # Then add MA-ICL values
             values.append(pre_maicl.get(metric, 0))
             
             if has_llm_pre:
@@ -194,8 +232,10 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
             ax.tick_params(axis='x', labelsize=9)
             plt.setp(ax.xaxis.get_majorticklabels(), rotation=15, ha='right')
         
-        fig.suptitle('Performance Comparison: ML Baseline vs MA-ICL vs LLM-only', 
-                     fontsize=16, fontweight='bold', y=1.02)
+        title = 'Performance Comparison: ML Baseline vs MA-ICL vs LLM-only'
+        if has_baselines:
+            title += ' vs Baseline Models (TabPFN/EBM/XGBoost)'
+        fig.suptitle(title, fontsize=16, fontweight='bold', y=1.02)
         plt.tight_layout()
         
         if output_path:
@@ -219,6 +259,39 @@ def plot_scatter_predictions(y_true: np.ndarray, y_pred: np.ndarray,
         return
     
     try:
+        # Normalize shapes and guard against common issues (2D arrays, NaNs, length mismatches)
+        y_true = np.asarray(y_true)
+        y_pred = np.asarray(y_pred)
+
+        # Squeeze single-column vectors (n,1) -> (n,)
+        if y_true.ndim == 2 and y_true.shape[1] == 1:
+            y_true = y_true[:, 0]
+        if y_pred.ndim == 2 and y_pred.shape[1] == 1:
+            y_pred = y_pred[:, 0]
+
+        y_true = np.ravel(y_true)
+        y_pred = np.ravel(y_pred)
+
+        # Drop non-finite pairs when possible
+        try:
+            finite_mask = np.isfinite(y_true) & np.isfinite(y_pred)
+            if finite_mask.size == y_true.size:
+                y_true = y_true[finite_mask]
+                y_pred = y_pred[finite_mask]
+        except Exception:
+            pass
+
+        if y_true.size == 0 or y_pred.size == 0:
+            logger.warning("Failed to plot scatter: empty y_true or y_pred after preprocessing")
+            return
+
+        if y_true.size != y_pred.size:
+            logger.warning(
+                f"Failed to plot scatter: x and y must be the same size "
+                f"(y_true n={y_true.size}, y_pred n={y_pred.size}). Skipping scatter plot."
+            )
+            return
+
         fig, ax = plt.subplots(figsize=(8, 8))
         
         # Scatter plot
@@ -266,7 +339,8 @@ def create_result_visualizations(y_test: np.ndarray,
                                  class_names: Optional[List[str]] = None,
                                  output_dir: Optional[str] = None,
                                  llm_only_metrics: Optional[Dict[str, Any]] = None,
-                                 llm_only_pre_metrics: Optional[Dict[str, Any]] = None):
+                                 llm_only_pre_metrics: Optional[Dict[str, Any]] = None,
+                                 baseline_models: Optional[Dict[str, Dict[str, Any]]] = None):
     """Create all result visualizations (confusion matrices + performance comparison + scatter plots)
     
     Args:
@@ -279,6 +353,7 @@ def create_result_visualizations(y_test: np.ndarray,
         output_dir: Output directory for visualizations
         llm_only_metrics: Optional metrics from LLM-only evaluation post-training (excluding ML)
         llm_only_pre_metrics: Optional metrics from LLM-only evaluation pre-training (excluding ML)
+        baseline_models: Optional dictionary of baseline model metrics (e.g., {'tabpfn': {...}, 'ebm': {...}, 'xgboost': {...}})
     """
     if output_dir is None:
         from maicl_lib_v2 import OUTPUT_DIR
@@ -286,12 +361,34 @@ def create_result_visualizations(y_test: np.ndarray,
     
     os.makedirs(output_dir, exist_ok=True)
     
-    # Performance comparison plot (includes LLM-only if available)
+    # Performance comparison plot (includes LLM-only and baseline models if available)
     perf_plot_path = os.path.join(output_dir, "performance_comparison.png")
     plot_performance_comparison(ml_baseline_metrics, pre_metrics, post_metrics, 
                                 task_type=task_type, output_path=perf_plot_path,
                                 llm_only_pre=llm_only_pre_metrics,
-                                llm_only_post=llm_only_metrics)
+                                llm_only_post=llm_only_metrics,
+                                baseline_models=baseline_models)
+
+    def _true_values_for_plot(metrics: Optional[Dict[str, Any]], fallback: np.ndarray) -> np.ndarray:
+        """Pick the matching y_true for a given metrics dict.
+        Many runs evaluate MA-ICL on validation while still passing y_test here.
+        We prefer metrics['true_values'] when present to avoid length mismatches.
+        """
+        try:
+            if metrics is None:
+                return fallback
+            tv = metrics.get("true_values", None)
+            if tv is None:
+                return fallback
+            arr = np.array(tv)
+            # If the metrics dict has predictions, ensure sizes match; otherwise use fallback.
+            preds = metrics.get("predictions", None)
+            if preds is not None:
+                if len(arr) != len(preds):
+                    return fallback
+            return arr
+        except Exception:
+            return fallback
     
     # Scatter plots for regression
     if task_type == "regression":
@@ -302,7 +399,8 @@ def create_result_visualizations(y_test: np.ndarray,
             ml_mae = ml_baseline_metrics.get('mae', None)
             ml_mse = ml_baseline_metrics.get('mse', None)
             ml_scatter_path = os.path.join(output_dir, "scatter_ml_baseline.png")
-            plot_scatter_predictions(y_test, y_pred_ml, "ML Baseline Predictions",
+            y_true_ml = _true_values_for_plot(ml_baseline_metrics, y_test)
+            plot_scatter_predictions(y_true_ml, y_pred_ml, "ML Baseline Predictions",
                                     output_path=ml_scatter_path, r2=ml_r2, mae=ml_mae, mse=ml_mse)
         
         # LLM-only scatter plot (if available)
@@ -312,7 +410,8 @@ def create_result_visualizations(y_test: np.ndarray,
             llm_mae = llm_only_metrics.get('mae', None)
             llm_mse = llm_only_metrics.get('mse', None)
             llm_scatter_path = os.path.join(output_dir, "scatter_llm_only.png")
-            plot_scatter_predictions(y_test, y_pred_llm_only, "LLM-only Mechanism Predictions",
+            y_true_llm_only = _true_values_for_plot(llm_only_metrics, y_test)
+            plot_scatter_predictions(y_true_llm_only, y_pred_llm_only, "LLM-only Mechanism Predictions",
                                     output_path=llm_scatter_path, r2=llm_r2, mae=llm_mae, mse=llm_mse)
         
         # MA-ICL pre-training scatter plot
@@ -322,7 +421,8 @@ def create_result_visualizations(y_test: np.ndarray,
             pre_mae = pre_metrics.get('mae', None)
             pre_mse = pre_metrics.get('mse', None)
             pre_scatter_path = os.path.join(output_dir, "scatter_maicl_pre.png")
-            plot_scatter_predictions(y_test, y_pred_pre, "MA-ICL Pre-training Predictions",
+            y_true_pre = _true_values_for_plot(pre_metrics, y_test)
+            plot_scatter_predictions(y_true_pre, y_pred_pre, "MA-ICL Pre-training Predictions",
                                     output_path=pre_scatter_path, r2=pre_r2, mae=pre_mae, mse=pre_mse)
         
         # MA-ICL post-training scatter plot
@@ -332,8 +432,26 @@ def create_result_visualizations(y_test: np.ndarray,
             post_mae = post_metrics.get('mae', None)
             post_mse = post_metrics.get('mse', None)
             post_scatter_path = os.path.join(output_dir, "scatter_maicl_post.png")
-            plot_scatter_predictions(y_test, y_pred_post, "MA-ICL Post-training Predictions",
+            y_true_post = _true_values_for_plot(post_metrics, y_test)
+            plot_scatter_predictions(y_true_post, y_pred_post, "MA-ICL Post-training Predictions",
                                     output_path=post_scatter_path, r2=post_r2, mae=post_mae, mse=post_mse)
+        
+        # Baseline models scatter plots
+        if baseline_models is not None:
+            baseline_model_names = {
+                'tabpfn': 'TabPFN',
+                'ebm': 'EBM',
+                'xgboost': 'XGBoost'
+            }
+            for model_key, model_name in baseline_model_names.items():
+                if model_key in baseline_models and "predictions" in baseline_models[model_key]:
+                    y_pred_baseline = np.array(baseline_models[model_key]["predictions"])
+                    baseline_r2 = baseline_models[model_key].get('r2', None)
+                    baseline_mae = baseline_models[model_key].get('mae', None)
+                    baseline_mse = baseline_models[model_key].get('mse', None)
+                    baseline_scatter_path = os.path.join(output_dir, f"scatter_{model_key}_baseline.png")
+                    plot_scatter_predictions(y_test, y_pred_baseline, f"{model_name} Baseline Predictions",
+                                            output_path=baseline_scatter_path, r2=baseline_r2, mae=baseline_mae, mse=baseline_mse)
     
     # Confusion matrices for classification
     if task_type == "classification" and class_names is not None:
@@ -341,32 +459,36 @@ def create_result_visualizations(y_test: np.ndarray,
             # ML Baseline confusion matrix
             if "predictions" in ml_baseline_metrics:
                 y_pred_ml = np.array(ml_baseline_metrics["predictions"])
+                y_true_ml = _true_values_for_plot(ml_baseline_metrics, y_test)
                 cm_ml_path = os.path.join(output_dir, "confusion_matrix_ml_baseline.png")
-                plot_confusion_matrix(y_test, y_pred_ml, class_names, 
+                plot_confusion_matrix(y_true_ml, y_pred_ml, class_names, 
                                     title="ML Baseline - Confusion Matrix",
                                     output_path=cm_ml_path)
             
             # Pre-training MA-ICL confusion matrix
             if "predictions" in pre_metrics:
                 y_pred_pre = np.array(pre_metrics["predictions"])
+                y_true_pre = _true_values_for_plot(pre_metrics, y_test)
                 cm_pre_path = os.path.join(output_dir, "confusion_matrix_maicl_pre.png")
-                plot_confusion_matrix(y_test, y_pred_pre, class_names,
+                plot_confusion_matrix(y_true_pre, y_pred_pre, class_names,
                                     title="MA-ICL (Pre-training) - Confusion Matrix",
                                     output_path=cm_pre_path)
             
             # Post-training MA-ICL confusion matrix
             if "predictions" in post_metrics:
                 y_pred_post = np.array(post_metrics["predictions"])
+                y_true_post = _true_values_for_plot(post_metrics, y_test)
                 cm_post_path = os.path.join(output_dir, "confusion_matrix_maicl_post.png")
-                plot_confusion_matrix(y_test, y_pred_post, class_names,
+                plot_confusion_matrix(y_true_post, y_pred_post, class_names,
                                     title="MA-ICL (Post-training) - Confusion Matrix",
                                     output_path=cm_post_path)
             
             # LLM-only post-training confusion matrix (if provided)
             if llm_only_metrics is not None and "predictions" in llm_only_metrics:
                 y_pred_llm_only = np.array(llm_only_metrics["predictions"])
+                y_true_llm_only = _true_values_for_plot(llm_only_metrics, y_test)
                 cm_llm_only_path = os.path.join(output_dir, "confusion_matrix_maicl_llm_only_post.png")
-                plot_confusion_matrix(y_test, y_pred_llm_only, class_names,
+                plot_confusion_matrix(y_true_llm_only, y_pred_llm_only, class_names,
                                     title="MA-ICL LLM-only (Post-training, no ML) - Confusion Matrix",
                                     output_path=cm_llm_only_path)
                 logger.info(f"  ✓ Saved LLM-only confusion matrix to {cm_llm_only_path}")

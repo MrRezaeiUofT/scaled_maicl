@@ -31,7 +31,7 @@ REGRESSION_SCRIPT = "018_maicl_regression_biotech.py"
 
 def extract_model_name(row):
     """Extract model name from row, preferring run_name if available"""
-    model_name = 'gemini-2.5-pro'  # Default
+    model_name = 'gemini-2.0-flash'  # Default
     run_name = str(row.get('run_name', ''))
     if 'gemini' in run_name.lower():
         # Extract model name from run_name (e.g., modelgemini_2_0_flash -> gemini-2.0-flash)

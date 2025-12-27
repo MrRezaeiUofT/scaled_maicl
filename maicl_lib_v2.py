@@ -45,11 +45,10 @@ try:
 except:
     _HAS_TABICL = False
 
-try:
-    from baticl import BaticlClassifier
-    _HAS_BATICL = True
-except:
-    _HAS_BATICL = False
+# NOTE: Do NOT import baticl at module import time.
+# Some environments experience hard crashes/segfaults when importing baticl (cannot be caught by try/except).
+# We keep the flag for compatibility, but only import baticl lazily if/when the user explicitly selects it.
+_HAS_BATICL = False
 
 try:
     from langchain.schema import HumanMessage
@@ -203,7 +202,9 @@ class MultiAgentPredictor:
         # Get predictions from all mechanisms
         llm_mechanisms, llm_indices, ml_indices = [], [], []
         for i, (mech, mech_type) in enumerate(zip(self.mechanisms, self.mechanism_types)):
-            if mech_type == "llm":
+            # IMPORTANT: "known" mechanisms are also textual mechanisms and must be executed like LLM mechanisms.
+            # Otherwise they default to class 0 / 0.0 and can drag down the ensemble.
+            if mech_type in ("llm", "known"):
                 llm_mechanisms.append(mech)
                 llm_indices.append(i)
             elif mech_type == "ml":
@@ -364,7 +365,12 @@ Please provide your prediction in the format specified above."""
             final_pred = sum(p * w for p, w in zip(predictions, weights))
             return float(final_pred), predictions, weights, None
     
-    def predict_batch(self, x_dicts: List[Dict], few_shot_list: Optional[List[List[Dict]]] = None):
+    def predict_batch(
+        self,
+        x_dicts: List[Dict],
+        few_shot_list: Optional[List[List[Dict]]] = None,
+        x_numeric_dicts: Optional[List[Dict[str, float]]] = None,
+    ):
         """Batch prediction across multiple samples (batches by mechanism for efficiency)"""
         if few_shot_list is None:
             few_shot_list = [[]] * len(x_dicts)
@@ -378,7 +384,8 @@ Please provide your prediction in the format specified above."""
         # Get LLM mechanisms
         llm_mechanisms, llm_indices, ml_indices = [], [], []
         for i, (mech, mech_type) in enumerate(zip(self.mechanisms, self.mechanism_types)):
-            if mech_type == "llm":
+            # IMPORTANT: "known" mechanisms are also textual mechanisms and must be executed like LLM mechanisms.
+            if mech_type in ("llm", "known"):
                 llm_mechanisms.append(mech)
                 llm_indices.append(i)
             elif mech_type == "ml":
@@ -406,6 +413,24 @@ Apply the mechanism's mathematical description to compute the output value from 
         # Grouped predictions: combine mechanisms per input group to reduce calls by factor M
         all_mechanism_responses: Dict[int, List[Tuple[float, float]]] = {idx: [None] * len(x_dicts) for idx in llm_indices}
         group_size = max(1, min(LLM_GROUP_SIZE, len(x_dicts)))
+
+        # Prompt-size safety: dynamically shrink group_size if JSON payloads get too large.
+        # This matters a lot for DeepChem/SMILES + RDKit descriptor dicts, which can exceed model limits
+        # when LLM_GROUP_SIZE is large (default 128).
+        #
+        # We use a char-based heuristic (fast, deterministic) instead of tokenization.
+        MAX_INPUTS_PAYLOAD_CHARS = 200_000  # conservative; keep well below typical context windows
+        try:
+            if len(x_dicts) > 1 and isinstance(x_dicts[0], dict):
+                while group_size > 1:
+                    preview = x_dicts[:group_size]
+                    payload_len = len(json.dumps(preview, default=str))
+                    if payload_len <= MAX_INPUTS_PAYLOAD_CHARS:
+                        break
+                    group_size = max(1, group_size // 2)
+        except Exception:
+            # If estimation fails, keep configured group_size.
+            pass
         if LLM_COMBINE_MECHANISMS and len(llm_mechanisms) > 0:
             mech_block = "\n".join([f"{i+1}) {mech}" for i, mech in enumerate(llm_mechanisms)])
             # Get few-shot examples from first sample (all samples use same few-shot examples)
@@ -614,6 +639,13 @@ Apply the mechanism's mathematical description to compute the output value from 
         batch_results = []
         for sample_idx in range(len(x_dicts)):
             x_dict = x_dicts[sample_idx]
+            # IMPORTANT:
+            # - x_dict may contain raw/non-numeric fields (e.g., OpenML categoricals as strings) for the LLM to "see".
+            # - ML baselines require numeric feature values aligned with self.feature_cols.
+            # If provided, x_numeric_dicts supplies the numeric view for ML prediction + ML confidence routing.
+            x_ml_dict = x_dict
+            if x_numeric_dicts is not None and sample_idx < len(x_numeric_dicts) and isinstance(x_numeric_dicts[sample_idx], dict):
+                x_ml_dict = x_numeric_dicts[sample_idx]
             results = [None] * len(self.mechanisms)
             
             # Parse LLM responses
@@ -628,7 +660,7 @@ Apply the mechanism's mathematical description to compute the output value from 
                         return_class_idx = (self.task_type == "classification" and 
                                           self.class_names is not None and 
                                           len(self.class_names) > 2)
-                        y_hat = self.ml_mechanism.predict(x_dict, return_class_index=return_class_idx)
+                        y_hat = self.ml_mechanism.predict(x_ml_dict, return_class_index=return_class_idx)
                         # For regression, clip to actual scaling range if scaling is enabled
                         if self.task_type == "regression" and self.use_scaling:
                             ymin, ymax = self._scaled_range_from(self.scaler)
@@ -637,9 +669,9 @@ Apply the mechanism's mathematical description to compute the output value from 
                             # No scaling: ensure value is finite
                             y_hat = float(y_hat) if np.isfinite(y_hat) else 0.0
                         if hasattr(self.ml_mechanism, 'get_confidence_heuristic_with_boost'):
-                            conf = self.ml_mechanism.get_confidence_heuristic_with_boost(x_dict)
+                            conf = self.ml_mechanism.get_confidence_heuristic_with_boost(x_ml_dict)
                         else:
-                            conf = self.ml_mechanism.get_confidence_heuristic(x_dict)
+                            conf = self.ml_mechanism.get_confidence_heuristic(x_ml_dict)
                         results[idx] = (y_hat, conf)
                     except:
                         if self.task_type == "regression":
@@ -665,7 +697,7 @@ Apply the mechanism's mathematical description to compute the output value from 
                 ml_idx = ml_indices_list[0]
                 ml_pred = agent_preds[ml_idx]
                 ml_predicted_class, ml_max_prob, ml_proba = get_ml_prediction_probability(
-                    self.ml_mechanism, x_dict, predicted_class=int(ml_pred) if ml_pred is not None else None, 
+                    self.ml_mechanism, x_ml_dict, predicted_class=int(ml_pred) if ml_pred is not None else None, 
                     scaler=self.scaler
                 )
                 if ml_max_prob is not None:
@@ -698,7 +730,7 @@ Apply the mechanism's mathematical description to compute the output value from 
                 
                 # Check if ML mechanism is significantly better
                 ml_indices_list = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "ml"]
-                llm_indices_list = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "llm"]
+                llm_indices_list = [i for i, mtype in enumerate(self.mechanism_types) if mtype in ("llm", "known")]
                 
                 if len(ml_indices_list) > 0 and len(llm_indices_list) > 0:
                     ml_perf = max([perf_scores[i] for i in ml_indices_list])
@@ -818,7 +850,7 @@ Apply the mechanism's mathematical description to compute the output value from 
                 
                 # Find ML mechanism indices
                 ml_indices = [i for i, mech_type in enumerate(self.mechanism_types) if mech_type == "ml"]
-                llm_indices = [i for i, mech_type in enumerate(self.mechanism_types) if mech_type == "llm"]
+                llm_indices = [i for i, mech_type in enumerate(self.mechanism_types) if mech_type in ("llm", "known")]
                 
                 if ml_indices and llm_indices:
                     if ml_confidence >= self.hard_ml_gate_threshold:
@@ -1130,7 +1162,47 @@ class VariationalMechanismGenerator:
                 if isinstance(orig, dict):
                     # Prefer a single, semantically rich field if present
                     if "SMILES" in orig:
-                        return f"SMILES={_truncate(orig.get('SMILES'))}"
+                        # For DeepChem molecular datasets we may also have RDKit descriptor fields
+                        # injected into X_original (e.g., molecular_weight, num_rings, etc.).
+                        # Include a small, ordered preview to actually expose these to the LLM,
+                        # while still avoiding ECFP bit spam and prompt blow-up.
+                        parts = [f"SMILES={_truncate(orig.get('SMILES'))}"]
+                        try:
+                            canonical_keys = [
+                                "molecular_weight",
+                                "num_rings",
+                                "num_hydroxyl_groups",
+                                "num_halogen",
+                                "num_nitrogen",
+                                "num_oxygen",
+                                "num_atoms",
+                                "is_aromatic",
+                                "num_hbd",
+                            ]
+                            extras = []
+                            # Prefer canonical descriptor keys first
+                            for k in canonical_keys:
+                                if k in orig and k != "SMILES":
+                                    extras.append((k, orig.get(k)))
+                            # Then include any other non-ECFP, non-SMILES keys (if present)
+                            for k, v in orig.items():
+                                if k == "SMILES":
+                                    continue
+                                if str(k).startswith("ecfp_bit_"):
+                                    continue
+                                if k in canonical_keys:
+                                    continue
+                                extras.append((k, v))
+                            # Limit extras to keep prompts compact
+                            max_extras = max(0, int(MAX_FEATURES_IN_EXAMPLE) - 1)
+                            for k, v in extras[:max_extras]:
+                                if isinstance(v, (int, float, np.number)):
+                                    parts.append(f"{k}={float(v):.3f}")
+                                else:
+                                    parts.append(f"{k}={_truncate(v)}")
+                        except Exception:
+                            pass
+                        return ", ".join(parts)
                     if "SEQ" in orig or "SUBSTRATES" in orig:
                         parts = []
                         if "SEQ" in orig:
@@ -1258,126 +1330,106 @@ class VariationalMechanismGenerator:
                 if isinstance(X_original_check[0], dict) and 'SMILES' in X_original_check[0]:
                     has_smiles = True
         
-        # If this is the first generation and ML mechanism is trained, use ML-guided initialization
-        # BUT skip ML-guided init for DeepChem datasets (they use ECFP features, not SMILES)
-        if (len(self.unknown_mechanisms) == 0 and 
-            self.use_ml_mechanism and 
-            self.ml_mechanism is not None and 
-            hasattr(self.ml_mechanism, 'is_trained') and 
-            self.ml_mechanism.is_trained and
-            not (is_deepchem and has_smiles)):  # Skip ML-guided init for DeepChem with SMILES
-            
-            logger.info("  [ML-Guided Init] Using ML-guided initialization for first mechanism generation...")
-            
-            # Log sample residuals for transparency (shows what the LLM sees during mechanism generation)
-            # Use SMILES strings (X_original) for LLM, not vectorized features
-            if ml_residuals is not None and len(ml_residuals) > 0:
-                try:
-                    # For classification: residuals are 1.0 (mismatched) or 0.0 (matched)
-                    # Sort descending to put mismatched (1.0) first
-                    sorted_indices = np.argsort(ml_residuals)[::-1]  # Sort by residual descending (1.0 first, then 0.0)
-                    top_5_idx = sorted_indices[:MAX_WORST_RESIDUAL_SAMPLES]
-                    
-                    # Check if we have any mismatched examples (residual > 0)
-                    mismatched_count = np.sum(ml_residuals > 0)
-                    if mismatched_count == 0:
-                        logger.warning(f"  [Residual Samples] ⚠️  No mismatched examples found (ML model has 100% accuracy on training set). Showing top samples by residual (all are 0.0):")
-                    else:
-                        logger.info(f"  [Residual Samples] Top {min(MAX_WORST_RESIDUAL_SAMPLES, mismatched_count)} worst ML residuals (mismatched examples) passed to LLM during mechanism generation:")
-                    # Try to get X_train_original (SMILES) from parent TrainableMAICL if available
-                    X_original = None
-                    if hasattr(self, 'X_train_original') and self.X_train_original is not None:
-                        X_original = self.X_train_original
-                    elif hasattr(self, 'predictor') and hasattr(self.predictor, 'X_train_original'):
-                        X_original = self.predictor.X_train_original
-                    
-                    for rank, idx in enumerate(top_5_idx, 1):
-                        if idx < len(X_train) and idx < len(y_train):
-                            # Use SMILES string if available, otherwise fall back to feature names
-                            if X_original is not None and idx < len(X_original):
-                                original_feat = X_original[idx]
-                                if isinstance(original_feat, dict):
-                                    # Extract SMILES or other original features
-                                    if 'SMILES' in original_feat:
-                                        feat_display = f"SMILES={original_feat['SMILES']}"
-                                    elif 'SUBSTRATES' in original_feat:
-                                        feat_display = f"SUBSTRATES={original_feat['SUBSTRATES']}"
-                                    else:
-                                        # Use first few key-value pairs
-                                        key_vals = list(original_feat.items())[:MAX_FEATURES_IN_COMPONENT_LIST]
-                                        feat_display = ', '.join([f"{k}={v}" for k, v in key_vals])
-                                else:
-                                    feat_display = f"original_feat={str(original_feat)[:MAX_FEATURE_DISPLAY_LENGTH]}"
-                            else:
-                                # Fallback: use feature names (vectorized)
-                                feature_names = self.feature_cols if self.feature_cols else [f"x{j}" for j in range(X_train.shape[1])]
-                                feat_vals = {feature_names[j]: float(X_train[idx, j]) for j in range(min(len(feature_names), X_train.shape[1]))}
-                                feat_display = ', '.join([f"{k}={v:.2f}" for k, v in list(feat_vals.items())[:MAX_FEATURES_IN_COMPONENT_LIST]])
-                            
-                            if self.task_type == "regression":
-                                y_pred = ml_residuals[idx] + y_train[idx] if ml_residuals is not None else y_train[idx]
-                                logger.info(f"    {rank}. Sample {idx}: {feat_display} → ML-pred={y_pred:.2f}, true={y_train[idx]:.2f}, residual={ml_residuals[idx]:+.2f}")
-                            else:
-                                # Classification: show predicted vs true, and residual (1.0=mismatched, 0.0=matched)
-                                true_idx = int(y_train[idx])
-                                residual_val = ml_residuals[idx]
-                                is_mismatched = residual_val > 0.5  # For classification, residual is 1.0 or 0.0
-                                
-                                # Try to get prediction if available
-                                pred_display = ""
-                                if hasattr(self, 'ml_mechanism') and self.ml_mechanism is not None:
-                                    try:
-                                        x_dict = {self.feature_cols[j]: float(X_train[idx, j]) for j in range(len(self.feature_cols))}
-                                        pred_idx = self.ml_mechanism.predict(x_dict, return_class_index=True)
-                                        class_names = getattr(self, 'class_names', None)
-                                        if class_names and pred_idx < len(class_names) and true_idx < len(class_names):
-                                            pred_display = f"pred={class_names[pred_idx]}, "
-                                        else:
-                                            pred_display = f"pred={pred_idx}, "
-                                    except:
-                                        pass
-                                
-                                class_names = getattr(self, 'class_names', None)
-                                match_status = "mismatched" if is_mismatched else "matched"
-                                if class_names and true_idx < len(class_names):
-                                    logger.info(f"    {rank}. Sample {idx}: {feat_display} → {pred_display}true={class_names[true_idx]}, residual={residual_val:.2f} ({match_status})")
-                                else:
-                                    logger.info(f"    {rank}. Sample {idx}: {feat_display} → {pred_display}true={true_idx}, residual={residual_val:.2f} ({match_status})")
-                except Exception as e:
-                    logger.warning(f"  [Residual Samples] Failed to log residual samples: {e}")
-            
-            ml_knowledge = extract_ml_knowledge(self.ml_mechanism, self.feature_cols, self.task_type)
-            
-            # Determine if ML model is linear
-            model_name = getattr(self.ml_mechanism, "model_name", "unknown")
-            is_linear_ml = model_name in ["LinearRegression", "LogisticRegression"]
-            
-            # Generate variants (up to num_mechanisms_unknown)
-            mechanisms = []
-            num_variants = min(3, self.num_mechanisms_unknown)
-            
-            # If ML model is linear, skip linear variant (variant 0) and use non-linear variants
-            # This ensures LLM mechanisms complement rather than replicate the ML model
-            if is_linear_ml and num_variants == 1:
-                # Only 1 mechanism needed: use non-linear variant (variant 2)
-                variant = 2
-                mech = generate_ml_guided_mechanism(
-                    ml_knowledge, self.feature_cols, self.task_type, self.class_names, variant,
-                    use_scaling=getattr(self, 'use_scaling', True)
-                )
-                mechanisms.append(mech)
-            else:
-                # Generate multiple variants
-                for variant in range(num_variants):
-                    mech = generate_ml_guided_mechanism(
-                        ml_knowledge, self.feature_cols, self.task_type, self.class_names, variant
-                    )
-                    mechanisms.append(mech)
-            
-            self.unknown_mechanisms = mechanisms
-            return mechanisms
+        # ALWAYS use encoder/decoder approach for first iteration to use actual samples
+        # This generates mechanisms based on the actual data samples, not just feature importance
+        # The encoder sees actual samples with their features and targets, allowing it to reason
+        # about relationships in the data rather than relying on potentially poor ML model feature importance
+        logger.info("  [Sample-Based Init] Using encoder/decoder approach with actual samples for first mechanism generation...")
         
-        # Standard mechanism generation (not ML-guided)
+        # Log sample information for transparency
+        if ml_residuals is not None and len(ml_residuals) > 0:
+            try:
+                # For classification: residuals are 1.0 (mismatched) or 0.0 (matched)
+                # Sort descending to put mismatched (1.0) first
+                sorted_indices = np.argsort(ml_residuals)[::-1]  # Sort by residual descending (1.0 first, then 0.0)
+                top_5_idx = sorted_indices[:MAX_WORST_RESIDUAL_SAMPLES]
+                
+                # Check if we have any mismatched examples (residual > 0)
+                mismatched_count = np.sum(ml_residuals > 0)
+                if mismatched_count == 0:
+                    logger.info(f"  [Sample Info] Showing top {min(MAX_WORST_RESIDUAL_SAMPLES, len(X_train))} samples that will be used for mechanism generation:")
+                else:
+                    logger.info(f"  [Sample Info] Top {min(MAX_WORST_RESIDUAL_SAMPLES, mismatched_count)} samples with highest residuals (will be included in mechanism generation):")
+                # Try to get X_train_original (SMILES) from parent TrainableMAICL if available
+                X_original = None
+                if hasattr(self, 'X_train_original') and self.X_train_original is not None:
+                    X_original = self.X_train_original
+                elif hasattr(self, 'predictor') and hasattr(self.predictor, 'X_train_original'):
+                    X_original = self.predictor.X_train_original
+                
+                for rank, idx in enumerate(top_5_idx, 1):
+                    if idx < len(X_train) and idx < len(y_train):
+                        # Use SMILES string if available, otherwise fall back to feature names
+                        if X_original is not None and idx < len(X_original):
+                            original_feat = X_original[idx]
+                            if isinstance(original_feat, dict):
+                                # Extract SMILES or other original features
+                                if 'SMILES' in original_feat:
+                                    feat_display = f"SMILES={original_feat['SMILES']}"
+                                    # Also show a small preview of any non-ECFP descriptor fields (e.g., RDKit)
+                                    try:
+                                        extras = []
+                                        for k, v in original_feat.items():
+                                            if k == "SMILES":
+                                                continue
+                                            if str(k).startswith("ecfp_bit_"):
+                                                continue
+                                            extras.append((k, v))
+                                        if extras:
+                                            extras_preview = ", ".join(
+                                                [f"{k}={v:.2f}" if isinstance(v, (int, float, np.number)) else f"{k}={str(v)[:20]}"
+                                                 for k, v in extras[: max(0, MAX_FEATURES_IN_COMPONENT_LIST - 1)]]
+                                            )
+                                            feat_display = f"{feat_display}, {extras_preview}"
+                                    except Exception:
+                                        pass
+                                elif 'SUBSTRATES' in original_feat:
+                                    feat_display = f"SUBSTRATES={original_feat['SUBSTRATES']}"
+                                else:
+                                    # Use first few key-value pairs
+                                    key_vals = list(original_feat.items())[:MAX_FEATURES_IN_COMPONENT_LIST]
+                                    feat_display = ', '.join([f"{k}={v}" for k, v in key_vals])
+                            else:
+                                feat_display = f"original_feat={str(original_feat)[:MAX_FEATURE_DISPLAY_LENGTH]}"
+                        else:
+                            # Fallback: use feature names (vectorized)
+                            feature_names = self.feature_cols if self.feature_cols else [f"x{j}" for j in range(X_train.shape[1])]
+                            feat_vals = {feature_names[j]: float(X_train[idx, j]) for j in range(min(len(feature_names), X_train.shape[1]))}
+                            feat_display = ', '.join([f"{k}={v:.2f}" for k, v in list(feat_vals.items())[:MAX_FEATURES_IN_COMPONENT_LIST]])
+                        
+                        if self.task_type == "regression":
+                            y_pred = ml_residuals[idx] + y_train[idx] if ml_residuals is not None else y_train[idx]
+                            logger.info(f"    {rank}. Sample {idx}: {feat_display} → ML-pred={y_pred:.2f}, true={y_train[idx]:.2f}, residual={ml_residuals[idx]:+.2f}")
+                        else:
+                            # Classification: show predicted vs true, and residual (1.0=mismatched, 0.0=matched)
+                            true_idx = int(y_train[idx])
+                            residual_val = ml_residuals[idx]
+                            is_mismatched = residual_val > 0.5  # For classification, residual is 1.0 or 0.0
+                            
+                            # Try to get prediction if available
+                            pred_display = ""
+                            if hasattr(self, 'ml_mechanism') and self.ml_mechanism is not None:
+                                try:
+                                    x_dict = {self.feature_cols[j]: float(X_train[idx, j]) for j in range(len(self.feature_cols))}
+                                    pred_idx = self.ml_mechanism.predict(x_dict, return_class_index=True)
+                                    class_names = getattr(self, 'class_names', None)
+                                    if class_names and pred_idx < len(class_names) and true_idx < len(class_names):
+                                        pred_display = f"pred={class_names[pred_idx]}, "
+                                    else:
+                                        pred_display = f"pred={pred_idx}, "
+                                except:
+                                    pass
+                            
+                            class_names = getattr(self, 'class_names', None)
+                            match_status = "mismatched" if is_mismatched else "matched"
+                            if class_names and true_idx < len(class_names):
+                                logger.info(f"    {rank}. Sample {idx}: {feat_display} → {pred_display}true={class_names[true_idx]}, residual={residual_val:.2f} ({match_status})")
+                            else:
+                                logger.info(f"    {rank}. Sample {idx}: {feat_display} → {pred_display}true={true_idx}, residual={residual_val:.2f} ({match_status})")
+            except Exception as e:
+                logger.warning(f"  [Sample Info] Failed to log sample information: {e}")
+        
+        # Standard mechanism generation using encoder/decoder (uses actual samples)
         mechanisms = []
         for _ in range(self.num_mechanisms_unknown):
             latent_z = self.encode_latent_space(X_train, y_train, prediction_errors, ml_residuals)
@@ -1415,30 +1467,54 @@ class VariationalMechanismGenerator:
             
             classification_instruction = f"""
 
-CRITICAL FOR CLASSIFICATION TASKS:
-1. Start with a clear MECHANISM DESCRIPTION section (2-4 sentences) that explains:
-   - The classification task: what you are classifying and into which classes{f" ({class_names_str})" if class_names_str else ""}
-   - Which features are most important for distinguishing between classes
-   - How the mechanism uses these features to make classification decisions
-   - Specific decision rules or boundaries that separate different classes
+CRITICAL FOR CLASSIFICATION TASKS - FIRST ITERATION GENERATION:
+You are generating a classification mechanism based on ACTUAL DATA SAMPLES. Look at the example samples provided in the latent mechanism z to understand the relationships between features and class labels. DO NOT rely on feature importance from ML models - instead, reason about the actual data patterns you see in the samples.
 
-2. Use descriptive, plain language to explain the classification logic:
-   - Describe how different feature values relate to different classes
-   - Explain decision boundaries (e.g., "examples with high FEATURE_X are typically class A")
+1. MECHANISM DESCRIPTION (be generous with text - 5-8 sentences):
+   - Start with a detailed explanation of the classification task: what you are classifying and into which classes{f" ({class_names_str})" if class_names_str else ""}
+   - Analyze the example samples to identify which features are most important for distinguishing between classes
+   - Describe how the mechanism uses these features to make classification decisions based on patterns observed in the samples
+   - Explain specific decision rules or boundaries that separate different classes, referencing what you see in the data
+   - Describe how different feature values relate to different classes based on the samples
+   - Explain decision boundaries with examples from the data (e.g., "examples with high FEATURE_X are typically class A")
    - Describe how the mechanism handles edge cases or ambiguous examples
+   - Explain the domain-specific reasoning: what makes sense mechanistically given the dataset context
 
-3. CRITICAL: For EACH CLASS, FIRST provide a TEXTUAL INTERPRETATION, THEN provide the equation with ADVANCED NONLINEAR TRANSFORMATIONS:
-   - Start with a textual interpretation of what the class represents (if it has a meaningful label)
-   - Describe the relationship between the class and input features - think about NONLINEAR relationships and INTERACTIONS
-   - Explain what patterns/characteristics distinguish this class from others
-   - THEN provide the equation (score_0, score_1, score_2, etc.) with ADVANCED NONLINEAR TRANSFORMATIONS
+2. INTERMEDIATE STEPS AND FORMULAS (REQUIRED - show your work):
+   You MUST show intermediate computational steps before the final class scores. This helps explain the reasoning process.
+   
+   STEP 1 - Feature Transformations:
+   - Show how individual features are transformed (e.g., saturation, normalization, log transforms)
+   - Provide formulas for each transformation: transformed_feature1 = <formula>, transformed_feature2 = <formula>, etc.
+   - Explain WHY each transformation is applied based on the data patterns you observe
+   
+   STEP 2 - Intermediate Concepts (combinatory variables):
+   - Introduce 2-4 INTERMEDIATE CONCEPTS that capture complex relationships between features
+   - For EACH intermediate concept, provide:
+     * A descriptive name (e.g., class_separation_factor, feature_interaction_strength, class_characteristic_score)
+     * A detailed explanation of what it represents mechanistically (2-3 sentences)
+     * The FORMULA for computing it: intermediate_name = <formula>
+     * Examples of intermediate concepts:
+       - class_separation_factor = feature1 * feature2 / (K + feature1 * feature2) (nonlinear interaction)
+       - saturation_effect = feature1 / (K + feature1) (diminishing returns)
+       - inhibition_strength = 1 / (1 + alpha * feature3) (inhibition/gating)
+   - Explain how these intermediates combine information from multiple features to capture class-specific patterns
+
+3. CRITICAL: For EACH CLASS, provide detailed INTERPRETATION and EQUATION with INTERMEDIATE STEPS:
+   - Start with a detailed textual interpretation of what the class represents (if it has a meaningful label)
+   - Describe the relationship between the class and input features - think about NONLINEAR relationships and INTERACTIONS observed in the samples
+   - Explain what patterns/characteristics distinguish this class from others based on the data
+   - Show INTERMEDIATE COMPUTATIONS for this class:
+     * Compute intermediate variables specific to this class
+     * Show how features are combined: class_intermediate = <formula>
+   - THEN provide the final class score equation (score_0, score_1, score_2, etc.) with ADVANCED NONLINEAR TRANSFORMATIONS
    - Each class equation MUST use:
      * INTERMEDIATE VARIABLES to capture complex nonlinear interactions (e.g., intermediate = feature1 * feature2 / (K + feature1 * feature2))
      * Saturation effects: feature / (K + feature) to capture diminishing returns
      * NONLINEAR INTERACTIONS: not just feature1 * feature2, but feature1 * feature2 / (K + feature1 * feature2) to learn the nonlinearity of interactions
      * Multiple interaction patterns: multiplicative, ratio-based, threshold-based
    - LEARN THE NONLINEARITY OF INTERACTIONS: interactions themselves may have saturation or other nonlinear effects
-   - DISCOVER which features interact and HOW they interact nonlinearly
+   - DISCOVER which features interact and HOW they interact nonlinearly based on the samples
    - Think about intermediate variables: create variables that capture complex relationships between features
    - Think about how features interact: do high values of multiple features create synergistic effects? How do they interact nonlinearly?
    - Consider saturation effects: do very high feature values have diminishing returns?
@@ -1448,38 +1524,82 @@ CRITICAL FOR CLASSIFICATION TASKS:
    - DO NOT use simple multiplicative interactions - learn the nonlinearity of interactions themselves
    - Instead, compute a score for each class independently using advanced nonlinear transformations and intermediate variables, then use argmax to select the class
 
-4. After the descriptive text, provide the executable FORMULA that implements the classification logic
+4. After all class descriptions, provide the executable FINAL PREDICTION formula
 
-FORMAT:
+OUTPUT FORMAT (exact order - be generous with descriptions):
 MECHANISM DESCRIPTION:
-[2-4 sentences clearly describing the classification task and how features are used to distinguish between classes]
+<5-8 sentences with detailed explanation of the classification task, data patterns observed, and reasoning>
+
+STEP 1 - FEATURE TRANSFORMATIONS:
+<For each key feature, show the transformation formula and explain why>
+- transformed_feature1 = <formula>  # Explanation of why this transformation
+- transformed_feature2 = <formula>  # Explanation of why this transformation
+- ...
+
+STEP 2 - INTERMEDIATE CONCEPTS:
+<For each intermediate concept, provide name, detailed explanation, and formula>
+- <intermediate_name>: <2-3 sentence explanation of what it represents mechanistically>
+  Formula: <intermediate_name> = <formula>
+- <intermediate_name>: <2-3 sentence explanation of what it represents mechanistically>
+  Formula: <intermediate_name> = <formula>
+- ...
 
 CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS:
-CLASS 0 ({class_names[0] if class_names and len(class_names) > 0 else 'class0'}):
-  INTERPRETATION: [Textual description of what this class represents, its relationship to input features, and what patterns characterize it. If the class has a meaningful label, interpret what that label means in the context of the features.]
+CLASS 0 ({self.class_names[0] if self.class_names and len(self.class_names) > 0 else 'class0'}):
+  INTERPRETATION: <3-5 sentences describing what this class represents, its relationship to input features based on observed patterns, and what characteristics distinguish it from other classes>
+  
+  INTERMEDIATE COMPUTATIONS FOR CLASS 0:
+  - class0_intermediate1 = <formula>  # Explanation of what this captures for this class
+  - class0_intermediate2 = <formula>  # Explanation of what this captures for this class
+  
   EQUATION:
-    score_0 = [equation using features that are important for this class]
+    score_0 = <equation using transformed features, intermediate concepts, and class-specific intermediates with nonlinear transformations>
 
-CLASS 1 ({class_names[1] if class_names and len(class_names) > 1 else 'class1'}):
-  INTERPRETATION: [Textual description of what this class represents, its relationship to input features, and what patterns characterize it. If the class has a meaningful label, interpret what that label means in the context of the features.]
+CLASS 1 ({self.class_names[1] if self.class_names and len(self.class_names) > 1 else 'class1'}):
+  INTERPRETATION: <3-5 sentences describing what this class represents, its relationship to input features based on observed patterns, and what characteristics distinguish it from other classes>
+  
+  INTERMEDIATE COMPUTATIONS FOR CLASS 1:
+  - class1_intermediate1 = <formula>  # Explanation of what this captures for this class
+  - class1_intermediate2 = <formula>  # Explanation of what this captures for this class
+  
   EQUATION:
-    score_1 = [equation using features that are important for this class]
+    score_1 = <equation using transformed features, intermediate concepts, and class-specific intermediates with nonlinear transformations>
 
 [Continue for all classes...]
 
 FINAL PREDICTION:
 ŷ = argmax([score_0, score_1, ...])
 
-EXAMPLE FORMAT:
+EXAMPLE STRUCTURE:
 MECHANISM DESCRIPTION:
-This mechanism classifies examples into {len(class_names) if class_names else 'N'} classes: {class_names_str if class_names_str else '[class names]'}. Each class has distinct characteristics that can be identified through different feature combinations.
+Based on the sample data, I observe that [describe patterns]. The mechanism classifies examples into {len(self.class_names) if self.class_names else 'N'} classes: {class_names_str if class_names_str else '[class names]'}. Each class has distinct characteristics that can be identified through different feature combinations. [Continue with detailed explanation...]
 
-CLASS-SPECIFIC EQUATIONS:
-CLASS 0 ({class_names[0] if class_names and len(class_names) > 0 else 'class0'}): This class is characterized by high values of [feature1] and low values of [feature2]. Examples with [specific pattern] tend to belong to this class.
-  score_0 = 0.5*feature1 + 0.3*feature2 - 0.2*feature3
+STEP 1 - FEATURE TRANSFORMATIONS:
+- normalized_feature1 = feature1 / (K1 + feature1)  # Saturation effect observed in high-value samples
+- log_feature2 = log(1 + feature2)  # Diminishing returns pattern seen in data
 
-CLASS 1 ({class_names[1] if class_names and len(class_names) > 1 else 'class1'}): This class is characterized by moderate [feature1] and high [feature3]. Examples with [specific pattern] tend to belong to this class.
-  score_1 = 0.3*feature1 + 0.6*feature3 + 0.1*feature4
+STEP 2 - INTERMEDIATE CONCEPTS:
+- class_separation_factor: This represents how well features separate classes through nonlinear interaction. It models how feature1 and feature2 interact nonlinearly.
+  Formula: class_separation_factor = normalized_feature1 * log_feature2 / (0.3 + normalized_feature1 * log_feature2)
+
+CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS:
+CLASS 0 ({self.class_names[0] if self.class_names and len(self.class_names) > 0 else 'class0'}):
+  INTERPRETATION: This class is characterized by [detailed description based on samples]. Examples with [specific pattern] tend to belong to this class because [reasoning from data].
+  
+  INTERMEDIATE COMPUTATIONS FOR CLASS 0:
+  - class0_characteristic = normalized_feature1 * (1 - log_feature2) / (0.2 + normalized_feature1 * (1 - log_feature2))  # Captures class-specific pattern
+  
+  EQUATION:
+    score_0 = 0.5 * class_separation_factor + 0.3 * class0_characteristic + 0.2 * normalized_feature1 / (0.4 + normalized_feature1)
+
+CLASS 1 ({self.class_names[1] if self.class_names and len(self.class_names) > 1 else 'class1'}):
+  INTERPRETATION: This class is characterized by [detailed description based on samples]. Examples with [specific pattern] tend to belong to this class because [reasoning from data].
+  
+  INTERMEDIATE COMPUTATIONS FOR CLASS 1:
+  - class1_characteristic = log_feature2 * normalized_feature1 / (0.3 + log_feature2 * normalized_feature1)  # Captures class-specific pattern
+  
+  EQUATION:
+    score_1 = 0.4 * class_separation_factor + 0.4 * class1_characteristic + 0.2 * log_feature2 / (0.5 + log_feature2)
 
 [Continue for all classes...]
 
@@ -1503,35 +1623,104 @@ FINAL PREDICTION:
             
             regression_instruction = f"""
 
-CRITICAL FOR REGRESSION TASKS:
-1. Be concise and useful: write a clear MECHANISM DESCRIPTION (3-5 sentences) explaining:
-   - What latent process you hypothesize and how it maps inputs to the target
-   - Which features are primary drivers vs secondary modulators
-   - At least 1 nonlinearity (saturation, diminishing returns, inverse-U, log/exp, soft-thresholds)
-   - At least 1 interaction (synergy, inhibition, ratio effects, gating)
+CRITICAL FOR REGRESSION TASKS - FIRST ITERATION GENERATION:
+You are generating a regression mechanism based on ACTUAL DATA SAMPLES. Look at the example samples provided in the latent mechanism z to understand the relationships between features and target values. DO NOT rely on feature importance from ML models - instead, reason about the actual data patterns you see in the samples.
 
-2. Introduce 1–3 INTERMEDIATE CONCEPTS (combinatory variables) in text, e.g.:
-   - effective_substrate = x*y/(K+x*y) (nonlinear synergy)
-   - capacity_limit = x/(K+x) (saturation)
-   - inhibition = 1/(1+alpha*z) (inhibition/gating)
-   Explain what each intermediate represents mechanistically.
+1. MECHANISM DESCRIPTION (be generous with text - 5-8 sentences):
+   - Start with a detailed explanation of what latent process you hypothesize based on the actual samples you see
+   - Describe how inputs map to the target by analyzing the example samples provided
+   - Explain which features are primary drivers vs secondary modulators based on patterns in the data
+   - Describe at least 1-2 nonlinearities (saturation, diminishing returns, inverse-U, log/exp, soft-thresholds) and WHY they are needed based on the data
+   - Describe at least 1-2 interactions (synergy, inhibition, ratio effects, gating) and HOW they manifest in the samples
+   - Explain the domain-specific reasoning: what makes sense mechanistically given the dataset context
+   - Be specific about what you observe in the samples that leads to your mechanism design
+
+2. INTERMEDIATE STEPS AND FORMULAS (REQUIRED - show your work):
+   You MUST show intermediate computational steps before the final formula. This helps explain the reasoning process.
+   
+   STEP 1 - Feature Transformations:
+   - Show how individual features are transformed (e.g., saturation, normalization, log transforms)
+   - Provide formulas for each transformation: transformed_feature1 = <formula>, transformed_feature2 = <formula>, etc.
+   - Explain WHY each transformation is applied based on the data patterns
+   
+   STEP 2 - Intermediate Concepts (combinatory variables):
+   - Introduce 2-4 INTERMEDIATE CONCEPTS that capture complex relationships
+   - For EACH intermediate concept, provide:
+     * A descriptive name (e.g., effective_substrate, capacity_limit, inhibition_factor)
+     * A detailed explanation of what it represents mechanistically (2-3 sentences)
+     * The FORMULA for computing it: intermediate_name = <formula>
+     * Examples of intermediate concepts:
+       - effective_substrate = x*y/(K+x*y) (nonlinear synergy)
+       - capacity_limit = x/(K+x) (saturation)
+       - inhibition = 1/(1+alpha*z) (inhibition/gating)
+       - interaction_strength = feature1 * feature2 / (threshold + feature1 * feature2) (nonlinear interaction)
+   - Explain how these intermediates combine information from multiple features
+   
+   STEP 3 - Combining Intermediates:
+   - Show how the intermediate concepts are combined: combined_signal = <formula using intermediates>
+   - Explain the combination logic: additive, multiplicative, weighted, etc.
+   - Provide the formula: combined_signal = <formula>
+   
+   STEP 4 - Final Prediction:
+   - Show how the combined signal maps to the final prediction
+   - Include any final transformations, offsets, or scaling
+   - This becomes your FINAL FORMULA
 
 3. FINAL FORMULA REQUIREMENTS (do not violate):
    - Provide EXACTLY ONE SINGLE-LINE formula starting with "Formula:" so it can be extracted programmatically.
+   - The final formula should INLINE/EXPAND all intermediate variables (do not reference intermediate names)
    - Do NOT output Python code blocks, def statements, or multi-line equations.
-   - Do NOT reference intermediate names in the final Formula line; inline/expand them in the expression.
    - {scaling_note}
    - Use stable coefficients and reasonable constants (avoid extreme values).
+   - The final formula should be the complete, expanded version of all the intermediate steps combined.
 
-OUTPUT FORMAT (exact order):
+OUTPUT FORMAT (exact order - be generous with descriptions):
 MECHANISM DESCRIPTION:
-<3-5 sentences>
+<5-8 sentences with detailed explanation of the mechanism, data patterns observed, and reasoning>
 
-INTERMEDIATE CONCEPTS (text; you may include short inline equations):
-- <name>: <meaning>, <optional inline equation>
+STEP 1 - FEATURE TRANSFORMATIONS:
+<For each key feature, show the transformation formula and explain why>
+- transformed_feature1 = <formula>  # Explanation of why this transformation
+- transformed_feature2 = <formula>  # Explanation of why this transformation
 - ...
 
+STEP 2 - INTERMEDIATE CONCEPTS:
+<For each intermediate concept, provide name, detailed explanation, and formula>
+- <intermediate_name>: <2-3 sentence explanation of what it represents mechanistically>
+  Formula: <intermediate_name> = <formula>
+- <intermediate_name>: <2-3 sentence explanation of what it represents mechanistically>
+  Formula: <intermediate_name> = <formula>
+- ...
+
+STEP 3 - COMBINING INTERMEDIATES:
+<Show how intermediates are combined>
+combined_signal = <formula using intermediate concepts>
+<Explanation of combination logic>
+
+STEP 4 - FINAL PREDICTION:
+<Final formula that inlines all intermediates>
 {scaling_line}
+
+EXAMPLE STRUCTURE:
+MECHANISM DESCRIPTION:
+Based on the sample data, I observe that [describe patterns]. The mechanism models [describe process]. Primary drivers are [features] because [reasoning from samples]. Secondary modulators include [features] which [explain effect]. Nonlinearity is needed because [observe saturation/diminishing returns in samples]. Interactions occur because [observe patterns in samples].
+
+STEP 1 - FEATURE TRANSFORMATIONS:
+- normalized_feature1 = feature1 / (K1 + feature1)  # Saturation effect observed in high-value samples
+- log_feature2 = log(1 + feature2)  # Diminishing returns pattern seen in data
+
+STEP 2 - INTERMEDIATE CONCEPTS:
+- effective_capacity: This represents the effective processing capacity that combines feature1 and feature2. It models how these features interact nonlinearly, with saturation when both are high.
+  Formula: effective_capacity = normalized_feature1 * log_feature2 / (0.3 + normalized_feature1 * log_feature2)
+- inhibition_factor: This models how feature3 inhibits the overall process, with stronger inhibition at higher values.
+  Formula: inhibition_factor = 1 / (1 + 0.5 * feature3)
+
+STEP 3 - COMBINING INTERMEDIATES:
+combined_signal = effective_capacity * inhibition_factor + 0.1 * feature4
+This combines the effective capacity (modulated by inhibition) with a small contribution from feature4.
+
+STEP 4 - FINAL PREDICTION:
+{scaling_line.replace('Formula: ŷ = ', 'Formula: ŷ = clip(').replace('<expression>', 'effective_capacity * inhibition_factor + 0.1 * feature4').replace('clip(', 'clip(') if 'clip' in scaling_line else scaling_line.replace('Formula: ŷ = ', 'Formula: ŷ = ').replace('<expression>', 'effective_capacity * inhibition_factor + 0.1 * feature4')}
 """
             decoder_prompt_enhanced = decoder_prompt_enhanced + regression_instruction
         
@@ -2055,7 +2244,7 @@ class TrainableMAICL:
                 if range_perf > 0:
                     # Check if ML mechanism is significantly better than LLM mechanisms
                     ml_indices = [i for i, t in enumerate(self.mechanism_types) if t == "ml"]
-                    llm_indices = [i for i, t in enumerate(self.mechanism_types) if t == "llm"]
+                    llm_indices = [i for i, t in enumerate(self.mechanism_types) if t in ("llm", "known")]
                     
                     if len(ml_indices) > 0 and len(llm_indices) > 0:
                         ml_perf = max([predictor.mechanism_performance.get(i, 0.5) for i in ml_indices])
@@ -2097,7 +2286,7 @@ class TrainableMAICL:
         # Boost ML mechanism confidence if it clearly outperforms LLM mechanisms
         try:
             ml_indices = [i for i, t in enumerate(self.mechanism_types) if t == "ml"]
-            llm_indices = [i for i, t in enumerate(self.mechanism_types) if t == "llm"]
+            llm_indices = [i for i, t in enumerate(self.mechanism_types) if t in ("llm", "known")]
             if len(ml_indices) > 0 and len(llm_indices) > 0:
                 ml_perf = np.mean([predictor.mechanism_performance.get(i, 0.5) for i in ml_indices])
                 llm_perf = np.mean([predictor.mechanism_performance.get(i, 0.5) for i in llm_indices])
@@ -2173,6 +2362,37 @@ class TrainableMAICL:
             hard_gate = hard_ml_gate_threshold if hard_ml_gate_threshold is not None else HARD_ML_GATE_THRESHOLD
             min_w = min_ml_weight if min_ml_weight is not None else MIN_ML_WEIGHT
             max_w = max_ml_weight if max_ml_weight is not None else MAX_ML_WEIGHT
+        # Use temperature=0.8 for all evaluations
+        # This ensures consistent LLM behavior across training and final evaluation
+        original_llm = None
+        original_temperature = None
+        use_consistent_llm = True  # Always use consistent LLM for evaluations
+        
+        if use_consistent_llm:
+            # CRITICAL FIX: Use temperature=0 (deterministic) when preserve_mechanism_performance=True
+            # to ensure exact reproduction of best iteration performance. For training evaluations,
+            # use temperature=0.8 to allow some exploration. For final evaluation with preservation,
+            # use temperature=0 to get deterministic results that match the best iteration.
+            eval_temperature = 0.0 if preserve_mechanism_performance else 0.8
+            # Set LLM temperature for consistent predictions during evaluation
+            if hasattr(self.llm, 'set_temperature'):
+                # Store original temperature if we can get it
+                if hasattr(self.llm, 'llm') and hasattr(self.llm.llm, 'temperature'):
+                    original_temperature = self.llm.llm.temperature
+                self.llm.set_temperature(eval_temperature)
+                if preserve_mechanism_performance:
+                    logger.info(f"  [Evaluate] Set LLM temperature to {eval_temperature} for deterministic final evaluation (preserving best iteration performance)")
+                else:
+                    logger.debug(f"  [Evaluate] Set LLM temperature to {eval_temperature} for evaluation")
+            elif hasattr(self.llm, 'key_manager') and hasattr(self.llm.key_manager, 'get_current_llm'):
+                # Use LLM with specified temperature for this evaluation
+                original_llm = self.llm.llm
+                self.llm.llm = self.llm.key_manager.get_current_llm(temperature=eval_temperature)
+                if preserve_mechanism_performance:
+                    logger.info(f"  [Evaluate] Using LLM (temperature={eval_temperature}) for deterministic final evaluation (preserving best iteration performance)")
+                else:
+                    logger.debug(f"  [Evaluate] Using LLM (temperature={eval_temperature}) for evaluation")
+        
         predictor = MultiAgentPredictor(
             self.llm, self.mechanisms, self.mechanism_types,
             self.mech_generator.ml_mechanism, self.feature_cols, self.scaler, att_temp,
@@ -2218,7 +2438,7 @@ class TrainableMAICL:
             # This ensures ML mechanism dominates and MA-ICL starts at baseline performance
             if is_pre_training:
                 for mech_idx, mtype in enumerate(self.mechanism_types):
-                    if mtype == "llm" and mech_idx not in self.mechanism_performance_snapshot:
+                    if mtype in ("llm", "known") and mech_idx not in self.mechanism_performance_snapshot:
                         # Set LLM mechanisms to very low performance (0.01) so they get minimal weight
                         predictor.update_mechanism_performance(mech_idx, 0.01)
                         logger.debug(f"  [Evaluate] Set LLM mechanism {mech_idx} to minimal performance (0.01) for pre-training")
@@ -2234,7 +2454,77 @@ class TrainableMAICL:
         # These contain non-vectorized features (e.g., SMILES strings) for LLM
         X_original = kwargs.get('X_original', None)
         X_pool_original = kwargs.get('X_pool_original', None)
+
+        # Safety: for DeepChem-style molecular datasets we must NOT fall back to ECFP bit vectors for the LLM.
+        # DeepChem detection is based on the ML feature naming convention (ecfp_bit_*).
+        is_deepchem = bool(self.feature_cols) and all(
+            str(f).startswith("ecfp_bit_") for f in self.feature_cols[: min(10, len(self.feature_cols))]
+        )
+        if is_deepchem:
+            if X_original is None or len(X_original) != len(X):
+                raise ValueError(
+                    "DeepChem/molecular regression detected (ecfp_bit_* features). "
+                    "Refusing to pass high-dimensional ECFP vectors to the LLM. "
+                    "Provide X_original with SMILES dicts (len(X_original) must equal len(X))."
+                )
+            k_shot_eff = getattr(self, 'k_shot', 0) if hasattr(self, 'k_shot') else 0
+            if k_shot_eff and (X_pool_original is None or len(X_pool_original) != len(X_pool)):
+                raise ValueError(
+                    "DeepChem/molecular regression with k_shot>0 requires X_pool_original (SMILES) for the training pool. "
+                    "Refusing to use vectorized ECFP bits as few-shot context. "
+                    "Provide X_pool_original with SMILES dicts (len(X_pool_original) must equal len(X_pool))."
+                )
+
+        # Safety: for DeepChem-style molecular datasets we must NOT fall back to ECFP bit vectors for the LLM.
+        is_deepchem = bool(self.feature_cols) and all(
+            str(f).startswith("ecfp_bit_") for f in self.feature_cols[: min(10, len(self.feature_cols))]
+        )
+        if is_deepchem:
+            if X_original is None or len(X_original) != len(X):
+                raise ValueError(
+                    "DeepChem/molecular regression detected (ecfp_bit_* features). "
+                    "Refusing to pass high-dimensional ECFP vectors to the LLM. "
+                    "Provide X_original with SMILES dicts (len(X_original) must equal len(X))."
+                )
+            k_shot = getattr(self, 'k_shot', 0) if hasattr(self, 'k_shot') else 0
+            if k_shot and (X_pool_original is None or len(X_pool_original) != len(X_pool)):
+                raise ValueError(
+                    "DeepChem/molecular regression with k_shot>0 requires X_pool_original (SMILES) for the training pool. "
+                    "Refusing to use vectorized ECFP bits as few-shot context. "
+                    "Provide X_pool_original with SMILES dicts (len(X_pool_original) must equal len(X_pool))."
+                )
+
+        # Safety: for DeepChem-style molecular datasets we must NOT fall back to ECFP bit vectors for the LLM.
+        # DeepChem detection is based on the ML feature naming convention used in `018_maicl_regression_biotech.py`.
+        is_deepchem = bool(self.feature_cols) and all(
+            str(f).startswith("ecfp_bit_") for f in self.feature_cols[: min(10, len(self.feature_cols))]
+        )
+        if is_deepchem:
+            if X_original is None or len(X_original) != len(X):
+                raise ValueError(
+                    "DeepChem/molecular regression detected (ecfp_bit_* features). "
+                    "Refusing to pass high-dimensional ECFP vectors to the LLM. "
+                    "Provide X_original with SMILES dicts (len(X_original) must equal len(X))."
+                )
+            if getattr(self, "k_shot", 0) and (X_pool_original is None or len(X_pool_original) != len(X_pool)):
+                raise ValueError(
+                    "DeepChem/molecular regression with k_shot>0 requires X_pool_original (SMILES) for the training pool. "
+                    "Refusing to use vectorized ECFP bits as few-shot context. "
+                    "Provide X_pool_original with SMILES dicts (len(X_pool_original) must equal len(X_pool))."
+                )
         
+        # Build numeric feature dicts for ML baselines (always derived from X, never from X_original).
+        # This avoids a common failure mode with OpenML datasets where X_original contains categorical
+        # strings, causing MLModelMechanism.predict() to crash/fallback and destroying ML performance.
+        x_numeric_dicts: List[Dict[str, float]] = []
+        try:
+            n_cols = len(self.feature_cols) if self.feature_cols is not None else int(getattr(X, "shape", [0, 0])[1])
+            for i in range(len(X)):
+                x_numeric_dicts.append({self.feature_cols[j]: float(X[i, j]) for j in range(n_cols)})
+        except Exception:
+            # Last resort: keep empty list (predict_batch will fall back to x_dict)
+            x_numeric_dicts = []
+
         # Use batched prediction for efficiency
         # For DeepChem datasets, X_original contains SMILES strings (dict with 'SMILES' key)
         # For other datasets, X_original may contain original feature dicts or be None
@@ -2244,7 +2534,11 @@ class TrainableMAICL:
             for i in range(len(X)):
                 if isinstance(X_original[i], dict):
                     # Already a dict (e.g., {'SMILES': '...'} for DeepChem)
-                    x_dicts.append(X_original[i].copy())
+                    # Also strip any accidental ecfp_bit_* keys to guarantee we never feed fingerprint bits to the LLM.
+                    d = X_original[i].copy()
+                    if is_deepchem:
+                        d = {k: v for k, v in d.items() if not str(k).startswith("ecfp_bit_")}
+                    x_dicts.append(d)
                 else:
                     # Fallback: convert from vectorized features
                     x_dicts.append({self.feature_cols[j]: float(X[i, j]) for j in range(len(self.feature_cols))})
@@ -2361,7 +2655,11 @@ class TrainableMAICL:
         if should_recalculate:
             # First pass: Make predictions with current routing (snapshot or default scores)
             # This gives us individual mechanism predictions needed for performance calculation
-            initial_batch_outputs = predictor.predict_batch(x_dicts, few_shot_list=few_shot_list)
+            initial_batch_outputs = predictor.predict_batch(
+                x_dicts,
+                few_shot_list=few_shot_list,
+                x_numeric_dicts=x_numeric_dicts if x_numeric_dicts else None,
+            )
             initial_all_agent_preds = [out[1] for out in initial_batch_outputs]
             initial_true_values = [float(y[i]) for i in range(len(y))]
             
@@ -2369,7 +2667,11 @@ class TrainableMAICL:
             self._evaluate_mechanism_performance(initial_all_agent_preds, initial_true_values, predictor)
             
             # Second pass: Re-make predictions with correct routing weights
-            batch_outputs = predictor.predict_batch(x_dicts, few_shot_list=few_shot_list)
+            batch_outputs = predictor.predict_batch(
+                x_dicts,
+                few_shot_list=few_shot_list,
+                x_numeric_dicts=x_numeric_dicts if x_numeric_dicts else None,
+            )
             predictions = [out[0] for out in batch_outputs]
             all_agent_preds = [out[1] for out in batch_outputs]
             true_values = [float(y[i]) for i in range(len(y))]
@@ -2390,7 +2692,11 @@ class TrainableMAICL:
                         self.mechanism_metrics_snapshot[mech_idx] = copy.deepcopy(mech_metrics)
         else:
             # Not recalculating: make predictions once with snapshot scores
-            batch_outputs = predictor.predict_batch(x_dicts, few_shot_list=few_shot_list)
+            batch_outputs = predictor.predict_batch(
+                x_dicts,
+                few_shot_list=few_shot_list,
+                x_numeric_dicts=x_numeric_dicts if x_numeric_dicts else None,
+            )
             predictions = [out[0] for out in batch_outputs]
             all_agent_preds = [out[1] for out in batch_outputs]
             true_values = [float(y[i]) for i in range(len(y))]
@@ -2418,28 +2724,44 @@ class TrainableMAICL:
                 else:  # Default to F1
                     loss = 1.0 - f1
             else:
-                y_pred = (y_probs >= 0.5).astype(int)
-                acc = accuracy_score(y_true, y_pred)
-                f1 = f1_score(y_true, y_pred, zero_division=0)
-                # For binary, use optimal threshold based on the selected metric
+                # Binary classification:
+                # - Predictor emits probability-like scores in [0,1]
+                # - Return *label* predictions for downstream confusion matrices and summaries
+                y_pred_05 = (y_probs >= 0.5).astype(int)
+                acc_05 = accuracy_score(y_true, y_pred_05)
+                f1_05 = f1_score(y_true, y_pred_05, zero_division=0)
+
+                # Use optimal threshold based on selected metric (for both loss and reported metrics)
                 metric_for_threshold = 'f1' if classification_loss == "f1" else 'accuracy'
                 optimal_threshold = find_optimal_threshold(y_true, y_probs, metric=metric_for_threshold)
-                y_pred_optimal = (y_probs >= optimal_threshold).astype(int)
-                acc_optimal = accuracy_score(y_true, y_pred_optimal)
-                f1_optimal = f1_score(y_true, y_pred_optimal, zero_division=0)
-                # Choose loss based on classification_loss_metric
+                y_pred = (y_probs >= optimal_threshold).astype(int)
+                acc = accuracy_score(y_true, y_pred)
+                f1 = f1_score(y_true, y_pred, zero_division=0)
+
+                # Choose loss based on classification_loss_metric (consistent with reported acc/f1)
                 if classification_loss == "acc":
-                    loss = 1.0 - acc_optimal
+                    loss = 1.0 - acc
                 else:  # Default to F1
-                    loss = 1.0 - f1_optimal
+                    loss = 1.0 - f1
             
             result = {
                 "accuracy": acc,
                 "f1": f1,
                 "loss": loss,
-                "predictions": predictions,
+                # For classification, store class *labels* in predictions (required by confusion matrices).
+                # For binary classification, also include probability scores separately.
+                "predictions": y_pred.tolist() if isinstance(y_pred, np.ndarray) else predictions,
                 "true_values": true_values
             }
+            # Attach probability scores for binary classification (useful for thresholding/analysis)
+            if (self.class_names is None) or (len(self.class_names) == 2):
+                result["probabilities"] = y_probs.tolist()
+                try:
+                    result["threshold_opt"] = float(optimal_threshold)  # type: ignore[name-defined]
+                    result["acc@0.5"] = float(acc_05)  # type: ignore[name-defined]
+                    result["f1@0.5"] = float(f1_05)  # type: ignore[name-defined]
+                except Exception:
+                    pass
             
             if return_details:
                 result["recall"] = recall_score(y_true, y_pred, zero_division=0, average='weighted' if len(self.class_names) > 2 else 'binary')
@@ -2483,6 +2805,15 @@ class TrainableMAICL:
                 "predictions": predictions,
                 "true_values": true_values
             }
+            
+            # Restore original LLM temperature after evaluation if we changed it
+            if original_llm is not None:
+                self.llm.llm = original_llm
+                logger.debug(f"  [Evaluate] Restored original LLM temperature")
+            elif original_temperature is not None and hasattr(self.llm, 'set_temperature'):
+                self.llm.set_temperature(original_temperature)
+                logger.debug(f"  [Evaluate] Restored original LLM temperature to {original_temperature}")
+            
             # Store few-shot examples used in this evaluation (for preservation)
             if len(few_shot_list) > 0 and len(few_shot_list[0]) > 0:
                 result["few_shot_examples"] = few_shot_list[0]  # All samples use same few-shot examples
@@ -2512,12 +2843,17 @@ class TrainableMAICL:
             k_shot: Number of few-shot examples to use
             **kwargs: Additional parameters
         """
+        # Initialize variables for LLM temperature restoration (if needed)
+        original_llm = None
+        original_temperature = None
+        
         # Filter to only LLM mechanisms
         llm_mechanisms = []
         llm_mechanism_types = []
         llm_indices = []
         for i, (mech, mech_type) in enumerate(zip(self.mechanisms, self.mechanism_types)):
-            if mech_type == "llm":
+            # Treat "known" as textual mechanisms for LLM-only evaluation (non-ML evaluation).
+            if mech_type in ("llm", "known"):
                 llm_mechanisms.append(mech)
                 llm_mechanism_types.append(mech_type)
                 llm_indices.append(i)
@@ -2559,6 +2895,17 @@ class TrainableMAICL:
         # These contain non-vectorized features (e.g., SMILES strings) for LLM
         X_original = kwargs.get('X_original', None)
         X_pool_original = kwargs.get('X_pool_original', None)
+
+        # Detect DeepChem-style molecular datasets (ecfp_bit_* feature names).
+        # In that case, we must never fall back to passing the ECFP bit vectors to the LLM.
+        is_deepchem = bool(self.feature_cols) and all(
+            str(f).startswith("ecfp_bit_") for f in self.feature_cols[: min(10, len(self.feature_cols))]
+        )
+        if is_deepchem and (X_original is None or len(X_original) != len(X)):
+            raise ValueError(
+                "DeepChem/molecular regression detected (ecfp_bit_* features). "
+                "LLM-only evaluation requires X_original with SMILES dicts (len(X_original) must equal len(X))."
+            )
         
         # Use batched prediction for efficiency
         # For DeepChem datasets, X_original contains SMILES strings (dict with 'SMILES' key)
@@ -2569,7 +2916,10 @@ class TrainableMAICL:
             for i in range(len(X)):
                 if isinstance(X_original[i], dict):
                     # Already a dict (e.g., {'SMILES': '...'} for DeepChem)
-                    x_dicts.append(X_original[i].copy())
+                    d = X_original[i].copy()
+                    if is_deepchem:
+                        d = {k: v for k, v in d.items() if not str(k).startswith("ecfp_bit_")}
+                    x_dicts.append(d)
                 else:
                     # Fallback: convert from vectorized features
                     x_dicts.append({self.feature_cols[j]: float(X[i, j]) for j in range(len(self.feature_cols))})
@@ -2645,29 +2995,46 @@ class TrainableMAICL:
                 else:
                     loss = 1.0 - f1
             else:
-                y_pred = (y_probs >= 0.5).astype(int)
-                acc = accuracy_score(y_true, y_pred)
-                f1 = f1_score(y_true, y_pred, zero_division=0)
+                # Binary classification: return label predictions; keep probabilities separately.
+                y_pred_05 = (y_probs >= 0.5).astype(int)
+                acc_05 = accuracy_score(y_true, y_pred_05)
+                f1_05 = f1_score(y_true, y_pred_05, zero_division=0)
                 metric_for_threshold = 'f1' if classification_loss == "f1" else 'accuracy'
                 optimal_threshold = find_optimal_threshold(y_true, y_probs, metric=metric_for_threshold)
-                y_pred_optimal = (y_probs >= optimal_threshold).astype(int)
-                acc_optimal = accuracy_score(y_true, y_pred_optimal)
-                f1_optimal = f1_score(y_true, y_pred_optimal, zero_division=0)
+                y_pred = (y_probs >= optimal_threshold).astype(int)
+                acc = accuracy_score(y_true, y_pred)
+                f1 = f1_score(y_true, y_pred, zero_division=0)
                 if classification_loss == "acc":
-                    loss = 1.0 - acc_optimal
+                    loss = 1.0 - acc
                 else:
-                    loss = 1.0 - f1_optimal
+                    loss = 1.0 - f1
             
             result = {
                 "accuracy": acc,
                 "f1": f1,
                 "loss": loss,
-                "predictions": predictions,
+                "predictions": y_pred.tolist() if isinstance(y_pred, np.ndarray) else predictions,
                 "true_values": true_values
             }
+            if (self.class_names is None) or (len(self.class_names) == 2):
+                result["probabilities"] = y_probs.tolist()
+                try:
+                    result["threshold_opt"] = float(optimal_threshold)  # type: ignore[name-defined]
+                    result["acc@0.5"] = float(acc_05)  # type: ignore[name-defined]
+                    result["f1@0.5"] = float(f1_05)  # type: ignore[name-defined]
+                except Exception:
+                    pass
             
             if return_details:
                 result["recall"] = recall_score(y_true, y_pred, zero_division=0, average='weighted' if len(self.class_names) > 2 else 'binary')
+            
+            # Restore original LLM temperature after evaluation if we changed it
+            if original_llm is not None:
+                self.llm.llm = original_llm
+                logger.debug(f"  [Evaluate] Restored original LLM temperature")
+            elif original_temperature is not None and hasattr(self.llm, 'set_temperature'):
+                self.llm.set_temperature(original_temperature)
+                logger.debug(f"  [Evaluate] Restored original LLM temperature to {original_temperature}")
             
             return result
         else:
@@ -2729,6 +3096,15 @@ class TrainableMAICL:
             acceptance_set = "validation"
         
         logger.info(f"\n[Training] Starting {iterations} iterations...")
+
+        # Persist originals for later DeepChem-safe evaluation and feedback.
+        # These are used to ensure LLM mechanisms receive SMILES/descriptor dicts, never ECFP vectors.
+        if X_train_original is not None:
+            self.X_train_original = X_train_original
+        if X_val_original is not None:
+            self.X_val_original = X_val_original
+        if X_test_original is not None:
+            self.X_test_original = X_test_original
         
         # Store output_dir for artifact persistence
         if output_dir is not None:
@@ -2741,11 +3117,15 @@ class TrainableMAICL:
         # Initialize iteration history tracking for TextGrad memory
         self.textgrad_iteration_history = []  # List of dicts with iteration history
         
-        # Store X_train_original (SMILES strings) for use in residual logging
-        self.X_train_original = X_train_original
+        # Store X_train_original (SMILES strings) for use in residual logging.
+        # IMPORTANT: avoid overwriting previously-set originals with None.
+        if X_train_original is not None:
+            self.X_train_original = X_train_original
         # Store X_val_original and X_test_original for DeepChem datasets
-        self.X_val_original = X_val_original
-        self.X_test_original = X_test_original
+        if X_val_original is not None:
+            self.X_val_original = X_val_original
+        if X_test_original is not None:
+            self.X_test_original = X_test_original
         # Also make it accessible to mechanism generator
         if self.mech_generator is not None:
             if self.mech_generator.predictor is None:
@@ -2870,6 +3250,34 @@ class TrainableMAICL:
         X_accept_consistent = X_accept[accept_idx]
         y_accept_consistent = y_accept[accept_idx]
         logger.info(f"  Using consistent {set_name} subset: {len(X_accept_consistent)}/{len(X_accept)} samples")
+
+        # Build DeepChem-safe eval_kwargs once and reuse throughout training.
+        # This prevents later evaluate() calls (e.g., after TextGrad updates) from accidentally dropping X_original.
+        eval_kwargs = {}
+        is_deepchem = bool(self.feature_cols) and all(
+            str(f).startswith("ecfp_bit_") for f in self.feature_cols[: min(10, len(self.feature_cols))]
+        )
+        if is_deepchem:
+            def _subset_original(full_list: Optional[List[Dict]], idxs: np.ndarray) -> Optional[List[Dict]]:
+                if full_list is None:
+                    return None
+                try:
+                    return [full_list[int(j)] for j in idxs]
+                except Exception:
+                    return None
+
+            if acceptance_set == "test":
+                X_accept_original = _subset_original(getattr(self, "X_test_original", None), accept_idx)
+            elif acceptance_set == "train":
+                X_accept_original = _subset_original(getattr(self, "X_train_original", None), accept_idx)
+            else:
+                # default: validation
+                X_accept_original = _subset_original(getattr(self, "X_val_original", None), accept_idx)
+
+            if X_accept_original is not None:
+                eval_kwargs["X_original"] = X_accept_original
+            if getattr(self, "X_train_original", None) is not None:
+                eval_kwargs["X_pool_original"] = getattr(self, "X_train_original", None)
         
         # CRITICAL FIX: Evaluate pre-training state and save as initial checkpoint
         # This ensures we can restore to the pre-training state if no improvements are made
@@ -2883,9 +3291,13 @@ class TrainableMAICL:
             routing_kwargs['max_ml_weight'] = self.max_ml_weight
         if hasattr(self, 'hard_ml_gate_threshold'):
             routing_kwargs['hard_ml_gate_threshold'] = self.hard_ml_gate_threshold
-        
-        initial_metrics = self.evaluate(X_accept_consistent, y_accept_consistent, X_train, y_train, relax_routing=True,
-                                      k_shot=self.k_shot, **routing_kwargs)
+
+        # Merge kwargs to avoid accidental duplicate keys (e.g., attention_temp) causing TypeError.
+        merged_eval_kwargs = {**routing_kwargs, **eval_kwargs}
+        initial_metrics = self.evaluate(
+            X_accept_consistent, y_accept_consistent, X_train, y_train,
+            relax_routing=True, k_shot=self.k_shot, **merged_eval_kwargs
+        )
         initial_loss = initial_metrics.get('loss', None)
         logger.info(f"  [Initial Checkpoint] Pre-training evaluation completed")
         
@@ -3405,7 +3817,24 @@ class TrainableMAICL:
                             if use_smiles and idx < len(self.X_train_original):
                                 original_feat = self.X_train_original[idx]
                                 if isinstance(original_feat, dict) and 'SMILES' in original_feat:
+                                    # Show SMILES plus a small preview of non-ECFP descriptor fields (e.g., RDKit descriptors)
                                     key_feats = f"SMILES={original_feat['SMILES']}"
+                                    try:
+                                        extra_items = []
+                                        for k, v in original_feat.items():
+                                            if k == "SMILES":
+                                                continue
+                                            if str(k).startswith("ecfp_bit_"):
+                                                continue
+                                            extra_items.append((k, v))
+                                        if extra_items:
+                                            extra_preview = ", ".join(
+                                                [f"{k}={v:.2f}" if isinstance(v, (int, float, np.number)) else f"{k}={str(v)[:20]}"
+                                                 for k, v in extra_items[: max(0, MAX_FEATURES_IN_EXAMPLE - 1)]]
+                                            )
+                                            key_feats = f"{key_feats}, {extra_preview}"
+                                    except Exception:
+                                        pass
                                 else:
                                     # Fallback to feature values
                                     feat_vals = {feature_names[j]: float(X_train[idx, j]) for j in range(min(len(feature_names), X_train.shape[1]))}
@@ -3497,16 +3926,11 @@ class TrainableMAICL:
                 # This helps LLM mechanisms learn to work independently, not just complement ML
                 try:
                     llm_only_kwargs_feedback = {}
-                    if hasattr(self, 'X_train_original'):
-                        llm_only_kwargs_feedback['X_pool_original'] = self.X_train_original
-                    if hasattr(self, 'X_val_original') and X_accept_consistent is X_val:
-                        llm_only_kwargs_feedback['X_original'] = self.X_val_original
-                        if len(accept_idx) < len(self.X_val_original):
-                            llm_only_kwargs_feedback['X_original'] = [self.X_val_original[j] for j in accept_idx]
-                    elif hasattr(self, 'X_test_original') and X_accept_consistent is X_test:
-                        llm_only_kwargs_feedback['X_original'] = self.X_test_original
-                        if len(accept_idx) < len(self.X_test_original):
-                            llm_only_kwargs_feedback['X_original'] = [self.X_test_original[j] for j in accept_idx]
+                    # Reuse DeepChem-safe originals (if any) for LLM-only feedback evaluation.
+                    if "X_pool_original" in eval_kwargs:
+                        llm_only_kwargs_feedback["X_pool_original"] = eval_kwargs["X_pool_original"]
+                    if "X_original" in eval_kwargs:
+                        llm_only_kwargs_feedback["X_original"] = eval_kwargs["X_original"]
                     
                     llm_only_metrics_feedback = self.evaluate_llm_only(
                         X_accept_consistent, y_accept_consistent, X_train, y_train,
@@ -3609,8 +4033,11 @@ class TrainableMAICL:
                         llm_idx += 1
                 
                 # Re-evaluate ON THE SAME CONSISTENT SUBSET
-                new_metrics = self.evaluate(X_accept_consistent, y_accept_consistent, X_train, y_train, relax_routing=True,
-                                            k_shot=self.k_shot, **routing_kwargs)
+                merged_eval_kwargs = {**routing_kwargs, **eval_kwargs}
+                new_metrics = self.evaluate(
+                    X_accept_consistent, y_accept_consistent, X_train, y_train,
+                    relax_routing=True, k_shot=self.k_shot, **merged_eval_kwargs
+                )
                 new_loss = new_metrics['loss']
                 # Snapshot "before" metrics for correct history bookkeeping
                 metrics_before_snapshot = metrics if metrics is not None else {}
@@ -4090,6 +4517,10 @@ class TrainableMAICL:
                         
                         # Capture few-shot examples from current metrics (if available)
                         few_shot_examples_from_metrics = metrics.get('few_shot_examples', None) if metrics else None
+                        if few_shot_examples_from_metrics is None:
+                            # Ensure snapshot always has a list (empty means "no few-shot")
+                            # If k_shot>0 and missing, this may hurt reproducibility, but we still persist a consistent shape.
+                            few_shot_examples_from_metrics = []
                         
                         # Store routing config for exact restoration
                         routing_config = {
@@ -4107,7 +4538,9 @@ class TrainableMAICL:
                             "mechanism_types": copy.deepcopy(self.mechanism_types),
                             "mechanism_performance": perf_snapshot,
                             "mechanism_metrics": metrics_snapshot,
-                            "few_shot_examples": copy.deepcopy(few_shot_examples_from_metrics) if few_shot_examples_from_metrics is not None else None,
+                            # Always save list (empty if k_shot=0 or missing), for consistent restoration
+                            "few_shot_examples": copy.deepcopy(few_shot_examples_from_metrics),
+                            "k_shot": self.k_shot,  # CRITICAL: Save k_shot value to ensure final evaluation uses same value
                             "routing_config": routing_config  # Store routing config for exact restoration
                         }
                         if self.task_type == "classification":
@@ -4200,7 +4633,13 @@ class TrainableMAICL:
                     if few_shot_examples_from_metrics is not None and len(few_shot_examples_from_metrics) > 0:
                         logger.debug(f"  [Best Checkpoint] Captured {len(few_shot_examples_from_metrics)} few-shot examples from metrics")
                     else:
-                        logger.warning(f"  [Best Checkpoint] WARNING: No few-shot examples found in metrics! This may cause final evaluation to differ from training.")
+                        if self.k_shot == 0:
+                            few_shot_examples_from_metrics = []  # Explicitly persist empty list for consistency
+                            logger.info("  [Best Checkpoint] Captured empty few-shot examples (k_shot=0) to ensure consistency")
+                        else:
+                            # Persist a consistent list shape even if missing
+                            few_shot_examples_from_metrics = []
+                            logger.warning(f"  [Best Checkpoint] WARNING: No few-shot examples found in metrics! k_shot={self.k_shot}. Final evaluation may differ from training.")
                     
                     # Store routing config for exact restoration
                     routing_config = {
@@ -4218,7 +4657,9 @@ class TrainableMAICL:
                         "mechanism_types": copy.deepcopy(self.mechanism_types),
                         "mechanism_performance": perf_snapshot,
                         "mechanism_metrics": metrics_snapshot,
-                        "few_shot_examples": copy.deepcopy(few_shot_examples_from_metrics) if few_shot_examples_from_metrics is not None else None,
+                        # Always save list (empty if k_shot=0 or missing), for consistent restoration
+                        "few_shot_examples": copy.deepcopy(few_shot_examples_from_metrics) if few_shot_examples_from_metrics is not None else [],
+                        "k_shot": self.k_shot,  # CRITICAL: Save k_shot value to ensure final evaluation uses same value
                         "routing_config": routing_config  # Store routing config for exact restoration
                     }
                     if self.task_type == "classification":
@@ -4614,10 +5055,23 @@ class TrainableMAICL:
                     
                     # CRITICAL: Restore few-shot examples from best snapshot (for consistency in final evaluation)
                     restored_few_shot_examples = best_snapshot.get("few_shot_examples", None)
-                    if restored_few_shot_examples is not None and len(restored_few_shot_examples) > 0:
+                    restored_k_shot = best_snapshot.get("k_shot", None)
+
+                    # Restore k_shot value from best snapshot to ensure consistency
+                    if restored_k_shot is not None:
+                        self.k_shot = restored_k_shot
+                        logger.info(f"  [Restoration] ✓ Restored k_shot={restored_k_shot} from best iteration (iter {best_snapshot['iteration']})")
+
+                    # Always restore the few-shot list if present (even if empty) for reproducibility.
+                    if restored_few_shot_examples is not None:
                         self._best_few_shot_examples = copy.deepcopy(restored_few_shot_examples)
-                        logger.info(f"  [Restoration] ✓ Restored {len(restored_few_shot_examples)} few-shot examples from best iteration (iter {best_snapshot['iteration']})")
-                        logger.info(f"  [Restoration] These few-shot examples will be used in final evaluation to ensure consistency with best iteration performance")
+                        if len(restored_few_shot_examples) > 0:
+                            logger.info(f"  [Restoration] ✓ Restored {len(restored_few_shot_examples)} few-shot examples from best iteration (iter {best_snapshot['iteration']})")
+                            logger.info(f"  [Restoration] These few-shot examples will be used in final evaluation to ensure consistency with best iteration performance")
+                        else:
+                            logger.info(f"  [Restoration] ✓ Restored empty few-shot examples (k_shot={restored_k_shot}) from best iteration (iter {best_snapshot['iteration']})")
+                            if restored_k_shot is not None and restored_k_shot > 0:
+                                logger.warning("  [Restoration] ⚠️  Best snapshot indicates k_shot>0 but saved few-shot examples are empty; final evaluation will proceed with empty few-shot for exact reproduction.")
                     else:
                         self._best_few_shot_examples = None
                         logger.warning(f"  [Restoration] ⚠️  No few-shot examples in best snapshot! Final evaluation will re-select few-shot examples, which may cause different results.")

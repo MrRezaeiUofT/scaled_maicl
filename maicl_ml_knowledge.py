@@ -207,46 +207,44 @@ KEY FEATURES (by ML relative importance - use as guide, NOT as coefficients):
             if class_names and len(class_names) > 0:
                 n_classes = len(class_names)
                 class_mapping = ", ".join([f"{i}={cn}" for i, cn in enumerate(class_names)])
+
+                # Detect lymphography-style feature set to tailor the initial mechanism (avoids filler text).
+                feat_set = set([str(f) for f in (feature_cols or [])])
+                is_lymphography = all(k in feat_set for k in ("lymphatics", "block_of_affere", "bl_of_lymph_s", "bl_of_lymph_c", "by_pass"))
                 
                 # Generate class-specific equations instead of thresholding
                 mechanism += f"\n\nCLASSIFICATION FORMULATION:\n"
-                mechanism += f"This mechanism uses separate equations for each class. First, interpret each class textually based on its label and relationship to input features. Then compute a score for each class, and select the class with the highest score.\n\n"
+                if is_lymphography and n_classes == 4:
+                    mechanism += (
+                        "This is a 4-way lymphography diagnosis task with many ordinal/discrete features (often {0.00, 0.33, 0.67, 1.00}). "
+                        "Use per-class scores with saturation and a few robust interactions, then pick the argmax.\n\n"
+                    )
+                else:
+                    mechanism += (
+                        "Use separate per-class score equations with nonlinear transforms and interactions, then select the class with the highest score.\n\n"
+                    )
                 
                 # Generate textual interpretations and equations for each class
                 for i, class_name in enumerate(class_names):
                     mechanism += f"CLASS {i} ({class_name}):\n"
                     
-                    # Add textual interpretation for the class
+                    # Pick a couple features for concrete signatures
                     primary_feat = top_features[i % len(top_features)] if len(top_features) > 0 else "feature_0"
                     secondary_feat = top_features[(i + 1) % len(top_features)] if len(top_features) > 1 else primary_feat
-                    
-                    # Generate meaningful textual description based on class name
-                    mechanism += f"  INTERPRETATION: "
-                    if class_name and len(class_name) > 0 and not class_name.isdigit():
-                        # Class has meaningful label - provide interpretation
-                        mechanism += f"The class '{class_name}' is characterized by "
-                        if len(top_features) >= 2:
-                            mechanism += f"specific patterns in {primary_feat} and {secondary_feat}. "
-                        else:
-                            mechanism += f"patterns in {primary_feat}. "
-                        mechanism += f"Examples belonging to this class typically exhibit "
-                        mechanism += f"distinctive NONLINEAR relationships between these features that distinguish '{class_name}' from other classes. "
-                        mechanism += f"The INTERACTION between these features is also nonlinear - they don't just multiply, but interact in complex ways. "
-                        mechanism += f"The mechanism models this class using intermediate variables and nonlinear transformations of {primary_feat}"
-                        if len(top_features) >= 2:
-                            mechanism += f" and {secondary_feat}"
-                        mechanism += f" in the scoring equation.\n"
+
+                    # Concrete signatures for lymphography (if detected)
+                    if is_lymphography and n_classes == 4:
+                        if str(class_name).lower() == "normal":
+                            signature = "lymphatics high (>=0.67) AND block_of_affere low (<=0.33); unlike metastases which shows stronger node defects"
+                        elif str(class_name).lower() == "fibrosis":
+                            signature = "lym_nodes_dimin high (>=0.67) AND regeneration_of moderate/high; unlike normal which has high lymphatics"
+                        elif "metast" in str(class_name).lower():
+                            signature = "defect_in_node high (>=0.67) OR bl_of_lymph_s/by_pass interaction strong; unlike malign_lymph which relies more on regeneration_of"
+                        else:  # malign_lymph
+                            signature = "regeneration_of high (>=0.67) with low lymphatics; unlike fibrosis which has stronger lym_nodes_dimin"
+                        mechanism += f"  SIGNATURE: {signature}\n"
                     else:
-                        # Generic class label - provide feature-based interpretation
-                        mechanism += f"This class is characterized by specific patterns in {primary_feat}"
-                        if len(top_features) >= 2:
-                            mechanism += f" and {secondary_feat}"
-                        mechanism += f". Examples belonging to this class typically exhibit distinctive NONLINEAR relationships between these features. "
-                        mechanism += f"The INTERACTION between features is nonlinear. "
-                        mechanism += f"The mechanism models this class using intermediate variables and nonlinear transformations of {primary_feat}"
-                        if len(top_features) >= 2:
-                            mechanism += f" and {secondary_feat}"
-                        mechanism += f" in the scoring equation.\n"
+                        mechanism += f"  SIGNATURE: {primary_feat} high (>=0.67) with {secondary_feat} low (<=0.33) (adjust thresholds as needed)\n"
                     
                     # Add equation after interpretation - USE ADVANCED NONLINEAR TRANSFORMATIONS
                     mechanism += f"  EQUATION (with nonlinear transformations and interactions):\n"
@@ -293,7 +291,13 @@ KEY FEATURES (by ML relative importance - use as guide, NOT as coefficients):
                 mechanism += f"- Use intermediate variables to model complex relationships: intermediate = f(feature1, feature2) where f is nonlinear\n"
                 mechanism += f"- Think about feature relationships: do features interact multiplicatively, additively, or through more complex patterns?\n"
                 mechanism += f"- Optimize BOTH the form of interactions AND their coefficients - the nonlinearity of interactions matters\n"
-                mechanism += f"- Linear combinations fail - you must learn nonlinear relationships and nonlinear interactions"
+                mechanism += f"- Linear combinations fail - you must learn nonlinear relationships and nonlinear interactions\n"
+                mechanism += f"\n🧠 REASONING AND DOMAIN KNOWLEDGE:\n"
+                mechanism += f"- Use your understanding of the domain to guide feature selection and interaction design\n"
+                mechanism += f"- Think about what makes each class unique: what characteristics distinguish one class from another?\n"
+                mechanism += f"- Reason about relationships: 'If class A has high feature X and class B has low feature X, then feature X is a discriminator'\n"
+                mechanism += f"- Create meaningful intermediate variables that capture domain concepts (e.g., 'boxiness', 'elongation_factor')\n"
+                mechanism += f"- Use analogical reasoning: 'This is similar to [domain concept], so I should model it as [mathematical form]'"
             else:
                 mechanism += f"\n\nCLASSIFICATION FORMULATION:\n"
                 mechanism += f"This mechanism uses separate equations for each class with nonlinear transformations.\n\n"
@@ -391,7 +395,7 @@ KEY FEATURES:
                     # Generate meaningful textual description based on class name
                     mechanism += f"  INTERPRETATION: "
                     if class_name and len(class_name) > 0 and not class_name.isdigit():
-                        # Class has meaningful label - provide interpretation
+                        # Class has meaningful label - provide interpretation with domain knowledge
                         mechanism += f"The class '{class_name}' is characterized by "
                         if len(top_features) >= 2:
                             mechanism += f"specific patterns in {primary_feat} and {secondary_feat}. "
@@ -399,11 +403,13 @@ KEY FEATURES:
                             mechanism += f"patterns in {primary_feat}. "
                         mechanism += f"Examples belonging to this class typically exhibit "
                         mechanism += f"distinctive NONLINEAR relationships between these features that distinguish '{class_name}' from other classes. "
+                        mechanism += f"Think about what makes '{class_name}' unique: use your knowledge of the domain to understand why these features matter. "
                         mechanism += f"The INTERACTION between these features is also nonlinear - they don't just multiply, but interact in complex ways. "
                         mechanism += f"The mechanism models this class using intermediate variables and nonlinear transformations of {primary_feat}"
                         if len(top_features) >= 2:
                             mechanism += f" and {secondary_feat}"
-                        mechanism += f" in the scoring equation.\n"
+                        mechanism += f" in the scoring equation. "
+                        mechanism += f"Use your understanding of '{class_name}' to guide how these features should be combined.\n"
                     else:
                         # Generic class label - provide feature-based interpretation
                         mechanism += f"This class is characterized by specific patterns in {primary_feat}"
@@ -446,7 +452,13 @@ KEY FEATURES:
                 mechanism += f"- Use intermediate variables to model complex relationships: intermediate = f(feature1, feature2) where f is nonlinear\n"
                 mechanism += f"- Think about feature relationships: do features interact multiplicatively, additively, or through more complex patterns?\n"
                 mechanism += f"- Optimize BOTH the form of interactions AND their coefficients - the nonlinearity of interactions matters\n"
-                mechanism += f"- Linear combinations fail - you must learn nonlinear relationships and nonlinear interactions"
+                mechanism += f"- Linear combinations fail - you must learn nonlinear relationships and nonlinear interactions\n"
+                mechanism += f"\n🧠 REASONING AND DOMAIN KNOWLEDGE:\n"
+                mechanism += f"- Use your understanding of the domain to guide feature selection and interaction design\n"
+                mechanism += f"- Think about what makes each class unique: what characteristics distinguish one class from another?\n"
+                mechanism += f"- Reason about relationships: 'If class A has high feature X and class B has low feature X, then feature X is a discriminator'\n"
+                mechanism += f"- Create meaningful intermediate variables that capture domain concepts (e.g., 'boxiness', 'elongation_factor')\n"
+                mechanism += f"- Use analogical reasoning: 'This is similar to [domain concept], so I should model it as [mathematical form]'"
             else:
                 mechanism += f"\n\nCLASSIFICATION FORMULATION:\n"
                 mechanism += f"CLASS 0 SCORE: score_0 = {scaled_weights[0] if len(scaled_weights) > 0 else 0.5:.3f}*{top_features[0] if len(top_features) > 0 else 'feature_0'}\n"
@@ -680,7 +692,13 @@ KEY FEATURES:
                 mechanism += f"- Nonlinear interactions (feature1 * feature2 / (K + feature1 * feature2)) capture how features interact nonlinearly\n"
                 mechanism += f"- Optimize BOTH the form of interactions AND their coefficients - the nonlinearity of interactions matters\n"
                 mechanism += f"- Consider threshold effects: are there critical values where the relationship changes?\n"
-                mechanism += f"- Linear combinations fail - you must learn nonlinear relationships and nonlinear interactions"
+                mechanism += f"- Linear combinations fail - you must learn nonlinear relationships and nonlinear interactions\n"
+                mechanism += f"\n🧠 REASONING AND DOMAIN KNOWLEDGE:\n"
+                mechanism += f"- Use your understanding of the domain to guide feature selection and interaction design\n"
+                mechanism += f"- Think about what makes each class unique: what characteristics distinguish one class from another?\n"
+                mechanism += f"- Reason about relationships: 'If class A has high feature X and class B has low feature X, then feature X is a discriminator'\n"
+                mechanism += f"- Create meaningful intermediate variables that capture domain concepts (e.g., 'boxiness', 'elongation_factor')\n"
+                mechanism += f"- Use analogical reasoning: 'This is similar to [domain concept], so I should model it as [mathematical form]'"
             else:
                 mechanism += f"\n\nCLASSIFICATION FORMULATION:\n"
                 mechanism += f"CLASS 0 SCORE: score_0 = {scaled_weights[0] if len(scaled_weights) > 0 else 0.5:.3f} * {top_features[0] if len(top_features) > 0 else 'feature_0'} / (0.3 + {top_features[0] if len(top_features) > 0 else 'feature_0'})\n"
@@ -1064,15 +1082,25 @@ The ML baseline identifies these as the most important features:
 While it may complement other mechanisms in an ensemble, prioritize independent predictive performance.
 Your mechanism should achieve high R² and low MAE when evaluated alone (LLM-only evaluation).
 
+🧠 CRITICAL: USE YOUR INTERNAL KNOWLEDGE AND REASONING
+- Think deeply about the domain: What do you know about this problem that could help?
+- Reason about relationships: "If class A has high feature X and class B has low feature X, then feature X discriminates"
+- Use analogical reasoning: "This is similar to [domain concept], so I should model it as [mathematical form]"
+- Think step-by-step: Understand the problem → Design mechanism → Optimize coefficients
+- Consider domain-specific knowledge: e.g., for vehicles, think about what makes buses vs vans vs sedans distinctive
+- Create meaningful intermediate variables: Model domain concepts (e.g., "boxiness", "elongation_factor") as variables
+
 KEY STRATEGIES:
 1. BUILD INDEPENDENT PREDICTIVE POWER: Focus on making your mechanism work well as a standalone predictor. 
    Include all features and interactions that improve independent performance, not just those that complement other mechanisms.
    If a feature or pattern improves standalone R²/MAE, include it even if it overlaps with other mechanisms.
+   USE DOMAIN KNOWLEDGE: Think about what features should matter for this problem based on your understanding.
 
 2. LEARN NEW COEFFICIENT VALUES: Your current formula has coefficients (like 0.783, 0.301, 0.194, etc.) that are starting values. 
    You MUST change these to new values based on performance metrics. Don't just keep the same coefficients and add interaction terms - 
    actually try different coefficient values (e.g., 0.5, 1.0, 1.2, 1.5, 2.0) to find what maximizes R² and minimizes MAE. 
    If R² is low, try increasing important feature coefficients. If MAE is high, adjust coefficients systematically.
+   REASON ABOUT COEFFICIENTS: "If feature X is very important for class A, its coefficient should be larger"
 
 3. OPTIMIZE COEFFICIENTS BASED ON PERFORMANCE METRICS: Don't just copy feature importance values - adjust coefficients based on 
    R² and MAE (for regression) or Accuracy and F1 (for classification). Feature importance (e.g., 0.392) is NOT a coefficient - 
@@ -1081,6 +1109,7 @@ KEY STRATEGIES:
 4. USE ML INSIGHTS TO IMPROVE INDEPENDENT PERFORMANCE: The error patterns identified above show where the ML model fails. 
    Use these to improve your mechanism's independent predictive power. Design your mechanism to handle these cases correctly 
    and achieve better standalone performance.
+   REASON ABOUT ERRORS: "The ML model confuses class A and B when feature X is low - I should emphasize feature X for class A"
 
 5. CRITICAL: ADD ADVANCED NONLINEAR TRANSFORMATIONS AND LEARN NONLINEAR INTERACTIONS:
    - Use INTERMEDIATE VARIABLES to capture complex nonlinear interactions: intermediate = f(feature1, feature2) where f is nonlinear
@@ -1097,9 +1126,16 @@ KEY STRATEGIES:
    - Optimize BOTH the form of interactions AND their coefficients - the nonlinearity of interactions matters
 
 6. USE COUNTERFACTUALS: The suggestions above show which features to emphasize and how to adjust them to improve standalone performance.
+   REASON ABOUT COUNTERFACTUALS: "If I increase feature X for this example, it should move toward class Y - does that make sense?"
 
 7. ITERATE BASED ON PERFORMANCE METRICS: Change coefficients, add/remove terms, or modify formulas based on R² and MAE 
    (for regression) or Accuracy and F1 (for classification). Focus on improving these metrics for standalone performance, not just reducing loss.
+   THINK ABOUT WHY CHANGES WORK: "This change improved performance because it better captures the relationship between features X and Y"
+
+8. REASON ABOUT FEATURE INTERACTIONS: Don't add random interactions - think about which features should interact and why
+   - "Features A and B both relate to [concept], so they should interact"
+   - "If feature A is high AND feature B is low, that might indicate class X"
+   - Use domain knowledge to guide interaction design
 
 CRITICAL: Your mechanism formula should use proper mathematical coefficients (typically 0.1-2.0 range), NOT raw feature importance values. 
 The initial formula uses normalized weights as a starting point - you should optimize these based on performance metrics 

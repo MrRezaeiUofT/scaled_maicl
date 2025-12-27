@@ -98,11 +98,24 @@ Key insights:
 - Features include diagnostic attributes and patient characteristics""",
         
         "lymphography": """LYMPHOGRAPHY DATASET:
-This dataset contains lymphography diagnosis data.
-Key insights:
-- 4 classes with limited samples
-- Features include diagnostic attributes
-- Medical classification task""",
+This dataset contains lymphography diagnosis attributes and the task is to classify patients into 4 diagnosis categories.
+
+Class labels (common naming):
+- fibrosis
+- malign_lymph
+- metastases
+- normal
+
+Key insights for modeling:
+- Many features are ordinal/graded indicators (often encoded as a few discrete levels), so threshold/gating behavior is important.
+- Several features represent "obstruction / blockage" vs "spread / metastasis" signals; interactions between these signals matter.
+- Normal cases often have a distinctive signature (e.g., higher lymphatics-related indicators with low blockage/spread markers).
+- Confusions commonly happen between malign_lymph vs metastases; adding interaction terms and explicit gates can help.
+
+Practical guidance:
+- Prefer per-class scoring rules + argmax over fragile nested if-chains.
+- Use saturation transforms x/(K+x) for stability on discrete inputs and to avoid extreme coefficients.
+- Include at least one explicit threshold-based gate for identifying the normal class.""",
         
         "ecoli": """ECOLI DATASET:
 This dataset contains protein localization sites in E.coli bacteria.
@@ -766,6 +779,17 @@ CONSTRAINTS:
                 ph_feat = feature_cols[3] if len(feature_cols) > 3 else temp_feat
                 inhibitor_feat = feature_cols[4] if len(feature_cols) > 4 else substrate_feat
                 
+                # Calculate optimum as midpoint of scale range, or use default 5.0 if scaling is disabled
+                if scale_min is not None and scale_max is not None:
+                    optimum = (scale_min + scale_max) / 2.0
+                    scale_range_comment = f"scaled range [{scale_min}, {scale_max}], optimum at {optimum:.1f}"
+                    formula_start = f"ŷ = clip(\n\n    # Base Michaelis-Menten\n\n    6.0 * {substrate_feat} / (0.3 + {substrate_feat})\n\n    \n\n    # Cofactor enhancement\n\n    * (1 + 0.5 * {cofactor_feat})\n\n    \n\n    # Temperature optimum ({scale_range_comment})\n\n    * exp(-({temp_feat} - {optimum:.1f})^2 / 8.0)\n\n    \n\n    # pH optimum ({scale_range_comment})\n\n    * exp(-({ph_feat} - {optimum:.1f})^2 / 8.0)\n\n    \n\n    # Competitive inhibition\n\n    / (1 + 0.3 * {inhibitor_feat}),\n\n    \n\n    {scale_min}, {scale_max}\n\n)"
+                else:
+                    # Default values when scaling is disabled - no clip() function
+                    optimum = 5.0
+                    scale_range_comment = "unscaled range, optimum at 5.0"
+                    formula_start = f"ŷ = \n\n    # Base Michaelis-Menten\n\n    6.0 * {substrate_feat} / (0.3 + {substrate_feat})\n\n    \n\n    # Cofactor enhancement\n\n    * (1 + 0.5 * {cofactor_feat})\n\n    \n\n    # Temperature optimum ({scale_range_comment})\n\n    * exp(-({temp_feat} - {optimum:.1f})^2 / 8.0)\n\n    \n\n    # pH optimum ({scale_range_comment})\n\n    * exp(-({ph_feat} - {optimum:.1f})^2 / 8.0)\n\n    \n\n    # Competitive inhibition\n\n    / (1 + 0.3 * {inhibitor_feat})"
+                
                 mechanism = f"""[KNOWN] ENZYME KINETICS MECHANISM
 
 DATASET: Enzyme Activity Prediction
@@ -828,41 +852,7 @@ FEATURES ({len(feature_cols)} total):
 
 KNOWN MECHANISM FORMULA:
 
-ŷ = clip(
-
-    # Base Michaelis-Menten
-
-    6.0 * {substrate_feat} / (0.3 + {substrate_feat})
-
-    
-
-    # Cofactor enhancement
-
-    * (1 + 0.5 * {cofactor_feat})
-
-    
-
-    # Temperature optimum (scaled range 0-10, optimum at 5)
-
-    * exp(-({temp_feat} - 5.0)^2 / 8.0)
-
-    
-
-    # pH optimum (scaled range 0-10, optimum at 5)
-
-    * exp(-({ph_feat} - 5.0)^2 / 8.0)
-
-    
-
-    # Competitive inhibition
-
-    / (1 + 0.3 * {inhibitor_feat}),
-
-    
-
-    0, 10
-
-)
+{formula_start}
 
 INTERPRETATION:
 
@@ -1080,7 +1070,13 @@ CONSTRAINTS:
             # For DeepChem datasets, ALWAYS use molecular properties, never ECFP bits
             if is_deepchem_fallback:
                 # For DeepChem: use molecular properties derived from SMILES, not ECFP bits
-                formula = "ŷ = clip((molecular_weight(SMILES) + num_rings(SMILES) + num_hydroxyl_groups(SMILES)) / 3 + 0.1 * molecular_weight(SMILES) * num_rings(SMILES), 0, 10)"
+                # Use proper scaling range if available, otherwise default to [0.0, 1.0] for scaled targets
+                if scale_min is not None and scale_max is not None:
+                    clip_min, clip_max = scale_min, scale_max
+                else:
+                    # Default to [0.0, 1.0] for scaled regression targets
+                    clip_min, clip_max = 0.0, 1.0
+                formula = f"ŷ = clip((molecular_weight(SMILES) + num_rings(SMILES) + num_hydroxyl_groups(SMILES)) / 3 + 0.1 * molecular_weight(SMILES) * num_rings(SMILES), {clip_min}, {clip_max})"
             elif feature_cols and len(feature_cols) > 0:
                 # Use first few features for formula (only for non-DeepChem datasets)
                 top_features = feature_cols[:min(5, len(feature_cols))]

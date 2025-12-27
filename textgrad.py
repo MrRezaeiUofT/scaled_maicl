@@ -146,6 +146,23 @@ class TextGrad:
         except Exception as e:
             logger.warning(f"Failed to load config from {config_path}: {e}, using empty config")
             return {}
+
+    def _normalize_dataset_name(self, dataset_name: Optional[str]) -> str:
+        """Normalize dataset name for dataset-specific prompt lookups."""
+        if not dataset_name:
+            return ""
+        name = str(dataset_name).lower()
+        name = name.replace(":", " ").replace("/", " ").replace("\\", " ")
+        name = " ".join(name.split()).strip()
+        # Strip common prefixes that appear in logs/runners
+        for prefix in ("openml", "tabarena", "sklearn", "deepchem"):
+            if name.startswith(prefix):
+                name = name[len(prefix):].strip()
+                name = name.lstrip(":").lstrip("-").strip()
+                break
+        # Remove common suffix
+        name = name.replace(" dataset", "").strip()
+        return name
     
     def _build_enhanced_error_feedback(self, X_train, y_train, ml_residuals, current_loss, dataset_name, 
                                        current_metrics: Optional[Dict[str, float]] = None,
@@ -367,7 +384,41 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
                 if use_smiles and idx < len(X_train_original):
                     original_feat = X_train_original[idx]
                     if isinstance(original_feat, dict) and 'SMILES' in original_feat:
+                        # Include a small preview of non-ECFP descriptor fields (e.g., RDKit descriptors)
+                        # if present in X_train_original to actually pass them to the LLM.
                         key_feats = [f"SMILES={original_feat['SMILES']}"]
+                        try:
+                            canonical_keys = [
+                                "molecular_weight",
+                                "num_rings",
+                                "num_hydroxyl_groups",
+                                "num_halogen",
+                                "num_nitrogen",
+                                "num_oxygen",
+                                "num_atoms",
+                                "is_aromatic",
+                                "num_hbd",
+                            ]
+                            extras = []
+                            for k in canonical_keys:
+                                if k in original_feat and k != "SMILES":
+                                    extras.append((k, original_feat.get(k)))
+                            for k, v in original_feat.items():
+                                if k == "SMILES":
+                                    continue
+                                if str(k).startswith("ecfp_bit_"):
+                                    continue
+                                if k in canonical_keys:
+                                    continue
+                                extras.append((k, v))
+                            max_extras = max(0, int(MAX_FEATURES_IN_EXAMPLE) - 1)
+                            for k, v in extras[:max_extras]:
+                                if isinstance(v, (int, float, np.number)):
+                                    key_feats.append(f"{k}={float(v):.3f}")
+                                else:
+                                    key_feats.append(f"{k}={str(v)[:50]}")
+                        except Exception:
+                            pass
                     else:
                         # Fallback to feature values
                         feat_vals = {feature_names[j]: float(X_train[idx, j]) 
@@ -1134,6 +1185,19 @@ OPTIMIZATION GUIDANCE:
         for mechanism, gradient in zip(mechanisms, gradients):
             if self.task_type == "classification":
                 update_instruction = update_instructions.get('classification', "")
+                # Dataset-specific addendum (optional)
+                try:
+                    ds = self._normalize_dataset_name(self.dataset_name)
+                    ds_specific = (
+                        update_instructions
+                        .get("dataset_specific", {})
+                        .get(ds, {})
+                        .get("classification", "")
+                    )
+                    if ds_specific:
+                        update_instruction = f"{update_instruction}\n\n{ds_specific}".strip()
+                except Exception:
+                    pass
             else:
                 update_instruction = update_instructions.get('regression', "")
             

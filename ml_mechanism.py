@@ -16,23 +16,14 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.kernel_ridge import KernelRidge
 
 # Optional dependencies
-try:
-    from xgboost import XGBClassifier, XGBRegressor
-    _HAS_XGB = True
-except:
-    _HAS_XGB = False
+# NOTE: Do NOT import heavy optional libs (xgboost/tabicl) at module import time.
+# Some environments can segfault during import; import lazily only if requested.
+_HAS_XGB = False
+_HAS_TABICL = False
 
-try:
-    from tabicl import TabICLClassifier
-    _HAS_TABICL = True
-except:
-    _HAS_TABICL = False
-
-try:
-    from baticl import BaticlClassifier
-    _HAS_BATICL = True
-except:
-    _HAS_BATICL = False
+# NOTE: Do NOT import baticl at module import time.
+# Some environments can segfault during import (cannot be caught). Import it lazily only if requested.
+_HAS_BATICL = False
 
 logger = logging.getLogger(__name__)
 
@@ -106,8 +97,10 @@ class MLModelMechanism:
         elif self.model_name == "KernelRidge":
             self.model = KernelRidge(alpha=1.0, kernel='rbf')
         elif self.model_name == "XGBoost":
-            if not _HAS_XGB:
-                logger.warning("XGBoost not installed, falling back to baseline")
+            try:
+                from xgboost import XGBClassifier, XGBRegressor  # type: ignore
+            except Exception as e:
+                logger.warning("XGBoost not installed or failed to import, falling back to baseline")
                 if self.task_type == "regression":
                     self.model_name = "LinearRegression"
                     self.model = LinearRegression()
@@ -116,15 +109,26 @@ class MLModelMechanism:
                     self.model = LogisticRegression(max_iter=LOGISTIC_REGRESSION_MAX_ITER, random_state=RANDOM_STATE)
             else:
                 if self.task_type == "regression":
-                    self.model = XGBRegressor(n_estimators=XGBOOST_N_ESTIMATORS, max_depth=XGBOOST_MAX_DEPTH, 
-                                            learning_rate=XGBOOST_LEARNING_RATE, random_state=XGBOOST_RANDOM_STATE)
+                    self.model = XGBRegressor(
+                        n_estimators=XGBOOST_N_ESTIMATORS,
+                        max_depth=XGBOOST_MAX_DEPTH,
+                        learning_rate=XGBOOST_LEARNING_RATE,
+                        random_state=XGBOOST_RANDOM_STATE,
+                    )
                 else:
-                    self.model = XGBClassifier(use_label_encoder=False, eval_metric='logloss', 
-                                              n_estimators=XGBOOST_N_ESTIMATORS, max_depth=XGBOOST_MAX_DEPTH, 
-                                              learning_rate=XGBOOST_LEARNING_RATE, random_state=XGBOOST_RANDOM_STATE)
+                    self.model = XGBClassifier(
+                        use_label_encoder=False,
+                        eval_metric='logloss',
+                        n_estimators=XGBOOST_N_ESTIMATORS,
+                        max_depth=XGBOOST_MAX_DEPTH,
+                        learning_rate=XGBOOST_LEARNING_RATE,
+                        random_state=XGBOOST_RANDOM_STATE,
+                    )
         elif self.model_name == "TabICL":
-            if not _HAS_TABICL:
-                raise RuntimeError("TabICL not installed. Install with: pip install tabicl")
+            try:
+                from tabicl import TabICLClassifier  # type: ignore
+            except Exception as e:
+                raise RuntimeError("TabICL not installed or failed to import. Install with: pip install tabicl") from e
             
             # TabICL can be used for regression via quantization
             if self.task_type != "classification" and not hasattr(self, '_tabicl_regression_bins'):
@@ -147,8 +151,11 @@ class MLModelMechanism:
             # Store feature columns for DataFrame conversion
             self._tabicl_feature_cols = feature_cols
         elif self.model_name == "Baticl":
-            if not _HAS_BATICL:
-                raise RuntimeError("Baticl not installed. Install with: pip install baticl")
+            # Lazy import to avoid hard crashes on environments where baticl import is unstable.
+            try:
+                from baticl import BaticlClassifier  # type: ignore
+            except Exception as e:
+                raise RuntimeError("Baticl not installed or failed to import. Install with: pip install baticl") from e
             logger.warning("Baticl can cause segmentation faults on some systems. If you encounter crashes, use --ml_mech logreg instead.")
             try:
                 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")

@@ -1,6 +1,14 @@
 # MA-ICL Configuration
 # This file contains all prompts and templates used by the MA-ICL system
 
+# =========================
+# LLM CONFIGURATION
+# =========================
+llm:
+  # Temperature for LLM predictions (0.0 = deterministic, 1.0+ = more creative)
+  # Default: 0.8
+  temperature: 0.8
+
 prompts:
   # =========================
   # ATTENTION PROMPTS
@@ -294,26 +302,48 @@ prompts:
     encoder:
       classification: |
         You are a mechanism encoder that discovers latent patterns in {dataset_name} classification data.
-        Given dataset statistics and sample predictions, infer what underlying mechanisms might be present.
+        Given dataset statistics, ACTUAL DATA SAMPLES with their feature values and class labels, and sample predictions, infer what underlying mechanisms might be present.
+        
+        CRITICAL: Analyze the ACTUAL EXAMPLE SAMPLES provided. Look at the feature values and corresponding class labels to understand what distinguishes different classes. DO NOT rely solely on statistics - examine the concrete examples to see patterns.
+        
+        When analyzing samples, look for:
+        - Class-specific patterns: which features are high/low for each class?
+        - Decision boundaries: what feature combinations separate different classes?
+        - Nonlinear relationships: are there saturation effects or threshold behaviors?
+        - Interactions: do combinations of features help distinguish classes?
+        - Domain-specific patterns: what makes sense mechanistically given the dataset context?
+        
         Focus on:
         - Feature interactions and correlations specific to {dataset_name}
         - Non-linear decision boundaries between classes
         - Domain-specific patterns and structural relationships
         - Patterns that complement machine learning models
+        
+        Be specific: reference what you observe in the actual samples when describing mechanisms.
 
       regression: |
         You are a mechanism encoder that discovers latent causal patterns in regression data.
-        Given dataset statistics, feature names, and sample residual/error patterns, infer plausible underlying mechanisms.
+        Given dataset statistics, feature names, ACTUAL DATA SAMPLES with their feature values and target values, and sample residual/error patterns, infer plausible underlying mechanisms.
+        
+        CRITICAL: Analyze the ACTUAL EXAMPLE SAMPLES provided. Look at the feature values and corresponding target values to understand relationships. DO NOT rely solely on statistics - examine the concrete examples to see patterns.
         
         Focus on mechanisms that can BOTH:
         - Improve predictive performance (capture nonlinearities, interactions, saturation, thresholds)
         - Improve interpretability (clear causal story + named intermediate concepts)
+        
+        When analyzing samples, look for:
+        - Patterns in feature values: which features correlate with high/low target values?
+        - Nonlinear relationships: do you see saturation effects (diminishing returns at high values)?
+        - Interactions: do combinations of features show synergistic or inhibitory effects?
+        - Domain-specific patterns: what makes sense mechanistically given the dataset context?
         
         Think in terms of:
         - Nonlinear transforms: saturation (x/(K+x)), diminishing returns, inverse-U, log/exp, soft-thresholds
         - Interactions: synergy, inhibition, ratio effects, gating (A * f(B)), AND/OR-like combinations
         - Latent intermediate concepts (combinatory variables): "effective_dose", "binding_proxy", "capacity_limit", etc.
         - Complementarity: avoid simply restating what a linear model would do
+        
+        Be specific: reference what you observe in the actual samples when describing mechanisms.
 
     encoder_with_data: |
       {encoder_prompt}
@@ -323,10 +353,12 @@ prompts:
       {task_description}
       
       CRITICAL OUTPUT REQUIREMENTS:
-      - Be concise and useful: 3-5 sentences.
-      - Mention 1-2 nonlinearities and 1-2 interactions that would likely fix residual patterns.
-      - Name 1-3 latent intermediate concepts (combinatory variables) and what they represent.
-      - Avoid vague filler (no "specific patterns"/"distinctive relationships").
+      - Be detailed and specific: 5-8 sentences that reference actual sample patterns you observe.
+      - Mention 1-2 nonlinearities and 1-2 interactions that you observe in the actual samples (not just theoretical).
+      - Name 2-4 latent intermediate concepts (combinatory variables) and what they represent mechanistically.
+      - Reference specific examples from the sample data when describing patterns.
+      - Avoid vague filler (no "specific patterns"/"distinctive relationships" without concrete examples).
+      - Explain WHY you infer each mechanism component based on what you see in the samples.
 
       Latent mechanism z:
 
@@ -350,6 +382,12 @@ prompts:
       2. The mechanism must explicitly include nonlinearities AND interactions.
       3. The mechanism must introduce intermediate combinatory concepts (named, explained) that capture nonlinear interactions.
       4. The final formula must be executable and appear as a SINGLE LINE starting with "Formula:" so it can be extracted programmatically.
+
+      STRUCTURED THINKING REQUIREMENT (concise, not verbose):
+      - You MUST present the mechanism as a small sequence of conceptual steps, using clear section headers.
+      - Do NOT reveal long chain-of-thought. Instead, provide a short "Reasoning Sketch" with 4–8 bullet points describing the computation flow.
+      - Introduce 1–3 intermediate concepts (named) and explain what each represents mechanistically.
+      - The final Formula line must INLINE/EXPAND intermediates (do not reference intermediate variable names there).
       
       WHAT TO INCLUDE:
       - Named intermediate concepts (1–3): define them briefly, but do NOT rely on them in the final Formula line.
@@ -357,11 +395,33 @@ prompts:
       - Nonlinear transforms: at least one (saturation/log/soft-threshold/inverse-U).
       - Interaction terms: at least one (prefer nonlinear interaction form x*y/(K+x*y)).
       - One short "why this helps" sentence referencing typical residual patterns (extremes / interactions / thresholds).
+      - A short "Sanity Checks" list (2–4 bullets): monotonicity, saturation bounds, and at least one interaction effect.
       
       STYLE:
       - Prefer causal language ("limits", "enhances", "inhibits", "gates", "synergizes") over purely statistical phrasing.
       - Keep constants realistic and stable (avoid huge coefficients).
       - Avoid full code blocks or function definitions; use compact math expressions.
+
+      REQUIRED OUTPUT FORMAT (exact order):
+      MECHANISM DESCRIPTION:
+      <3-6 sentences>
+
+      ASSUMPTIONS / INTUITION:
+      - <1-3 bullets>
+
+      REASONING SKETCH (4–8 bullets, high level steps; no long chain-of-thought):
+      - Step 1: <compute/transform key features>
+      - Step 2: <compute intermediates (synergy/inhibition/saturation)>
+      - Step 3: <combine into final prediction>
+
+      INTERMEDIATE CONCEPTS:
+      - <name>: <meaning>, <optional inline equation>
+      - ...
+
+      SANITY CHECKS:
+      - <2-4 bullets>
+
+      Formula: ŷ = <single-line executable expression>
     
     decoder_classification: |
       You are a mechanism decoder for classification tasks. Your goal is to generate a descriptive, text-based mechanism that clearly explains how to classify examples into different classes.
@@ -397,6 +457,13 @@ prompts:
       7. DO NOT use naive thresholding - use separate equations for each class, then argmax to select the winning class
       8. DO NOT use simple linear combinations - they often fail to capture complex relationships. Think deeply about nonlinearity.
       9. DO NOT use simple multiplicative interactions - learn the nonlinearity of interactions themselves. Use intermediate variables and nonlinear interaction forms.
+
+      STRUCTURED THINKING REQUIREMENT (concise, not verbose):
+      - Provide a short "Reasoning Sketch" (4–10 bullets) that explains the decision flow:
+        (a) compute key transforms, (b) compute intermediate concepts, (c) compute per-class scores, (d) argmax.
+      - Do NOT reveal long chain-of-thought. Use short bullets only.
+      - Ensure each class section has a concrete signature + equation.
+      - Final prediction MUST be: ŷ = argmax([score_0, score_1, ...]) (no probabilistic output).
       
       FORMAT:
       First, provide a descriptive mechanism explanation in plain text that clearly describes:
@@ -404,6 +471,15 @@ prompts:
       - Which features are used and why
       - How the mechanism distinguishes between classes
       - What characterizes each class
+
+      ASSUMPTIONS / INTUITION:
+      - <1-3 bullets>
+
+      REASONING SKETCH (4–10 bullets, high-level steps; no long chain-of-thought):
+      - Step 1: <transform features / normalize>
+      - Step 2: <compute intermediate concepts (synergy/inhibition/saturation)>
+      - Step 3: <compute score_k for each class>
+      - Step 4: ŷ = argmax(scores)
       
       Then, provide CLASS-SPECIFIC EQUATIONS:
       - For each class, provide a description of what characterizes that class
@@ -465,6 +541,92 @@ prompts:
     # Note: Dataset names are normalized (lowercase, remove "dataset", etc.)
     # See _normalize_dataset_name() in maicl_lib_v2.py for normalization rules
     dataset_specific:
+      lymphography:
+        classification:
+          encoder: |
+            You are a mechanism encoder for the OpenML LYMPHOGRAPHY dataset (4-way classification).
+
+            TASK:
+            Infer a *compact latent mechanism* that separates 4 diagnosis classes.
+
+            CRITICAL DATA REPRESENTATION:
+            - Most features are ORDINAL / categorical indicators that often appear as values like {0.00, 0.33, 0.67, 1.00}.
+              Treat them as *discrete levels* (0=absent/low, 1=present/high) with intermediate grades.
+            - Do NOT assume smooth linear effects everywhere; use thresholds and saturation/gating.
+
+            CLASSES (must use these exact names later):
+            - 0=fibrosis
+            - 1=malign_lymph
+            - 2=metastases
+            - 3=normal
+
+            WHAT TO FOCUS ON:
+            - Find 1–2 dominant separating axes that identify "normal" vs "pathology" and then split pathology subtypes.
+            - Use 1–2 key *interactions* (e.g., lymphatics × block_of_affere, or bl_of_lymph_s × by_pass).
+            - Prefer mechanisms that are robust for discrete inputs (avoid fragile high-order polynomials).
+            - Avoid generic filler; write concrete signatures like:
+              "normal: lymphatics high (≥0.67) AND by_pass low (≤0.33)".
+
+            OUTPUT REQUIREMENTS:
+            - 3–6 sentences total.
+            - Name 1–3 intermediate concepts (e.g., "obstruction_signal", "spread_signal", "node_damage").
+            - Mention at least 1 threshold and at least 1 nonlinear interaction form.
+
+          decoder: |
+            You are a mechanism decoder for the OpenML LYMPHOGRAPHY dataset (4-way classification).
+
+            GOAL:
+            Produce an interpretable, executable scoring mechanism that is stable on discrete/ordinal inputs.
+
+            CLASSES (exact names):
+            0=fibrosis, 1=malign_lymph, 2=metastases, 3=normal
+
+            CRITICAL REPRESENTATION NOTE:
+            - Features are often discrete levels in {0.00, 0.33, 0.67, 1.00}. Use thresholds like 0.17 / 0.50 / 0.83.
+            - Use saturation terms x/(K+x) to avoid extreme coefficients and to make rules robust.
+
+            HARD REQUIREMENTS:
+            1. Provide per-class scores: score_0..score_3.
+            2. Use at least TWO intermediate nonlinear interactions of the form:
+               inter = (a*b) / (K + a*b)   or   inter = a/(K+a) * b/(K+b)
+            3. Use at least ONE explicit threshold gate (step-like) to help identify "normal".
+               Example: gate_norm = (1.0 if lymphatics >= 0.67 else 0.0)
+            4. Keep constants small and sane (K in ~[0.2, 1.0], weights in ~[0.1, 1.5]).
+            5. Final prediction MUST be:
+               FINAL PREDICTION:
+               ŷ = argmax([score_0, score_1, score_2, score_3])
+
+            FORMAT (keep concise):
+            MECHANISM DESCRIPTION:
+            <3-6 sentences, concrete, no filler>
+
+            REASONING SKETCH (4–8 bullets, high-level):
+            - Step 1: <compute gates/transforms>
+            - Step 2: <compute interactions>
+            - Step 3: <compute per-class scores>
+            - Step 4: argmax
+
+            CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS:
+            CLASS 0 (fibrosis):
+              SIGNATURE: <concrete conditions, contrast at least one confusing class>
+              EQUATION:
+                score_0 = ...
+            CLASS 1 (malign_lymph):
+              SIGNATURE: ...
+              EQUATION:
+                score_1 = ...
+            CLASS 2 (metastases):
+              SIGNATURE: ...
+              EQUATION:
+                score_2 = ...
+            CLASS 3 (normal):
+              SIGNATURE: ...
+              EQUATION:
+                score_3 = ...
+
+            FINAL PREDICTION:
+            ŷ = argmax([score_0, score_1, score_2, score_3])
+
       # =========================
       # DEEPCHEM MOLECULAR DATASETS (Regression & Classification)
       # =========================
@@ -1142,24 +1304,93 @@ prompts:
       
       diabetes:
         encoder: |
-          You are a mechanism encoder for diabetes regression dataset.
-          Predicts disease progression from patient features (age, BMI, blood pressure, etc.).
-          Focus on physiological relationships between features and disease progression.
+          You are a mechanism encoder for diabetes disease progression regression dataset.
+          
+          DATASET CONTEXT:
+          This dataset predicts one-year disease progression in diabetes patients from baseline measurements.
+          Features: age, sex (0=female, 1=male), bmi (body mass index), bp (blood pressure), 
+          s1-s6 (six blood serum measurements: s1=TC, s2=LDL, s3=HDL, s4=TCH, s5=LTG, s6=GLU).
+          Target: disease progression (higher = worse progression).
+          
+          CRITICAL ANALYSIS FOCUS:
+          - Examine ACTUAL sample patterns: which feature combinations correlate with high/low progression?
+          - Look for nonlinear relationships: does disease progression saturate at high BMI/BP? Are there threshold effects?
+          - Identify interactions: does the effect of BMI depend on age? Do blood markers (s1-s6) interact with metabolic factors (BMI, BP)?
+          - Physiological plausibility: age amplifies metabolic stress; BMI and BP may have synergistic effects; 
+            HDL (s3) is protective and may modulate other risk factors; lipid markers (s1, s2, s4, s5) may interact.
+          - Patterns linear models miss: saturation effects (very high BMI doesn't linearly increase risk), 
+            age-dependent effects (same BMI affects differently at different ages), 
+            protective factors (high HDL may reduce impact of other risk factors).
+          
+          When analyzing samples, look for:
+          - Cases where high BMI + high BP together cause more progression than sum of individual effects (synergy)
+          - Cases where age amplifies the effect of metabolic risk factors
+          - Cases where low HDL (s3) makes other risk factors worse (gating/modulation effect)
+          - Saturation: very high values of BMI/BP don't proportionally increase progression
+          - Blood marker interactions: how do s1-s6 interact with each other and with BMI/BP?
         decoder: |
-          You are a mechanism decoder for diabetes regression dataset.
+          You are a mechanism decoder for diabetes disease progression regression dataset.
+          
+          DATASET CONTEXT:
+          Features: age (0-1 scaled), sex (0=female, 1=male), bmi, bp, s1-s6 (blood serum measurements).
+          s1=TC (total cholesterol), s2=LDL, s3=HDL (protective), s4=TCH, s5=LTG, s6=GLU (glucose).
+          Target: disease progression (0-1 scaled, higher = worse).
           
           GOAL:
-          Predict disease progression with an interpretable physiological mechanism that includes nonlinearities and interactions.
+          Create a physiologically interpretable mechanism that captures nonlinear interactions the linear ML model misses.
+          The linear model fails on cases with high BMI+BP+low HDL, age-amplified effects, and saturation patterns.
+          
+          CRITICAL REQUIREMENTS:
+          1. CAPTURE NONLINEAR INTERACTIONS THE LINEAR MODEL MISSES:
+             - BMI × BP synergy: high BMI AND high BP together cause more progression than sum (use: bmi * bp / (K + bmi * bp))
+             - Age amplification: age makes metabolic stress worse (use: metabolic_term * (1 + age_factor * age))
+             - HDL modulation: low HDL makes other risk factors worse (use: risk_term / (K + s3) or risk_term * (1 - protective_factor * s3))
+             - Saturation: very high BMI/BP have diminishing returns (use: bmi / (K + bmi))
+          
+          2. USE INTERMEDIATE CONCEPTS (name and explain):
+             - metabolic_stress: combines BMI and BP (nonlinear interaction)
+             - age_amplification: how age amplifies metabolic effects
+             - protective_modulation: how HDL (s3) modulates other risk factors
+             - lipid_risk: combined effect of lipid markers (s1, s2, s4, s5)
+          
+          3. INCLUDE MULTIPLE NONLINEAR TRANSFORMS:
+             - Saturation: x / (K + x) for BMI, BP, or combined terms
+             - Nonlinear interactions: x * y / (K + x * y) for BMI×BP, age×metabolic_stress
+             - Modulation: risk_term / (K + protective_factor) for HDL effects
+             - Amplification: base_term * (1 + factor * age) for age effects
+          
+          4. OPTIMIZE COEFFICIENTS BASED ON PERFORMANCE:
+             - Start with coefficients in 0.1-2.0 range
+             - Adjust based on R² and MAE: if R² is low, increase important feature coefficients
+             - Interaction terms typically need coefficients 0.5-2.0
+             - Saturation constants (K) typically 0.1-0.5 for normalized features
           
           REQUIRED OUTPUT FORMAT:
-          MECHANISM DESCRIPTION: 3-5 sentences.
-          INTERMEDIATE CONCEPTS: 1-3 named concepts (explain each).
-          Formula: ŷ = clip(expression, 0.0, 1.0)  (single line; inline intermediates)
+          MECHANISM DESCRIPTION:
+          <3-6 sentences explaining the physiological model>
           
-          Guidance:
-          - Include at least two interactions (e.g., BMI × BP synergy; lipid markers coupling; age gating metabolic effects)
-          - Include at least two nonlinearities (saturation, diminishing returns, soft-threshold)
-          - Use stable coefficients; avoid brittle hard thresholds
+          INTERMEDIATE CONCEPTS:
+          - metabolic_stress: <explanation>, Formula: <inline expression>
+          - age_amplification: <explanation>, Formula: <inline expression>
+          - [optional third concept]: <explanation>
+          
+          REASONING SKETCH:
+          - Step 1: Transform BMI and BP with saturation, combine into metabolic_stress
+          - Step 2: Apply age amplification to metabolic_stress
+          - Step 3: Incorporate HDL (s3) modulation of risk factors
+          - Step 4: Add contributions from other blood markers (s1, s2, s4, s5, s6)
+          - Step 5: Combine all terms and clip to [0, 1]
+          
+          Formula: ŷ = clip(<single-line expression with all intermediates inlined>, 0.0, 1.0)
+          
+          EXAMPLE STRUCTURE (adapt coefficients based on performance):
+          metabolic_stress = (bmi * bp) / (0.2 + bmi * bp)  # Nonlinear BMI×BP synergy with saturation
+          age_effect = 1 + 0.5 * age  # Age amplifies metabolic stress
+          hdl_protection = 1 / (0.3 + s3)  # Low HDL makes risk worse (inverse relationship)
+          lipid_risk = 0.3 * s1 + 0.2 * s2 + 0.2 * s5 - 0.1 * s4  # Combined lipid effects
+          ŷ = clip(metabolic_stress * age_effect * hdl_protection + lipid_risk + 0.1 * s6, 0.0, 1.0)
+          
+          CRITICAL: Your formula must be a SINGLE LINE starting with "Formula: ŷ = clip(..." with all intermediates expanded/inlined.
       
       housing:
         encoder: |
@@ -1238,6 +1469,7 @@ prompts:
           - Provide MECHANISM DESCRIPTION (2-4 sentences)
           - Provide CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS with nonlinear interactions and intermediate variables
           - Compute scores per class and use argmax; avoid naive thresholding
+          - The petal measurements are typically the strongest signal (petal length/width separate setosa strongly; versicolor vs virginica are medium vs large petals)
           
           FINAL PREDICTION MUST BE ONE LINE:
           ŷ = argmax([score_0, score_1, score_2])
@@ -1265,8 +1497,17 @@ prompts:
           - MECHANISM DESCRIPTION (2-4 sentences) explaining the socioeconomic story
           - CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS with nonlinear interactions and intermediate variables
           - Use separate scores per class and argmax; avoid naive thresholding
+          - If categorical features are one-hot encoded, treat them as 0/1 indicator signals and combine them via weighted sums and interactions
+          
+          USEFUL SOCIOECONOMIC PRIORS (only when matching available feature names):
+          - capital_gain is often a “spiky” high-income signal (model as a strong saturating boost)
+          - education / education_num (human capital) and occupation/relationship signals are strong
+          - age and hours_per_week are monotone but saturating (seniority/work intensity)
           
           Include intermediate concepts such as "human_capital", "labor_intensity", "seniority_signal", "credential_gate".
+          
+          FINAL PREDICTION MUST BE ONE LINE (binary):
+          ŷ = argmax([score_0, score_1])
       
       mushroom:
         encoder: |
@@ -1461,6 +1702,13 @@ prompts:
           - MECHANISM DESCRIPTION (2-4 sentences)
           - CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS with nonlinear interactions and intermediate variables
           - Use argmax over class scores; avoid naive thresholding
+          
+          PRACTICAL GUIDANCE:
+          - Many zoo features are binary traits (0/1) plus a legs count; build class scores as weighted sums of “trait matches” with penalties for contradictions.
+          - If present, typical strong rules include: milk→mammal, feathers→bird, fins&aquatic→fish, backbone=0 & legs≈6→insect.
+          
+          FINAL PREDICTION MUST BE ONE LINE:
+          ŷ = argmax([score_0, score_1, score_2, ...])
       
       glass:
         encoder: |
@@ -1519,6 +1767,12 @@ prompts:
           - MECHANISM DESCRIPTION (2-4 sentences)
           - CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS with nonlinear interactions and intermediate variables
           - Use argmax over class scores; avoid naive thresholding
+          
+          NOTE:
+          - Soybean features are often categorical/one-hot symptom indicators; treat them as discrete signals and build sparse symptom “signatures” per class.
+          
+          FINAL PREDICTION MUST BE ONE LINE:
+          ŷ = argmax([score_0, score_1, score_2, ...])
       
       primary-tumor:
         encoder: |
@@ -1542,6 +1796,12 @@ prompts:
           - MECHANISM DESCRIPTION (2-4 sentences)
           - CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS with nonlinear interactions and intermediate variables
           - Use argmax over class scores; avoid naive thresholding
+          
+          GUIDANCE:
+          - Treat ordinal/categorical diagnostic findings as severity signals; combine a small number into “severity” and “pattern” intermediates (e.g., enlargement × defect).
+          
+          FINAL PREDICTION MUST BE ONE LINE:
+          ŷ = argmax([score_0, score_1, score_2, ...])
       
       ecoli:
         encoder: |
@@ -1556,6 +1816,12 @@ prompts:
           - MECHANISM DESCRIPTION (2-4 sentences)
           - CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS with nonlinear interactions and intermediate variables
           - Use argmax over class scores; avoid naive thresholding
+          
+          GUIDANCE:
+          - Prefer monotone “signal” scores with a few interactions for ambiguous classes (e.g., combine 2-3 strongest features into a localization_signal).
+          
+          FINAL PREDICTION MUST BE ONE LINE:
+          ŷ = argmax([score_0, score_1, score_2, ...])
       
       miceprotein:
         encoder: |
@@ -1570,6 +1836,12 @@ prompts:
           - MECHANISM DESCRIPTION (2-4 sentences)
           - CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS with nonlinear interactions and intermediate variables
           - Use argmax over class scores; avoid naive thresholding
+          
+          GUIDANCE:
+          - This dataset is high-dimensional; pick a small set of proteins and build 2-4 pathway-like composite signals (synergy and contrasts).
+          
+          FINAL PREDICTION MUST BE ONE LINE:
+          ŷ = argmax([score_0, score_1, score_2, ...])
       
       colon-cancer:
         encoder: |
@@ -1598,6 +1870,9 @@ prompts:
           KEEP IT SHORT:
           - MECHANISM DESCRIPTION: 2-3 sentences.
           - For each class: 2 short lines max (SIGNATURE + INTERPRETATION) + the equation.
+          
+          FINAL PREDICTION MUST BE ONE LINE:
+          ŷ = argmax([score_0, score_1, score_2, ...])
       
       credit:
         encoder: |

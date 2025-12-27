@@ -22,6 +22,24 @@ prompts:
       🎯 PRIMARY GOAL: Your mechanism must work WELL ON ITS OWN as a standalone predictor.
       While it may complement other mechanisms in an ensemble, it should be independently predictive.
       Focus on building a mechanism that can make accurate predictions by itself, not just one that fills gaps.
+      
+      🧠 USE YOUR INTERNAL KNOWLEDGE AND REASONING:
+      - Think deeply about the domain and what makes different classes distinct
+      - Use your understanding of the problem to guide feature selection and interaction design
+      - Reason about relationships: "If class A has high feature X, and class B has low feature X, then feature X is a discriminator"
+      - Consider domain-specific knowledge: e.g., for vehicles, think about what makes a bus vs van vs sedan distinctive
+      - Use analogical reasoning: "This is similar to [domain concept], so I should model it as [mathematical form]"
+      - Think step-by-step: First understand the problem, then design the mechanism, then optimize coefficients
+      
+      EXECUTABILITY + ROBUSTNESS (CRITICAL):
+      - Provide EXACTLY ONE single-line formula that starts with: "Formula: ŷ = ...".
+      - Multi-class classification (>=3 classes): you SHOULD define per-class scores (score_0, score_1, ...)
+        and then select the class via argmax. This is preferred over nested if/else trees.
+      - Binary classification (2 classes): you MAY use a single score and a threshold, or a 2-score comparison.
+      - Avoid brittle boolean gates like (feature > 0.6). Prefer smooth numeric gating:
+        max(0, feature - threshold) or feature/(threshold + feature).
+      - NOTE: Features are often scaled to a small range; products of many scaled features can vanish.
+        Keep multiplicative interactions small (2 features) OR scale them explicitly with a larger coefficient.
 
       CRITICAL: Your mechanism formula has coefficients (like 0.783, 0.301, 0.194, etc.) that are starting values. 
       You MUST learn new coefficient values based on performance metrics (R² and MAE for regression, Accuracy and F1 for classification).
@@ -32,17 +50,23 @@ prompts:
       - Don't specialize only for complementarity - build a robust standalone predictor
       - Use all relevant features and interactions that improve independent predictive power
 
-      Follow this diagnostic process:
+      Follow this diagnostic process (THINK DEEPLY AT EACH STEP):
 
-      1️⃣ ANALYZE THE ERROR PATTERNS:
+      1️⃣ ANALYZE THE ERROR PATTERNS (USE REASONING):
 
-         - What are the systematic failures? (overestimation? underestimation?)
-
+         - What are the systematic failures? (overestimation? underestimation? class confusion?)
+         
+         - REASON ABOUT ERRORS: Why is the mechanism failing? What patterns do you see?
+         
          - Which features correlate with large errors?
-
+         
          - Are errors worse for high/low values of specific features?
+         
+         - THINK ABOUT CLASS CONFUSION: Which classes are being confused? Why might that be?
+         
+         - USE DOMAIN KNOWLEDGE: What do you know about this problem that could explain the errors?
 
-      2️⃣ IDENTIFY THE ROOT CAUSE:
+      2️⃣ IDENTIFY THE ROOT CAUSE (THINK MECHANISTICALLY):
 
          - Is a key feature missing from the mechanism?
 
@@ -63,11 +87,24 @@ prompts:
            * Ratios and divisions: feature1/feature2 (if ratio relationships make sense)
            * Exponential/logarithmic relationships (only if scientifically justified)
 
-      3️⃣ PROPOSE TARGETED FIX:
+      3️⃣ PROPOSE TARGETED FIX (USE REASONING AND KNOWLEDGE):
 
+         - THINK ABOUT THE DOMAIN: Use your knowledge of the problem to design better mechanisms
+           * What makes different classes distinct? (e.g., for vehicles: buses are boxy with many windows)
+           * What features should interact? (e.g., COMPACTNESS and CIRCULARITY both relate to shape)
+           * What nonlinear relationships make sense? (e.g., saturation when features get very high)
+         
+         - REASON ABOUT FEATURE INTERACTIONS: Don't just add random interactions - think about which features should interact and why
+           * "If feature A is high AND feature B is low, that might indicate class X"
+           * "Features A and B both relate to [concept], so they should interact nonlinearly"
+         
          - BUILD INDEPENDENT PREDICTIVE POWER: Focus on making your mechanism work well as a standalone predictor. Include all features and interactions that improve independent performance, not just those that complement other mechanisms.
 
          - LEARN NEW COEFFICIENTS: Don't just add interaction terms - actually adjust the base coefficients (0.783, 0.301, etc.) based on performance metrics. If R² is low or MAE is high, increase/decrease coefficients systematically. Try different coefficient values (e.g., 0.5, 1.0, 1.5, 2.0) to find what improves performance.
+         
+         - CREATE INTERMEDIATE VARIABLES: Think about domain concepts (e.g., "boxiness", "elongation_factor") and model them as intermediate variables
+           * intermediate = f(feature1, feature2) where f captures a meaningful concept
+           * Example: boxiness = COMPACTNESS * (1 - CIRCULARITY) / (0.1 + COMPACTNESS * (1 - CIRCULARITY))
 
          - Add the missing feature or interaction that explains errors AND improves standalone performance
 
@@ -119,23 +156,31 @@ prompts:
         - Use thresholds, argmax, or conditional logic to map feature values to class indices
         - DO NOT use sigmoid or other probability functions - output must be a discrete class index
         - Be creative and expressive in your formulation while maintaining mechanistic interpretability
+        - IMPORTANT (multi-class): prefer per-class score_k equations + FINAL PREDICTION: ŷ = argmax([score_0, score_1, ...])
+        - Avoid nested if/else trees for multi-class; they are brittle and hard to optimize
 
       OUTPUT FORMAT:
 
+      THINKING PROCESS (OPTIONAL BUT ENCOURAGED):
+      
+      [Briefly explain your reasoning: What did you observe? What domain knowledge did you use? How did you reason about the fix?]
+      
       DIAGNOSIS:
 
-      [1-2 sentences: What is causing the errors based on the patterns above?]
+      [1-2 sentences: What is causing the errors based on the patterns above? Use reasoning to explain WHY the mechanism is failing.]
 
       FIX:
 
-      [1-2 sentences: What specific change will reduce these errors?]
+      [1-2 sentences: What specific change will reduce these errors? Explain HOW this fix addresses the root cause.]
 
       REVISED MECHANISM:
 
-      [Clear description of the causal process]
+      [Clear description of the causal process - explain HOW the mechanism works and WHY it should perform better. Use domain knowledge to justify your design choices.]
 
       Formula: ŷ = [executable expression with ACTUAL feature names]
       {formula_instruction}
+      
+      NOTE: If you used domain knowledge or reasoning to design this mechanism, briefly mention it (e.g., "Based on knowledge that buses have high HOLLOWS_RATIO, I designed score_0 to emphasize this feature with saturation").
 
       CRITICAL REQUIREMENTS FOR YOUR FORMULA:
       - If the current formula has coefficients like 0.783, 0.301, 0.194, you MUST change these to new values (e.g., 0.5, 1.0, 1.2, 1.5, 2.0) that improve R² and MAE
@@ -157,10 +202,36 @@ prompts:
 
       {update_instruction}
 
-      Updated mechanism (2-3 concise sentences):
+      HARD OUTPUT REQUIREMENTS:
+      - Output the FULL updated mechanism text (not just a short summary).
+      - Preserve/produce a clean structure that downstream code can reuse.
+      - Include exactly ONE line starting with "Formula:" that contains the executable prediction expression.
+      - For MULTI-CLASS classification, you MUST define score_0..score_{n_classes_minus_1} and then:
+        FINAL PREDICTION:
+        ŷ = argmax([score_0, score_1, ...])
+      - ABSOLUTELY AVOID nested if-else decision trees as the main formula; use per-class scores + argmax instead.
+      - Do NOT include code blocks.
+
+      Updated mechanism:
 
   update_instructions:
-    classification: "Update the mechanism to improve Accuracy and F1 score (primary metrics) by refining feature interactions, thresholds, and decision boundaries. Do NOT use feature importance values as coefficients - learn proper coefficients (0.1-2.0 range) by optimizing Accuracy and F1. Preserve correctness on easy cases and focus on systematic residual patterns."
+    classification: |
+      Update the mechanism to improve Accuracy and F1 score (primary metrics) by refining feature interactions, thresholds, and decision boundaries.
+      Do NOT use feature importance values as coefficients — learn proper coefficients (0.1–2.0 range) by optimizing Accuracy and F1.
+      Preserve correctness on easy cases and focus on systematic residual patterns.
+
+      Multi-class rule: prefer per-class score_k equations + argmax; avoid nested if chains.
+
+    dataset_specific:
+      lymphography:
+        classification: |
+          LYMPHOGRAPHY-SPECIFIC CONTRACT:
+          - Treat many inputs as discrete/ordinal levels (often {0.00, 0.33, 0.67, 1.00}). Use thresholds like 0.17/0.50/0.83.
+          - Classes (exact): 0=fibrosis, 1=malign_lymph, 2=metastases, 3=normal.
+          - Include an explicit normal gate based on lymphatics (e.g., gate_norm = 1 if lymphatics>=0.67 else 0).
+          - Include at least TWO nonlinear interactions (e.g., (a*b)/(K+a*b) or a/(K+a)*b/(K+b)).
+          - For each CLASS section, include a concrete SIGNATURE line (high/low + thresholds) and contrast one confusing class.
+
     regression: "Update the mechanism to maximize R² and minimize MAE (primary metrics) by refining monotonic trends, curvature, and interaction terms. Do NOT use feature importance values as coefficients - learn proper coefficients (0.1-2.0 range) by optimizing R² and MAE. Explicitly address residual bias and outliers while keeping predictions in the correct scaled range."
 
 templates:
@@ -170,18 +241,24 @@ templates:
       CRITICAL: This is a molecular dataset (DeepChem). You will receive SMILES strings as input, NOT ECFP bit features.
       
       DO NOT use ECFP bit features (ecfp_bit_0, ecfp_bit_1, etc.) in your mechanism formula.
-      INSTEAD, work with molecular properties that can be derived from SMILES strings:
-      - Molecular weight
-      - Number of atoms
-      - Number of rings
-      - Presence of specific functional groups (e.g., -OH, -COOH, -NH2)
-      - Aromaticity
-      - Polarity
-      - Hydrophobicity
-      - Branching complexity
+      
+      ALLOWED RDKit DESCRIPTORS (use ONLY these exact names / calls):
+      - molecular_weight(SMILES)
+      - num_atoms(SMILES)
+      - num_rings(SMILES)
+      - is_aromatic(SMILES)
+      - num_halogen(SMILES)
+      - num_hydroxyl_groups(SMILES)
+      - num_nitrogen(SMILES)
+      - num_oxygen(SMILES)
+      - num_hbd(SMILES)
+      
+      ABSOLUTE PROHIBITIONS:
+      - Do NOT use any ecfp_bit_* identifiers.
+      - Do NOT use non-whitelisted descriptors like logp, tpsa, qed, fragments, SMARTS/substructure matches, etc.
       
       Your mechanism should reason about molecular STRUCTURE and PROPERTIES, not ECFP fingerprint bits.
-      Example: "Molecules with more hydroxyl groups (-OH) tend to have higher solubility" NOT "ecfp_bit_27 correlates with solubility"
+      Example: "More num_hydroxyl_groups(SMILES) increases solubility" NOT "ecfp_bit_27 correlates with solubility"
       
       When writing your formula, use molecular properties or structural features that can be computed from SMILES, not ECFP bit indices.
       
@@ -207,6 +284,22 @@ templates:
       - Use thresholds/piecewise logic and feature interactions.
       - For multi-class, score each class and use argmax.
       - Pay attention to minority classes; avoid predicting only the majority.
+      FEATURES: {features}
+
+    lymphography_classification: |
+      DATASET: {dataset_name}
+      DOMAIN: Medical Tabular Classification (Lymphography)
+      TASK: 4-way classification with ordinal/discrete inputs (often levels like 0.00/0.33/0.67/1.00).
+
+      CLASSES (exact):
+      0=fibrosis, 1=malign_lymph, 2=metastases, 3=normal
+
+      HARD STYLE CONTRACT:
+      - Use per-class scores score_0..score_3 and FINAL PREDICTION: ŷ = argmax([score_0, score_1, score_2, score_3]).
+      - Include a "normal gate" driven by lymphatics (e.g., lymphatics>=0.67) and at least TWO nonlinear interactions
+        of the form (a*b)/(K+a*b) or a/(K+a)*b/(K+b).
+      - For EACH class: include a concrete SIGNATURE line (thresholds, high/low) and contrast one confusing class.
+
       FEATURES: {features}
 
     tabular_regression: &tabular_regression |
@@ -235,6 +328,56 @@ templates:
       - Use molecular properties derived from SMILES (molecular_weight, num_rings, num_halogen, num_hydroxyl_groups, num_nitrogen, num_oxygen).
       - Do NOT use ECFP bit features.
       FEATURES: SMILES + derived properties
+
+    # -----------------------------
+    # DeepChem (explicit) contexts
+    # -----------------------------
+    esol_regression: |
+      DATASET: {dataset_name} (DeepChem ESOL / Delaney-like)
+      DOMAIN: Molecular Regression (SMILES)
+      TARGET: Higher value = MORE soluble .
+      ALLOWED RDKit DESCRIPTORS (ONLY):
+      - molecular_weight(SMILES), num_atoms(SMILES), num_rings(SMILES), is_aromatic(SMILES), num_halogen(SMILES),
+        num_hydroxyl_groups(SMILES), num_nitrogen(SMILES), num_oxygen(SMILES), num_hbd(SMILES)
+      EXPECTED DIRECTIONS (typical):
+      - Polarity (num_oxygen/num_nitrogen/num_hydroxyl_groups/num_hbd) -> increase solubility
+      - Hydrophobic bulk (num_rings/is_aromatic/num_halogen/molecular_weight/num_atoms) -> decrease solubility
+      REQUIREMENTS:
+      - Use at least one saturation nonlinearity (x/(K+x), log(1+x), exp(-x))
+      - Use at least one interaction term (polarity × hydrophobe or polarity dampening hydrophobe)
+      - ABSOLUTE: never use ecfp_bit_* or any non-whitelisted descriptor names
+
+    delaney_regression: |
+      DATASET: {dataset_name} (DeepChem Delaney / ESOL-like)
+      DOMAIN: Molecular Regression (SMILES)
+      Use the exact same constraints as ESOL:
+      - Only: molecular_weight(SMILES), num_atoms(SMILES), num_rings(SMILES), is_aromatic(SMILES), num_halogen(SMILES),
+        num_hydroxyl_groups(SMILES), num_nitrogen(SMILES), num_oxygen(SMILES), num_hbd(SMILES)
+      - Never: ecfp_bit_* or any other descriptor names
+      - Include one saturation + one interaction
+
+    lipo_regression: |
+      DATASET: {dataset_name} (DeepChem LIPO / Lipophilicity)
+      DOMAIN: Molecular Regression (SMILES)
+      TARGET: Higher value = MORE lipophilic (after scaling).
+      ALLOWED RDKit DESCRIPTORS (ONLY):
+      - molecular_weight(SMILES), num_atoms(SMILES), num_rings(SMILES), is_aromatic(SMILES), num_halogen(SMILES),
+        num_hydroxyl_groups(SMILES), num_nitrogen(SMILES), num_oxygen(SMILES), num_hbd(SMILES)
+      EXPECTED DIRECTIONS (typical):
+      - Hydrophobic bulk (num_rings/is_aromatic/num_halogen/molecular_weight/num_atoms) -> increase lipophilicity
+      - Polarity (num_oxygen/num_nitrogen/num_hydroxyl_groups/num_hbd) -> decrease lipophilicity
+      REQUIREMENTS:
+      - At least one saturation + one interaction (e.g., polarity dampens hydrophobe)
+      - ABSOLUTE: never use ecfp_bit_* or any non-whitelisted descriptor names
+
+    lipophilicity_regression: |
+      DATASET: {dataset_name} (DeepChem Lipophilicity / LIPO)
+      DOMAIN: Molecular Regression (SMILES)
+      Use the exact same constraints as LIPO:
+      - Only: molecular_weight(SMILES), num_atoms(SMILES), num_rings(SMILES), is_aromatic(SMILES), num_halogen(SMILES),
+        num_hydroxyl_groups(SMILES), num_nitrogen(SMILES), num_oxygen(SMILES), num_hbd(SMILES)
+      - Never: ecfp_bit_* or any other descriptor names
+      - Include one saturation + one interaction
 
     enzyme_regression: &enzyme_regression |
       DATASET: {dataset_name}
@@ -275,8 +418,30 @@ templates:
       - Missing competitive resource allocation
       FEATURES: {features}
     # Regression biotech datasets (018)
-    protein_expression: *tabular_regression
-    protein_expression_all: *tabular_regression
+    protein_expression: |
+      DATASET: {dataset_name} (Cell-free Protein Expression Yield)
+      DOMAIN: Synthetic Biology / Cell-Free Expression (Regression)
+      TASK: Predict continuous yield from reagent/cofactor concentrations.
+      MECHANISTIC PRIORS (use saturations + gating):
+      - Energy/cofactor gating: NAD and nucleotide mix often act as limiting resources (use saturation and interaction).
+      - Translation coupling: amino acids × tRNA (multiplicative, saturating).
+      - Polyamine effect: spermidine can boost translation but saturates.
+      - Ionic balance: magnesium and potassium/glutamate can be synergistic; too low limits ribosome/polymerase activity.
+      COMMON PATTERNS TO MODEL:
+      - Saturation: x/(K+x) on limiting reagents
+      - Synergy: sat(a)*sat(b) or (a*b)/(K+a*b)
+      - Soft inhibition: 1 - sat(x) when a component competes for resources at high values
+      FEATURES: {features}
+      {scale_info}
+    protein_expression_all: |
+      DATASET: {dataset_name} (Cell-free Protein Expression Yield - multi-plate)
+      DOMAIN: Synthetic Biology / Cell-Free Expression (Regression)
+      TASK: Predict continuous yield robustly across plates/conditions.
+      GUIDANCE:
+      - Prefer stable, monotone saturations and a few interpretable interactions (avoid brittle thresholds).
+      - Use the same “limiting factor” structure as protein_expression: energy gating + translation coupling + ionic stability.
+      FEATURES: {features}
+      {scale_info}
     dataset_102: *tabular_regression
     gfp_yield: |
       DATASET: GFP Yield Prediction (Cell-Free Expression)
@@ -344,7 +509,19 @@ templates:
     deepchem: *molecular_regression
 
     # TabArena regression datasets (018)
-    diabetes_regression: *tabular_regression
+    diabetes_regression: |
+      DATASET: {dataset_name} (Diabetes Progression)
+      DOMAIN: Clinical Tabular Regression
+      TASK: Predict disease progression from patient biomarkers/features.
+      MECHANISTIC PRIORS:
+      - Adiposity/metabolic load (often BMI-like) interacts with blood pressure and lipid/glucose markers.
+      - Age can gate risk but saturates (older age increases risk up to a plateau).
+      - Use 1-2 key interactions rather than many small terms (keeps it robust).
+      COMMON FORMS:
+      - sat(x)=x/(K+x) to model diminishing returns of a biomarker
+      - synergy: sat(BMI)*sat(BP) or sat(glucose)*sat(triglycerides)
+      FEATURES: {features}
+      {scale_info}
     housing: *tabular_regression
     bike: *tabular_regression
     insurance: *tabular_regression
@@ -371,15 +548,124 @@ templates:
 
     # Classification datasets (017)
     car: *tabular_classification
-    iris: *tabular_classification
+    iris: |
+      DATASET: {dataset_name} (Iris)
+      DOMAIN: Simple Geometry / Tabular Classification
+      TASK: Predict iris species from sepal/petal measurements.
+      STRONG SIGNALS (typical):
+      - Petal length & petal width dominate.
+      - Setosa: very small petals (strongly separable).
+      - Versicolor vs Virginica: medium vs large petals; sepal width/length can help as secondary.
+      GUIDANCE:
+      - Use 3 class scores and argmax.
+      - Prefer smooth saturations/soft-thresholds around petal-size ranges vs hard step functions.
+      FEATURES: {features}
     wine: *tabular_classification
-    zoo: *tabular_classification
+    zoo: |
+      DATASET: {dataset_name} (Zoo)
+      DOMAIN: Discrete Traits / Tabular Classification
+      TASK: Predict animal class from mostly binary traits (and often legs count).
+      STRONG RULES (typical UCI zoo):
+      - Mammal: milk=1 and hair=1
+      - Bird: feathers=1 and eggs=1
+      - Fish: fins=1 and aquatic=1
+      - Insect: backbone=0 and legs≈6
+      - Amphibian/Reptile: eggs=1 with aquatic/breathes/toothed patterns
+      GUIDANCE:
+      - Build class scores as weighted sums of trait matches; include contradictions as penalties.
+      - Use legs as a strong discriminator when present.
+      FEATURES: {features}
     glass: *tabular_classification
-    vehicle: *tabular_classification
-    soybean: *tabular_classification
-    lymphography: *tabular_classification
-    ecoli: *tabular_classification
-    adult: *tabular_classification
+    vehicle: |
+      DATASET: {dataset_name} (Vehicle Silhouettes)
+      DOMAIN: Computer Vision / Shape Analysis / Tabular Classification
+      TASK: Classify vehicle type (bus, opel, saab, van) from 18 shape-based features extracted from silhouettes.
+      
+      CLASSES (exact):
+      0=bus, 1=opel, 2=saab, 3=van
+      
+      DOMAIN KNOWLEDGE - USE YOUR INTERNAL KNOWLEDGE:
+      Think about what makes each vehicle type distinctive:
+      - BUS: Large, boxy, high HOLLOWS_RATIO (windows/doors), elongated rectangular shape, high DISTANCE_CIRCULARITY (deviates from circle)
+      - OPEL: Medium sedan, moderate ELONGATEDNESS, balanced proportions, moderate COMPACTNESS and CIRCULARITY
+      - SAAB: Similar to Opel but may have different aspect ratios, often more elongated, distinctive MAX.LENGTH_ASPECT_RATIO patterns
+      - VAN: Box-like but smaller than bus, moderate HOLLOWS_RATIO, distinctive MAX.LENGTH_ASPECT_RATIO and SKEWNESS patterns
+      
+      KEY FEATURES AND THEIR MEANING:
+      - HOLLOWS_RATIO: Ratio of hollow areas (windows, doors) - HIGH for buses, MODERATE for vans, LOWER for sedans
+      - DISTANCE_CIRCULARITY: How far from a perfect circle - HIGH for elongated vehicles (buses, some vans)
+      - ELONGATEDNESS: Length-to-width ratio - HIGH for buses and some vans, MODERATE for sedans
+      - MAX.LENGTH_ASPECT_RATIO: Maximum length aspect ratio - DISTINCTIVE for each class
+      - COMPACTNESS: How compact the shape is - LOWER for elongated vehicles, HIGHER for compact ones
+      - CIRCULARITY: How circular the shape is - LOWER for elongated/boxy vehicles
+      - SKEWNESS_ABOUT_MAJOR/MINOR: Asymmetry measures - can distinguish between similar classes
+      
+      CRITICAL THINKING PROCESS:
+      1. REASON ABOUT VEHICLE SHAPES: Use your knowledge of vehicle types to understand what features should distinguish them
+      2. IDENTIFY KEY DISCRIMINATORS: 
+         - Bus vs others: HOLLOWS_RATIO is key (buses have many windows/doors)
+         - Opel vs Saab: These are similar sedans - need subtle differences in ELONGATEDNESS, MAX.LENGTH_ASPECT_RATIO, and interactions
+         - Van vs Bus: Both boxy, but van is smaller - use HOLLOWS_RATIO, COMPACTNESS, and size-related features
+      3. MODEL NONLINEAR INTERACTIONS: Features interact nonlinearly - e.g., high COMPACTNESS + low CIRCULARITY might indicate van vs bus
+      4. USE INTERMEDIATE VARIABLES: Create variables that capture shape concepts (e.g., "boxiness" = COMPACTNESS * (1 - CIRCULARITY))
+      
+      MECHANISTIC PRIORS:
+      - Buses: High HOLLOWS_RATIO + high DISTANCE_CIRCULARITY + high ELONGATEDNESS
+      - Opel: Moderate COMPACTNESS + moderate CIRCULARITY + specific ELONGATEDNESS range
+      - Saab: Similar to Opel but different MAX.LENGTH_ASPECT_RATIO and SKEWNESS patterns
+      - Vans: Moderate HOLLOWS_RATIO + moderate COMPACTNESS + specific MAX.LENGTH_ASPECT_RATIO
+      
+      COMMON ERROR PATTERNS TO AVOID:
+      - Confusing Opel and Saab: Need to use SKEWNESS_ABOUT_MAJOR and MAX.LENGTH_ASPECT_RATIO interactions
+      - Confusing Van and Bus: Use HOLLOWS_RATIO and COMPACTNESS interactions
+      - Missing nonlinear interactions: Features don't just add - they interact in complex ways
+      
+      GUIDANCE:
+      - Use per-class scores with ADVANCED NONLINEAR TRANSFORMATIONS
+      - Create INTERMEDIATE VARIABLES that capture shape concepts (boxiness, elongation_factor, etc.)
+      - Use saturation effects: feature / (K + feature) for diminishing returns
+      - Use NONLINEAR INTERACTIONS: feature1 * feature2 / (K + feature1 * feature2)
+      - Think about how features interact: e.g., COMPACTNESS * CIRCULARITY might distinguish bus from van
+      - Optimize coefficients systematically: try different values (0.5, 1.0, 1.5, 2.0) to find what works
+      - Use your knowledge of vehicle shapes to guide feature selection and interaction design
+      
+      FEATURES: {features}
+    soybean: |
+      DATASET: {dataset_name} (Soybean)
+      DOMAIN: Plant Pathology / Tabular Classification
+      TASK: Predict disease class from symptom/plant descriptors (often categorical/one-hot).
+      GUIDANCE:
+      - Treat one-hot/categorical indicators as symptoms; use AND-like interactions for co-occurring symptoms.
+      - Penalize mutually exclusive symptom patterns; reward consistent symptom clusters.
+      - Prefer sparse “signature” rules per class (few indicators + 1 interaction).
+      FEATURES: {features}
+    lymphography: |
+      DATASET: {dataset_name} (Lymphography)
+      DOMAIN: Medical Diagnosis / Tabular Classification
+      TASK: Predict lymph node status from diagnostic features (often categorical/ordinal).
+      GUIDANCE:
+      - Build “severity” and “pattern” intermediate concepts: enlargement/defect/structure changes.
+      - Use soft thresholds (ordinal increases) and 1-2 interactions (e.g., defect × enlargement).
+      FEATURES: {features}
+    ecoli: |
+      DATASET: {dataset_name} (E. coli Localization)
+      DOMAIN: Protein Localization / Tabular Classification
+      TASK: Predict cellular localization class from sequence-derived numeric features.
+      GUIDANCE:
+      - Use 1-2 dominant features as localization signals; add interactions for ambiguous classes.
+      - Prefer monotone score terms + a few contrasts (e.g., signal-peptide-like vs cytosolic).
+      FEATURES: {features}
+    adult: |
+      DATASET: {dataset_name} (Adult Income)
+      DOMAIN: Socioeconomic Tabular Classification
+      TASK: Predict income class from demographics/education/employment features.
+      MECHANISTIC PRIORS:
+      - Human capital: education (and education_num) + occupation/skill signals.
+      - Seniority/work intensity: age and hours_per_week saturate; professional roles amplify.
+      - Capital_gain is often a “spiky” high-income indicator; model it with a strong saturating boost.
+      GUIDANCE:
+      - Use 2 class scores (<=50K vs >50K) with interactions like education×hours and capital_gain gating.
+      FEATURES: {features}
     credit: *tabular_classification
     vote: *tabular_classification
     mushroom: *tabular_classification
@@ -393,10 +679,26 @@ templates:
     plant-shape: *tabular_classification
     plant-texture: *tabular_classification
     leukemia: *tabular_classification
-    colon-cancer: *tabular_classification
+    colon-cancer: |
+      DATASET: {dataset_name} (Colon Cancer)
+      DOMAIN: High-dimensional Biomarkers / Tabular Classification
+      TASK: Predict class from many measured markers/features (often att1..attN).
+      GUIDANCE:
+      - Pick a small set of strong markers (3-6) and build robust class signatures.
+      - Use soft thresholds (sat/high-low) rather than brittle exact cutoffs.
+      - Add at least one interaction that captures “co-expression” (markerA*markerB) for a class.
+      FEATURES: {features}
     colon: *tabular_classification
     mice-protein: *tabular_classification
-    miceprotein: *tabular_classification
+    miceprotein: |
+      DATASET: {dataset_name} (Mice Protein Expression)
+      DOMAIN: Signaling / High-dimensional Tabular Classification
+      TASK: Predict class from many protein expression measurements.
+      GUIDANCE:
+      - Use 2-4 pathway-like composites (e.g., mean/sum of selected proteins) rather than many tiny terms.
+      - Model co-activation: sat(p1)*sat(p2) and contrasts (p_pathway_A - p_pathway_B).
+      - Keep rules stable: avoid extremely sharp thresholds.
+      FEATURES: {features}
     splice: *tabular_classification
     synthetic5: *tabular_classification
     # TabArena classification datasets (017) that are not OpenML keys
@@ -589,9 +891,11 @@ templates:
     class_line: "  - {class_name}: {count} samples ({percentage:.1f}%)"
     footer: |
       
-      IMPORTANT: Your mechanism must correctly predict ALL classes, not just the majority classes. Pay special attention to classes with fewer samples.
+      IMPORTANT: Your mechanism must correctly predict ALL classes, not just the majority class.
+      If the data is imbalanced, prioritize improving minority-class recall/F1 (avoid predicting only the majority).
+      Use asymmetric thresholds/gates if needed to capture the minority class without collapsing precision.
 
 formula_instructions:
-  classification: "- For classification: Formula MUST output a CLASS INDEX (integer: 0, 1, 2, ...), NOT a probability or continuous value. Use thresholds, argmax, or conditional logic as needed."
+  classification: "- For classification: Formula MUST output a CLASS INDEX (integer: 0, 1, 2, ...), NOT a probability. Prefer explicit if/threshold logic or score comparisons (avoid argmax([...]) in the single-line formula)."
   regression: "- For regression: Clipped to [{scale_min}, {scale_max}]"
 

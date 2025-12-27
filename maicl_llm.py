@@ -7,7 +7,7 @@ import os
 import time
 import threading
 import logging
-from typing import List
+from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
@@ -15,12 +15,6 @@ try:
 except Exception:
     from langchain_core.messages import HumanMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
-
-try:
-    # Optional dependency (only needed for --llm_provider openai)
-    from langchain_openai import ChatOpenAI
-except Exception:
-    ChatOpenAI = None
 
 from maicl_config import MAX_BATCH_SIZE, BATCH_TIMEOUT, MAX_PROMPT_PREVIEW_LENGTH
 
@@ -51,19 +45,29 @@ class GoogleAPIKeyManager:
         
         logger.info(f"✓ Initialized Gemini API Key Manager with {len(self.api_keys)} key(s)")
     
-    def get_current_llm(self) -> ChatGoogleGenerativeAI:
-        """Get current LLM instance (thread-safe)"""
+    def get_current_llm(self, temperature: Optional[float] = None) -> ChatGoogleGenerativeAI:
+        """Get current LLM instance (thread-safe)
+        
+        Args:
+            temperature: Optional temperature override. If None, uses default 0.8.
+                        Use temperature=0.8 for all predictions.
+        """
         with self.key_lock:
             current_key = self.api_keys[self.current_key_index]
         
+        # Use provided temperature or default
+        temp = temperature if temperature is not None else 0.8
+        
         with self.cache_lock:
-            if current_key not in self.llm_cache:
-                self.llm_cache[current_key] = ChatGoogleGenerativeAI(
+            # For deterministic evaluation (temp=0), create a separate cache key
+            cache_key = f"{current_key}_temp_{temp}"
+            if cache_key not in self.llm_cache:
+                self.llm_cache[cache_key] = ChatGoogleGenerativeAI(
                     model=self.model_name,
-                    temperature=.8,
+                    temperature=temp,
                     google_api_key=current_key
                 )
-            return self.llm_cache[current_key]
+            return self.llm_cache[cache_key]
     
     def switch_to_next_key(self) -> bool:
         """Thread-safe key switching"""
@@ -133,20 +137,29 @@ class OpenAIAPIKeyManager:
 
         logger.info(f"✓ Initialized OpenAI API Key Manager with {len(self.api_keys)} key(s)")
 
-    def get_current_llm(self):
-        """Get current OpenAI LLM instance (thread-safe)."""
+    def get_current_llm(self, temperature: Optional[float] = None):
+        """Get current OpenAI LLM instance (thread-safe).
+        
+        Args:
+            temperature: Optional temperature override. If None, uses default 0.8.
+                        Use temperature=0.8 for all predictions.
+        """
         with self.key_lock:
             current_key = self.api_keys[self.current_key_index]
 
+        # Use provided temperature or default
+        temp = temperature if temperature is not None else 0.8
+
         with self.cache_lock:
-            if current_key not in self.llm_cache:
-                # Keep temperature aligned with Gemini usage for now.
-                self.llm_cache[current_key] = ChatOpenAI(
+            # For deterministic evaluation (temp=0), create a separate cache key
+            cache_key = f"{current_key}_temp_{temp}"
+            if cache_key not in self.llm_cache:
+                self.llm_cache[cache_key] = ChatOpenAI(
                     model=self.model_name,
-                    temperature=0.8,
+                    temperature=temp,
                     api_key=current_key,
                 )
-            return self.llm_cache[current_key]
+            return self.llm_cache[cache_key]
 
     def switch_to_next_key(self) -> bool:
         """Thread-safe key switching."""
@@ -195,15 +208,17 @@ class OpenAIAPIKeyManager:
 
 class BatchedLLM:
     """Batched LLM wrapper with quota management and retry logic"""
-    def __init__(self, llm_or_key_manager, print_samples: bool = None, max_samples_to_print: int = 2):
+    def __init__(self, llm_or_key_manager, print_samples: bool = None, max_samples_to_print: int = 2, temperature: Optional[float] = None):
         if isinstance(llm_or_key_manager, (GoogleAPIKeyManager, OpenAIAPIKeyManager)):
             self.key_manager = llm_or_key_manager
-            self.llm = self.key_manager.get_current_llm()
+            self.temperature = temperature  # Store temperature for deterministic evaluation
+            self.llm = self.key_manager.get_current_llm(temperature=temperature)
             self.use_key_manager = True
         else:
             self.llm = llm_or_key_manager
             self.key_manager = None
             self.use_key_manager = False
+            self.temperature = None
         self.call_count = 0
         self.batch_count = 0
         if print_samples is None:
@@ -212,6 +227,13 @@ class BatchedLLM:
             self.print_samples = print_samples
         self.max_samples_to_print = max_samples_to_print
         self._samples_printed_count = 0
+    
+    def set_temperature(self, temperature: float):
+        """Set temperature for LLM predictions (default 0.8)"""
+        if self.use_key_manager and self.key_manager:
+            self.temperature = temperature
+            self.llm = self.key_manager.get_current_llm(temperature=temperature)
+            logger.debug(f"[BatchedLLM] Set temperature to {temperature} for deterministic evaluation")
     
     def invoke_single(self, message: HumanMessage, max_retries: int = 3, skip_print: bool = False) -> str:
         """Invoke single LLM call with retry logic"""

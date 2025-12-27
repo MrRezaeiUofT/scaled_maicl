@@ -15,6 +15,7 @@ Usage examples:
 """
 
 import os
+import sys
 import argparse
 import numpy as np
 from typing import Dict, Any, Optional, List
@@ -159,7 +160,9 @@ def _get_gemini_llm(model_name: str):
     if not keys:
         raise RuntimeError("No Google API key found. Set GOOGLE_API_KEY or GOOGLE_API_KEY_1/2/3")
     km = GoogleAPIKeyManager(keys, model_name=model_name)
-    return BatchedLLM(km)
+    from maicl_config import get_llm_temperature
+    temperature = get_llm_temperature()
+    return BatchedLLM(km, temperature=temperature)
 
 def _get_openai_llm(model_name: str):
     # Ensure .env is loaded before reading env vars
@@ -196,7 +199,9 @@ def _get_openai_llm(model_name: str):
         logger.warning(f"Warning: API key seems too short ({len(keys[0])} chars). OpenAI keys are typically 50+ characters.")
     
     km = OpenAIAPIKeyManager(keys, model_name=model_name)
-    return BatchedLLM(km)
+    from maicl_config import get_llm_temperature
+    temperature = get_llm_temperature()
+    return BatchedLLM(km, temperature=temperature)
 
 def _get_llm(model_name: str):
     """Get LLM instance based on model name - automatically detects provider"""
@@ -218,7 +223,8 @@ def load_openml_classification(dataset_name: str, max_samples: int):
         raise RuntimeError("OpenML not installed. pip install openml")
     dataset_ids = {
         "car": 22, "iris": 61, "wine": 187, "zoo": 62, "glass": 1468, "vehicle": 54,
-        "soybean": 41, "lymphography": 10, "ecoli": 40,
+        # NOTE: OpenML 41 is the *glass* dataset; soybean is a different dataset id.
+        "soybean": 42, "lymphography": 10, "ecoli": 40,
         "adult": 1590, "credit": 31, "vote": 56, "mushroom": 24,
         # Datasets with many classes (10+)
         "letter": 6,  # 26 classes - Letter Recognition
@@ -263,6 +269,27 @@ def load_openml_classification(dataset_name: str, max_samples: int):
                 f"Failed to load OpenML dataset '{dataset_name}' (ID {did}): {e}. "
                 f"Please check your internet connection and OpenML API access."
             ) from e
+
+    # Sanity check: ensure the loaded dataset matches the requested name.
+    # This catches accidental ID mismatches (e.g., soybean ↔ glass) that can silently ruin results.
+    try:
+        requested = str(dataset_name).strip().lower()
+        actual_name = getattr(ds, "name", None) or getattr(ds, "dataset_name", None) or ""
+        actual_name_l = str(actual_name).strip().lower()
+        if actual_name_l and requested and requested not in actual_name_l:
+            msg = (f"OpenML ID mapping mismatch: requested dataset='{dataset_name}' but loaded "
+                   f"OpenML ID {did} with name='{actual_name}'. "
+                   f"Please correct the dataset ID mapping in load_openml_classification().")
+            # For known-problematic datasets (soybean), fail fast to avoid wasting runs.
+            if requested in ("soybean",):
+                raise RuntimeError(msg)
+            logger.warning(msg)
+    except Exception as e:
+        # If the sanity check itself fails, be conservative for soybean and raise; otherwise warn.
+        if str(dataset_name).strip().lower() in ("soybean",):
+            raise
+        logger.warning(f"OpenML dataset sanity check failed: {e}")
+
     X, y, _, _ = ds.get_data(target=ds.default_target_attribute)
     if len(X) > max_samples:
         try:
@@ -760,11 +787,18 @@ def load_tabarena_classification_dataset(dataset_name: str, max_samples: int):
         raise RuntimeError(f"TabArena dataset '{dataset_name}' not available: {e}")
 
 
-def load_deepchem_classification_dataset(dataset_name: str, max_samples: int):
+def load_deepchem_classification_dataset(
+    dataset_name: str,
+    max_samples: int,
+    *,
+    featurizer: str = "ECFP",
+    splitter: str = "random",
+    return_splits: bool = False,
+):
     """Load DeepChem classification dataset (HIV, BACE, or Tox21)
     
     Args:
-        dataset_name: Name of the dataset ('hiv', 'bace', or 'tox21')
+        dataset_name: Name of the dataset ('hiv', 'bace', 'tox21', or any DeepChem MolNet loader name)
         max_samples: Maximum number of samples to load
         
     Returns:
@@ -820,27 +854,29 @@ def load_deepchem_classification_dataset(dataset_name: str, max_samples: int):
     try:
         from sklearn.preprocessing import LabelEncoder
         
-        # Map dataset names to DeepChem loader function names
-        # Access loaders lazily to avoid AttributeError for unavailable loaders
-        dataset_loader_names = {
+        dataset_name_lower = dataset_name.lower()
+
+        # Common dataset name mappings (some MolNet loaders differ from the dataset short name)
+        dataset_mappings = {
             'hiv': 'load_hiv',
             'bace': 'load_bace_c',
             'tox21': 'load_tox21',
         }
-        
-        dataset_name_lower = dataset_name.lower()
-        if dataset_name_lower not in dataset_loader_names:
-            raise ValueError(f"Unknown DeepChem classification dataset: {dataset_name}. "
-                           f"Available: {list(dataset_loader_names.keys())}")
-        
-        # Get the loader function name and access it dynamically
-        loader_name = dataset_loader_names[dataset_name_lower]
+
+        if dataset_name_lower in dataset_mappings:
+            loader_name = dataset_mappings[dataset_name_lower]
+        else:
+            loader_name = f"load_{dataset_name_lower}"
+
         if not hasattr(dc.molnet, loader_name):
-            raise AttributeError(f"DeepChem loader '{loader_name}' not available in this version of DeepChem. "
-                              f"Available loaders: {[attr for attr in dir(dc.molnet) if attr.startswith('load_')]}")
+            available = [attr for attr in dir(dc.molnet) if attr.startswith('load_')]
+            raise AttributeError(
+                f"DeepChem loader '{loader_name}' not available in this version of DeepChem. "
+                f"Available loaders (sample): {available[:30]}"
+            )
         
         loader_func = getattr(dc.molnet, loader_name)
-        logger.info(f"Loading DeepChem dataset: {dataset_name_lower}")
+        logger.info(f"Loading DeepChem dataset: {dataset_name_lower} (loader={loader_name}, featurizer={featurizer}, splitter={splitter})")
         
         # Load dataset with ECFP featurization (2048-bit fingerprints)
         # ECFP requires RDKit - check if it's available
@@ -854,77 +890,173 @@ def load_deepchem_classification_dataset(dataset_name: str, max_samples: int):
                 f"Note: pip installation may not work on all systems; conda is recommended."
             )
         
-        tasks, datasets, transformers = loader_func(featurizer='ECFP', splitter='random')
+        # Fast path: avoid expensive ECFP fingerprinting for large datasets like HIV.
+        # DeepChem's built-in RawFeaturizer can crash when invalid SMILES produce mixed outputs.
+        # Instead, when the user requests "Raw", we use a SAFE, fixed-length RDKit descriptor featurizer.
+        raw_requested = str(featurizer).strip().lower() in ("raw", "smiles", "none")
+        if raw_requested:
+            try:
+                from rdkit import Chem
+                from rdkit.Chem import Descriptors, Crippen, Lipinski, rdMolDescriptors
+            except Exception as e:
+                raise RuntimeError(
+                    "RDKit is required for DeepChem featurizer=Raw (descriptor-based) but is not available. "
+                    f"Error: {e}"
+                )
+
+            class _SafeRDKitDescriptorFeaturizer(dc.feat.Featurizer):
+                """Fixed-length descriptor featurizer over SMILES strings (never returns empty arrays)."""
+
+                def featurize(self, datapoints, **kwargs):  # type: ignore[override]
+                    feats = []
+                    for dp in datapoints:
+                        smiles = "" if dp is None else str(dp)
+                        mol = Chem.MolFromSmiles(smiles) if smiles else None
+                        if mol is None:
+                            feats.append(np.full((12,), np.nan, dtype=float))
+                            continue
+                        degrees = [a.GetDegree() for a in mol.GetAtoms()] if mol.GetNumAtoms() else []
+                        min_deg = min(degrees) if degrees else 0
+                        max_deg = max(degrees) if degrees else 0
+                        feats.append(
+                            np.array(
+                                [
+                                    float(Descriptors.MolWt(mol)),
+                                    float(Crippen.MolLogP(mol)),
+                                    float(rdMolDescriptors.CalcTPSA(mol)),
+                                    float(Lipinski.NumHDonors(mol)),
+                                    float(Lipinski.NumHAcceptors(mol)),
+                                    float(rdMolDescriptors.CalcNumRings(mol)),
+                                    float(Lipinski.NumRotatableBonds(mol)),
+                                    float(Descriptors.HeavyAtomCount(mol)),
+                                    float(rdMolDescriptors.CalcFractionCSP3(mol)),
+                                    float(rdMolDescriptors.CalcNumHeteroatoms(mol)),
+                                    float(min_deg),
+                                    float(max_deg),
+                                ],
+                                dtype=float,
+                            )
+                        )
+                    return np.asarray(feats, dtype=float)
+
+            featurizer_arg = _SafeRDKitDescriptorFeaturizer()
+        else:
+            featurizer_arg = featurizer
+
+        tasks, datasets, transformers = loader_func(featurizer=featurizer_arg, splitter=splitter)
         train_dataset, valid_dataset, test_dataset = datasets
-        
-        # Combine all splits for now (we'll split later in main())
-        all_X = np.vstack([train_dataset.X, valid_dataset.X, test_dataset.X])
-        all_y = np.vstack([train_dataset.y, valid_dataset.y, test_dataset.y])
-        all_ids = list(train_dataset.ids) + list(valid_dataset.ids) + list(test_dataset.ids)
-        
-        logger.info(f"Loaded DeepChem {dataset_name_lower}: {len(all_X)} total samples")
-        logger.info(f"  Features shape: {all_X.shape} (ECFP fingerprints)")
-        logger.info(f"  Target shape: {all_y.shape}")
-        logger.info(f"  Tasks: {tasks}")
-        
-        # Handle multi-task vs single-task
-        if len(tasks) > 1:
-            # Multi-task (e.g., Tox21 with 12 tasks)
-            # For now, use first task only (can be extended later)
-            logger.info(f"  Multi-task dataset detected ({len(tasks)} tasks). Using first task: {tasks[0]}")
-            all_y = all_y[:, 0:1]  # Take first task only
-        
-        # Flatten y to 1D for classification
-        if all_y.ndim > 1 and all_y.shape[1] == 1:
-            all_y = all_y.flatten()
-        
-        # Remove samples with NaN targets
-        valid_mask = ~np.isnan(all_y)
-        if isinstance(valid_mask, np.ndarray) and valid_mask.ndim > 0:
-            all_X = all_X[valid_mask]
-            all_y = all_y[valid_mask]
-            all_ids = [all_ids[i] for i in range(len(all_ids)) if valid_mask[i]]
-        
-        logger.info(f"After removing NaN targets: {len(all_X)} samples")
-        
-        # Subsample if needed
-        if max_samples and len(all_X) > max_samples:
-            indices = np.random.choice(len(all_X), max_samples, replace=False)
-            all_X = all_X[indices]
-            all_y = all_y[indices]
-            all_ids = [all_ids[i] for i in indices]
-            logger.info(f"Subsampled to {len(all_X)} samples")
-        
-        # X_encoded: featurized vectors for ML model (ECFP fingerprints)
-        X_encoded = all_X.astype(float)
-        
-        # Create feature column names (ECFP fingerprints are typically 2048 bits)
-        n_features = X_encoded.shape[1]
-        feature_cols = [f"ecfp_bit_{i}" for i in range(n_features)]
-        
-        # Encode target labels
+
+        def _extract_split(ds):
+            X = ds.X
+            y = ds.y
+            ids = list(ds.ids)
+            # Multi-task: use first task for now
+            if isinstance(y, np.ndarray) and y.ndim > 1 and y.shape[1] > 1:
+                y = y[:, 0:1]
+            if isinstance(y, np.ndarray) and y.ndim > 1 and y.shape[1] == 1:
+                y = y.flatten()
+            # Remove NaN targets
+            if isinstance(y, np.ndarray):
+                mask = ~np.isnan(y)
+                if mask.ndim > 0:
+                    X = X[mask]
+                    y = y[mask]
+                    ids = [ids[i] for i in range(len(ids)) if mask[i]]
+            return X, y, ids
+
+        X_tr, y_tr, ids_tr = _extract_split(train_dataset)
+        X_va, y_va, ids_va = _extract_split(valid_dataset)
+        X_te, y_te, ids_te = _extract_split(test_dataset)
+
+        logger.info(
+            f"Loaded DeepChem {dataset_name_lower} (after NaN target removal): "
+            f"train={len(X_tr)} valid={len(X_va)} test={len(X_te)}"
+        )
+        logger.info(f"  Tasks: {tasks} (using first task when multi-task)")
+
+        # Encode target labels consistently across splits
+        y_all_for_fit = np.concatenate([np.asarray(y_tr), np.asarray(y_va), np.asarray(y_te)]).astype(str)
         y_le = LabelEncoder()
-        y_encoded = y_le.fit_transform(all_y.astype(str))
+        y_le.fit(y_all_for_fit)
         class_names = y_le.classes_.tolist()
-        
+        y_tr_enc = y_le.transform(np.asarray(y_tr).astype(str))
+        y_va_enc = y_le.transform(np.asarray(y_va).astype(str))
+        y_te_enc = y_le.transform(np.asarray(y_te).astype(str))
         logger.info(f"Classes: {class_names} (n={len(class_names)})")
-        logger.info(f"Class distribution: {Counter(y_encoded)}")
-        
-        # X_original: SMILES strings for LLM
-        # DeepChem stores SMILES in dataset.ids
-        X_original = []
-        for smiles in all_ids:
-            # SMILES string is the primary input for LLM
-            # Include it as a feature dict that LLM can understand
-            feat_dict = {'SMILES': str(smiles)}
-            X_original.append(feat_dict)
-        
+
+        # Optional subsampling: apply to TRAIN split only (keep eval stable)
+        if max_samples and len(X_tr) > max_samples:
+            try:
+                from sklearn.model_selection import train_test_split
+                train_indices, _ = train_test_split(
+                    np.arange(len(X_tr)), train_size=max_samples, random_state=RANDOM_STATE, stratify=y_tr_enc
+                )
+                X_tr = X_tr[train_indices]
+                y_tr_enc = y_tr_enc[train_indices]
+                ids_tr = [ids_tr[i] for i in train_indices]
+                logger.info(f"Subsampled DeepChem TRAIN split to {len(X_tr)} samples (stratified)")
+            except Exception:
+                indices = np.random.choice(len(X_tr), max_samples, replace=False)
+                X_tr = X_tr[indices]
+                y_tr_enc = y_tr_enc[indices]
+                ids_tr = [ids_tr[i] for i in indices]
+                logger.info(f"Subsampled DeepChem TRAIN split to {len(X_tr)} samples (random)")
+
+        # Feature naming:
+        # - Keep ecfp_bit_* when using ECFP (used downstream for DeepChem safety guards).
+        # - When featurizer=Raw, ML features are our compact RDKit descriptor vector (12 dims).
+        if raw_requested:
+            feature_cols = [
+                "molecular_weight",
+                "logp",
+                "tpsa",
+                "hbond_donors",
+                "hbond_acceptors",
+                "num_rings",
+                "num_rotatable_bonds",
+                "heavy_atom_count",
+                "fraction_csp3",
+                "num_heteroatoms",
+                "min_degree",
+                "max_degree",
+            ]
+            logger.info("DeepChem featurizer=Raw: using compact RDKit descriptor features for ML (fixed-length, robust)")
+        else:
+            n_features = int(X_tr.shape[1]) if hasattr(X_tr, "shape") and len(X_tr.shape) > 1 else 0
+            if str(featurizer).upper() == "ECFP":
+                feature_cols = [f"ecfp_bit_{i}" for i in range(n_features)]
+            else:
+                feature_cols = [f"feature_{i}" for i in range(n_features)]
+
+        def _ids_to_original(ids_list):
+            return [{'SMILES': str(s)} for s in ids_list]
+
+        X_original_tr = _ids_to_original(ids_tr)
+        X_original_va = _ids_to_original(ids_va)
+        X_original_te = _ids_to_original(ids_te)
+
         feature_encoders: Dict[str, Any] = {}
-        
-        logger.info(f"Final dataset: {len(X_encoded)} samples, {len(feature_cols)} features (ECFP), {len(class_names)} classes")
+
+        if return_splits:
+            return (
+                (X_tr.astype(float), y_tr_enc, X_original_tr),
+                (X_va.astype(float), y_va_enc, X_original_va),
+                (X_te.astype(float), y_te_enc, X_original_te),
+                feature_cols,
+                class_names,
+                feature_encoders,
+            )
+
+        # Backwards-compatible: combine splits and return a single pool (script will re-split)
+        X_encoded = np.vstack([X_tr, X_va, X_te]).astype(float)
+        y_encoded = np.concatenate([y_tr_enc, y_va_enc, y_te_enc]).astype(int)
+        X_original = X_original_tr + X_original_va + X_original_te
+
+        logger.info(f"Final dataset: {len(X_encoded)} samples, {len(feature_cols)} features, {len(class_names)} classes")
+        logger.info(f"Class distribution: {Counter(y_encoded)}")
         logger.info(f"  ML model will use: {X_encoded.shape} featurized vectors")
         logger.info(f"  LLM will use: SMILES strings from dataset")
-        
+
         return X_encoded, y_encoded, X_original, feature_cols, class_names, feature_encoders
         
     except ImportError as e:
@@ -959,6 +1091,338 @@ def load_deepchem_classification_dataset(dataset_name: str, max_samples: int):
             import traceback
             traceback.print_exc()
             raise RuntimeError(f"DeepChem dataset '{dataset_name}' not available: {e}")
+
+
+def train_and_evaluate_baseline_models(X_train, y_train, X_test, y_test, 
+                                       feature_cols, scaler, class_names,
+                                       no_scaling=False):
+    """
+    Train and evaluate baseline models (TabPFN, EBM, XGBoost) for classification.
+    
+    Args:
+        X_train: Training features (scaled if scaling enabled)
+        y_train: Training targets (class indices)
+        X_test: Test features (scaled if scaling enabled)
+        y_test: Test targets (class indices)
+        feature_cols: List of feature column names
+        scaler: Feature scaler (or None if no scaling)
+        class_names: List of class names
+        no_scaling: Whether scaling is disabled
+        
+    Returns:
+        Dictionary with baseline model metrics: {'tabpfn': {...}, 'ebm': {...}, 'xgboost': {...}}
+    """
+    baseline_results = {}
+    
+    logger.info("=" * 80)
+    logger.info("TRAINING BASELINE MODELS FOR COMPARISON")
+    logger.info("=" * 80)
+    logger.info(f"Training on {len(X_train)} samples, testing on {len(X_test)} samples")
+    
+    # Convert to pandas DataFrame for models that need it (TabPFN, EBM)
+    try:
+        import pandas as pd
+        X_train_df = pd.DataFrame(X_train, columns=feature_cols)
+        X_test_df = pd.DataFrame(X_test, columns=feature_cols)
+    except ImportError:
+        logger.warning("pandas not available, skipping TabPFN and EBM baselines")
+        X_train_df = None
+        X_test_df = None
+    
+    # 1. TabPFN Baseline
+    import os
+    if os.getenv('SKIP_TABPFN', '0') == '1':
+        logger.info("\n[Baseline] Training TabPFN...")
+        logger.info("  ⏭️  TabPFN skipped (SKIP_TABPFN=1 environment variable set)")
+        logger.info("  Continuing with EBM and XGBoost baselines...")
+    else:
+        logger.info("\n[Baseline] Training TabPFN...")
+        logger.info("  ⚠️  Note: TabPFN may crash with segmentation fault in some environments.")
+        logger.info("  If this happens, set SKIP_TABPFN=1 to skip TabPFN and continue with EBM/XGBoost.")
+        try:
+            if X_train_df is not None:
+                logger.info(f"  Fitting TabPFN on {len(X_train_df)} samples...")
+                logger.info("  Using subprocess isolation to prevent crashes from affecting main script...")
+                
+                try:
+                    import subprocess
+                    import tempfile
+                    from pathlib import Path
+                    import sys
+                    
+                    # Ensure data types are correct
+                    X_train_df = X_train_df.astype(float)
+                    X_test_df = X_test_df.astype(float)
+                    y_train_array = np.array(y_train, dtype=int).ravel()
+                    
+                    # Create temporary files for data exchange
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        tmpdir_path = Path(tmpdir)
+                        X_train_path = tmpdir_path / "X_train.csv"
+                        y_train_path = tmpdir_path / "y_train.npy"
+                        X_test_path = tmpdir_path / "X_test.csv"
+                        output_path = tmpdir_path / "tabpfn_results.json"
+                        
+                        # Save data to temporary files
+                        X_train_df.to_csv(X_train_path, index=False)
+                        np.save(y_train_path, y_train_array)
+                        X_test_df.to_csv(X_test_path, index=False)
+                        
+                        # Run TabPFN in subprocess (isolates crashes)
+                        # Need to create a classification version of the subprocess script
+                        script_path = Path(__file__).parent / "run_tabpfn_classification_subprocess.py"
+                        if not script_path.exists():
+                            logger.warning("  TabPFN classification subprocess script not found, skipping TabPFN")
+                        else:
+                            logger.info(f"  Running TabPFN in isolated subprocess...")
+                            
+                            result = subprocess.run(
+                                [sys.executable, str(script_path), 
+                                 str(X_train_path), str(y_train_path), 
+                                 str(X_test_path), str(output_path)],
+                                capture_output=True,
+                                text=True,
+                                timeout=300  # 5 minute timeout
+                            )
+                            
+                            if result.returncode != 0:
+                                logger.warning(f"  ✗ TabPFN subprocess failed (exit code {result.returncode})")
+                                if result.stderr:
+                                    logger.warning(f"  Error output: {result.stderr[:500]}")
+                                logger.warning("  Skipping TabPFN baseline (continuing with EBM and XGBoost)")
+                            elif not output_path.exists():
+                                logger.warning("  ✗ TabPFN subprocess completed but no output file found")
+                                logger.warning("  Skipping TabPFN baseline (continuing with EBM and XGBoost)")
+                            else:
+                                # Load results
+                                with open(output_path, 'r') as f:
+                                    tabpfn_results = json.load(f)
+                                
+                                if not tabpfn_results.get('success', False):
+                                    error_msg = tabpfn_results.get('error', 'Unknown error')
+                                    error_type = tabpfn_results.get('error_type', 'Unknown')
+                                    logger.warning(f"  ✗ TabPFN failed: {error_type}: {error_msg}")
+                                    logger.warning("  Skipping TabPFN baseline (continuing with EBM and XGBoost)")
+                                else:
+                                    y_pred_tabpfn = np.array(tabpfn_results['predictions'])
+                                    
+                                    acc_tabpfn = accuracy_score(y_test, y_pred_tabpfn)
+                                    f1_tabpfn = f1_score(y_test, y_pred_tabpfn, average='weighted', zero_division=0)
+                                    
+                                    baseline_results['tabpfn'] = {
+                                        'accuracy': float(acc_tabpfn),
+                                        'f1': float(f1_tabpfn),
+                                        'predictions': y_pred_tabpfn.tolist()
+                                    }
+                                    logger.info(f"  ✓ TabPFN: ACC={acc_tabpfn:.4f}, F1={f1_tabpfn:.4f}")
+                                    
+                except subprocess.TimeoutExpired:
+                    logger.warning("  ✗ TabPFN subprocess timed out (>5 minutes)")
+                    logger.warning("  Skipping TabPFN baseline (continuing with EBM and XGBoost)")
+                except FileNotFoundError:
+                    logger.warning("  ✗ TabPFN subprocess script not found")
+                    logger.warning("  Skipping TabPFN baseline (continuing with EBM and XGBoost)")
+                except Exception as e:
+                    logger.warning(f"  ✗ TabPFN subprocess execution failed: {e}")
+                    logger.warning(f"  Error type: {type(e).__name__}")
+                    import traceback
+                    logger.warning(f"  Traceback:\n{traceback.format_exc()}")
+                    logger.warning("  Skipping TabPFN baseline (continuing with EBM and XGBoost)")
+            else:
+                logger.warning("  TabPFN skipped: pandas not available")
+        except ImportError as e:
+            error_msg = str(e)
+            error_str = error_msg.lower()
+            logger.warning(f"  ❌ TabPFN import failed: {error_msg}")
+            if '_is_pandas_df' in error_msg or 'sklearn' in error_str or 'validation' in error_str:
+                logger.warning("  ⚠️  TabPFN 6.2.0 is incompatible with sklearn 1.8.0+")
+                logger.warning("  Possible solutions:")
+                logger.warning("    1. Downgrade sklearn: pip install 'scikit-learn<1.8'")
+                logger.warning("    2. Wait for TabPFN update that supports sklearn 1.8+")
+                logger.warning("    3. Continue without TabPFN (EBM and XGBoost will still run)")
+            else:
+                logger.warning(f"  TabPFN not available. Install with: pip install tabpfn")
+        except Exception as e:
+            logger.warning(f"  TabPFN training failed: {e}")
+            logger.warning(f"  Error type: {type(e).__name__}")
+            import traceback
+            logger.warning(f"  Traceback:\n{traceback.format_exc()}")
+    
+    # 2. EBM (Explainable Boosting Machine) Baseline
+    logger.info("\n[Baseline] Training EBM (Explainable Boosting Machine)...")
+    try:
+        # Suppress EBM verbose logging before import
+        import logging as ebm_logging
+        # Suppress all interpret-related loggers
+        ebm_logging.getLogger('interpret').setLevel(ebm_logging.ERROR)
+        ebm_logging.getLogger('interpret.glassbox').setLevel(ebm_logging.ERROR)
+        ebm_logging.getLogger('interpret.glassbox.ebm').setLevel(ebm_logging.ERROR)
+        # Suppress any existing handlers
+        for name in logging.Logger.manager.loggerDict:
+            if 'interpret' in name.lower():
+                logging.getLogger(name).setLevel(logging.ERROR)
+        
+        # Set environment variable to suppress EBM native logging if supported
+        os.environ['EBM_LOG_LEVEL'] = 'ERROR'
+        
+        from interpret.glassbox import ExplainableBoostingClassifier
+        
+        # Suppress again after import (in case new loggers were created)
+        ebm_logging.getLogger('interpret').setLevel(ebm_logging.ERROR)
+        ebm_logging.getLogger('interpret.glassbox').setLevel(ebm_logging.ERROR)
+        
+        # Remove all handlers from interpret loggers to completely silence them
+        for name in logging.Logger.manager.loggerDict:
+            if 'interpret' in name.lower():
+                log = logging.getLogger(name)
+                log.handlers = []
+                log.propagate = False
+        
+        ebm_model = ExplainableBoostingClassifier(random_state=RANDOM_STATE, n_jobs=1)
+        
+        # EBM can work with numpy arrays or pandas DataFrames
+        if X_train_df is not None:
+            ebm_model.fit(X_train_df, y_train)
+            y_pred_ebm = ebm_model.predict(X_test_df)
+        else:
+            ebm_model.fit(X_train, y_train)
+            y_pred_ebm = ebm_model.predict(X_test)
+        
+        acc_ebm = accuracy_score(y_test, y_pred_ebm)
+        f1_ebm = f1_score(y_test, y_pred_ebm, average='weighted', zero_division=0)
+        
+        baseline_results['ebm'] = {
+            'accuracy': float(acc_ebm),
+            'f1': float(f1_ebm),
+            'predictions': y_pred_ebm.tolist()
+        }
+        logger.info(f"  ✓ EBM: ACC={acc_ebm:.4f}, F1={f1_ebm:.4f}")
+    except ImportError as e:
+        logger.warning(f"  EBM not available (pip install interpret): {e}")
+    except Exception as e:
+        logger.warning(f"  EBM training failed: {e}")
+        import traceback
+        logger.warning(f"  Traceback:\n{traceback.format_exc()}")
+    
+    # 3. XGBoost Baseline
+    logger.info("\n[Baseline] Training XGBoost...")
+    try:
+        import xgboost as xgb
+        
+        xgb_model = xgb.XGBClassifier(
+            random_state=RANDOM_STATE,
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            n_jobs=1,
+            verbosity=0
+        )
+        
+        xgb_model.fit(X_train, y_train)
+        y_pred_xgb = xgb_model.predict(X_test)
+        
+        acc_xgb = accuracy_score(y_test, y_pred_xgb)
+        f1_xgb = f1_score(y_test, y_pred_xgb, average='weighted', zero_division=0)
+        
+        baseline_results['xgboost'] = {
+            'accuracy': float(acc_xgb),
+            'f1': float(f1_xgb),
+            'predictions': y_pred_xgb.tolist()
+        }
+        logger.info(f"  ✓ XGBoost: ACC={acc_xgb:.4f}, F1={f1_xgb:.4f}")
+    except ImportError as e:
+        logger.warning(f"  XGBoost not available (pip install xgboost): {e}")
+    except Exception as e:
+        logger.warning(f"  XGBoost training failed: {e}")
+        import traceback
+        logger.warning(f"  Traceback:\n{traceback.format_exc()}")
+    
+    logger.info("=" * 80)
+    logger.info("BASELINE MODELS TRAINING COMPLETE")
+    logger.info("=" * 80)
+    
+    return baseline_results
+
+
+def _maybe_add_rdkit_features_to_smiles_dicts(
+    x_original_list,
+    *,
+    enabled: bool,
+    log_prefix: str = "",
+):
+    """
+    Optionally enrich DeepChem-style X_original dicts with interpretable RDKit descriptors.
+
+    We ONLY ever add to/modify X_original (LLM-visible) fields. We do NOT touch ML features (ECFP vectors).
+
+    Expected input format per item: {'SMILES': '...'}
+    """
+    if not enabled or not x_original_list:
+        return x_original_list
+
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import Descriptors, Crippen, Lipinski, rdMolDescriptors
+    except Exception as e:
+        logger.warning(f"{log_prefix}RDKit not available; cannot add SMILES descriptors to LLM input. Error: {e}")
+        return x_original_list
+
+    def _safe_float(x):
+        try:
+            return float(x)
+        except Exception:
+            return float("nan")
+
+    enriched = []
+    n_ok = 0
+    for item in x_original_list:
+        if not isinstance(item, dict) or "SMILES" not in item:
+            enriched.append(item)
+            continue
+        smiles = str(item.get("SMILES", ""))
+        mol = Chem.MolFromSmiles(smiles) if smiles else None
+        d = item.copy()
+        if mol is None:
+            d.update({
+                "molecular_weight": float("nan"),
+                "logp": float("nan"),
+                "tpsa": float("nan"),
+                "hbond_donors": float("nan"),
+                "hbond_acceptors": float("nan"),
+                "num_rings": float("nan"),
+                "num_rotatable_bonds": float("nan"),
+                "heavy_atom_count": float("nan"),
+                "fraction_csp3": float("nan"),
+                "num_heteroatoms": float("nan"),
+                "min_degree": float("nan"),
+                "max_degree": float("nan"),
+            })
+            enriched.append(d)
+            continue
+
+        degrees = [a.GetDegree() for a in mol.GetAtoms()] if mol.GetNumAtoms() else []
+        min_deg = min(degrees) if degrees else 0
+        max_deg = max(degrees) if degrees else 0
+
+        d.update({
+            "molecular_weight": _safe_float(Descriptors.MolWt(mol)),
+            "logp": _safe_float(Crippen.MolLogP(mol)),
+            "tpsa": _safe_float(rdMolDescriptors.CalcTPSA(mol)),
+            "hbond_donors": _safe_float(Lipinski.NumHDonors(mol)),
+            "hbond_acceptors": _safe_float(Lipinski.NumHAcceptors(mol)),
+            "num_rings": _safe_float(rdMolDescriptors.CalcNumRings(mol)),
+            "num_rotatable_bonds": _safe_float(Lipinski.NumRotatableBonds(mol)),
+            "heavy_atom_count": _safe_float(Descriptors.HeavyAtomCount(mol)),
+            "fraction_csp3": _safe_float(rdMolDescriptors.CalcFractionCSP3(mol)),
+            "num_heteroatoms": _safe_float(rdMolDescriptors.CalcNumHeteroatoms(mol)),
+            "min_degree": _safe_float(min_deg),
+            "max_degree": _safe_float(max_deg),
+        })
+        enriched.append(d)
+        n_ok += 1
+
+    logger.info(f"{log_prefix}Added RDKit descriptors to LLM input for {n_ok}/{len(x_original_list)} SMILES entries")
+    return enriched
 
 
 def main():
@@ -1008,7 +1472,7 @@ def main():
     )
     parser.add_argument("--ml_mech", default="linear", help="ML mechanism: logreg|xgboost|tabicl")
     parser.add_argument("--use_ml", type=int, default=1, choices=[0,1], help="Include ML mechanism in ensemble")
-    parser.add_argument("--max_samples", type=int, default=200)
+    parser.add_argument("--max_samples", type=int, default=100)
     parser.add_argument("--top_k", type=int, default=100, help="-1 to use full dataset")
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--acceptance_set", type=str, default="test",
@@ -1031,6 +1495,20 @@ def main():
                              "This controls how many LLM-based mechanisms are created to complement the ML mechanism.")
     parser.add_argument("--no_scaling", action="store_true",
                         help="If set, disables all feature scaling. Data will be used in its original range.")
+    parser.add_argument("--deepchem_splitter", type=str, default="random",
+                        help="DeepChem MolNet splitter to use for DeepChem datasets (common: random, scaffold).")
+    parser.add_argument("--deepchem_use_official_split", type=int, default=1, choices=[0, 1],
+                        help="If 1 (default) and dataset is DeepChem, use DeepChem's official train/valid/test splits "
+                             "directly (MolNet benchmark convention). If 0, combine splits and re-split internally.")
+    parser.add_argument("--deepchem_featurizer", type=str, default="ECFP",
+                        help="DeepChem MolNet featurizer for the ML side (default: ECFP). "
+                             "LLM always uses SMILES via X_original; featurizer only affects ML features.")
+    parser.add_argument("--deepchem_llm_add_rdkit_features", type=int, default=0, choices=[0, 1],
+                        help="If 1, enrich LLM inputs (X_original) for DeepChem datasets with RDKit descriptors "
+                             "(e.g., molecular_weight, logp, tpsa, rings, HBD/HBA). Never passes ecfp_bit_* to the LLM.")
+    parser.add_argument("--deepchem_max_eval_samples", type=int, default=0,
+                        help="Optional cap for DeepChem validation/test set sizes to speed up runs. "
+                             "0 (default) means no cap. Applies after DeepChem official split is loaded.")
     args = parser.parse_args()
 
     # Note: Classification loss metric is now configurable via --classification_loss argument
@@ -1038,6 +1516,7 @@ def main():
 
     # Resolve dataset
     ds_name = str(args.dataset).lower()
+    deepchem_splits = None  # populated when using DeepChem official train/valid/test splits
     
     # Build comprehensive run name with all important arguments
     # Start with base components
@@ -1103,12 +1582,85 @@ def main():
                 args.dataset, args.max_samples
             )
             ds_label = f"OpenML {args.dataset}"
-    elif ds_name in ("hiv", "bace", "tox21"):
-        # DeepChem molecular classification datasets
-        X_encoded, y_encoded, X_original, feature_cols, class_names, feature_encoders = load_deepchem_classification_dataset(
-            args.dataset, args.max_samples
-        )
-        ds_label = f"DeepChem {args.dataset.upper()}"
+    elif ds_name in ("hiv", "bace", "tox21") or ds_name.startswith("deepchem_"):
+        # DeepChem MolNet classification datasets (commonly used benchmarks)
+        deepchem_name = ds_name.replace("deepchem_", "")
+        if bool(args.deepchem_use_official_split):
+            deepchem_splits = load_deepchem_classification_dataset(
+                deepchem_name,
+                args.max_samples,
+                featurizer=args.deepchem_featurizer,
+                splitter=args.deepchem_splitter,
+                return_splits=True,
+            )
+            (X_train_dc, y_train_dc, X_original_train_dc), (X_val_dc, y_val_dc, X_original_val_dc), (X_test_dc, y_test_dc, X_original_test_dc), feature_cols, class_names, feature_encoders = deepchem_splits
+
+            # Optional: enrich LLM inputs (SMILES dicts) with RDKit descriptors
+            if bool(args.deepchem_llm_add_rdkit_features):
+                X_original_train_dc = _maybe_add_rdkit_features_to_smiles_dicts(
+                    X_original_train_dc, enabled=True, log_prefix="[DeepChem LLM] "
+                )
+                X_original_val_dc = _maybe_add_rdkit_features_to_smiles_dicts(
+                    X_original_val_dc, enabled=True, log_prefix="[DeepChem LLM] "
+                )
+                X_original_test_dc = _maybe_add_rdkit_features_to_smiles_dicts(
+                    X_original_test_dc, enabled=True, log_prefix="[DeepChem LLM] "
+                )
+                deepchem_splits = (
+                    (X_train_dc, y_train_dc, X_original_train_dc),
+                    (X_val_dc, y_val_dc, X_original_val_dc),
+                    (X_test_dc, y_test_dc, X_original_test_dc),
+                    feature_cols,
+                    class_names,
+                    feature_encoders,
+                )
+
+            # Build combined pools for bookkeeping/config logging (we still evaluate using official splits).
+            X_encoded = np.vstack([X_train_dc, X_val_dc, X_test_dc])
+            y_encoded = np.concatenate([y_train_dc, y_val_dc, y_test_dc])
+            X_original = X_original_train_dc + X_original_val_dc + X_original_test_dc
+
+            # Optional: cap eval set sizes for speed
+            if int(args.deepchem_max_eval_samples) and int(args.deepchem_max_eval_samples) > 0:
+                cap = int(args.deepchem_max_eval_samples)
+                rng = np.random.RandomState(RANDOM_STATE)
+
+                def _cap_split(Xs, ys, Xo):
+                    if len(Xs) <= cap:
+                        return Xs, ys, Xo
+                    try:
+                        from sklearn.model_selection import train_test_split
+                        idx = np.arange(len(Xs))
+                        idx_keep, _ = train_test_split(idx, train_size=cap, random_state=RANDOM_STATE, stratify=ys)
+                    except Exception:
+                        idx_keep = rng.choice(len(Xs), size=cap, replace=False)
+                    idx_keep = np.array(sorted(idx_keep.tolist()))
+                    return Xs[idx_keep], ys[idx_keep], [Xo[i] for i in idx_keep]
+
+                X_val_dc, y_val_dc, X_original_val_dc = _cap_split(X_val_dc, y_val_dc, X_original_val_dc)
+                X_test_dc, y_test_dc, X_original_test_dc = _cap_split(X_test_dc, y_test_dc, X_original_test_dc)
+                deepchem_splits = (
+                    (X_train_dc, y_train_dc, X_original_train_dc),
+                    (X_val_dc, y_val_dc, X_original_val_dc),
+                    (X_test_dc, y_test_dc, X_original_test_dc),
+                    feature_cols,
+                    class_names,
+                    feature_encoders,
+                )
+                logger.info(f"DeepChem eval cap enabled: val/test capped to <= {cap} samples each")
+        else:
+            X_encoded, y_encoded, X_original, feature_cols, class_names, feature_encoders = load_deepchem_classification_dataset(
+                deepchem_name,
+                args.max_samples,
+                featurizer=args.deepchem_featurizer,
+                splitter=args.deepchem_splitter,
+                return_splits=False,
+            )
+            if bool(args.deepchem_llm_add_rdkit_features):
+                X_original = _maybe_add_rdkit_features_to_smiles_dicts(
+                    X_original, enabled=True, log_prefix="[DeepChem LLM] "
+                )
+        ds_label = f"DeepChem {deepchem_name}"
     elif ds_name.endswith("_binary") or ds_name.endswith("_categorical") or any(
         ds_name.startswith(prefix) for prefix in ["halogenase", "aminotransferase", "olea", "nitrilase", 
                                                     "phosphatase", "gt_", "duf", "esterase", "davis"]
@@ -1133,25 +1685,29 @@ def main():
         ds_label = f"OpenML {args.dataset}"
 
     from sklearn.model_selection import train_test_split
-    class_counts = Counter(y_encoded)
-    stratify = y_encoded if min(class_counts.values()) >= 2 else None
-    idx = np.arange(len(X_encoded))
-    idx_tr_full, idx_te = train_test_split(idx, test_size=0.2, random_state=RANDOM_STATE, stratify=stratify)
-    # Split training further into train/validation (stratified if possible)
-    # Check if stratification is possible: need at least 2 samples per class in training set
-    y_tr_full = y_encoded[idx_tr_full]
-    tr_class_counts = Counter(y_tr_full)
-    can_stratify = (idx_tr_full.size > 0 and 
-                   len(np.unique(y_tr_full)) > 1 and 
-                   min(tr_class_counts.values()) >= 2)
-    stratify_tr = y_tr_full if can_stratify else None
-    idx_tr, idx_va = train_test_split(idx_tr_full, test_size=float(args.val_size), random_state=RANDOM_STATE, stratify=stratify_tr)
-    X_train, X_val, X_test = X_encoded[idx_tr], X_encoded[idx_va], X_encoded[idx_te]
-    y_train, y_val, y_test = y_encoded[idx_tr], y_encoded[idx_va], y_encoded[idx_te]
-    # Split X_original (SMILES strings for LLM) using same indices
-    X_original_train = [X_original[i] for i in idx_tr]
-    X_original_val = [X_original[i] for i in idx_va]
-    X_original_test = [X_original[i] for i in idx_te]
+    if deepchem_splits is not None and bool(args.deepchem_use_official_split):
+        (X_train, y_train, X_original_train), (X_val, y_val, X_original_val), (X_test, y_test, X_original_test), _, _, _ = deepchem_splits
+        logger.info(f"Using DeepChem official splits (splitter={args.deepchem_splitter}). Ignoring --val_size.")
+    else:
+        class_counts = Counter(y_encoded)
+        stratify = y_encoded if min(class_counts.values()) >= 2 else None
+        idx = np.arange(len(X_encoded))
+        idx_tr_full, idx_te = train_test_split(idx, test_size=0.2, random_state=RANDOM_STATE, stratify=stratify)
+        # Split training further into train/validation (stratified if possible)
+        # Check if stratification is possible: need at least 2 samples per class in training set
+        y_tr_full = y_encoded[idx_tr_full]
+        tr_class_counts = Counter(y_tr_full)
+        can_stratify = (idx_tr_full.size > 0 and 
+                       len(np.unique(y_tr_full)) > 1 and 
+                       min(tr_class_counts.values()) >= 2)
+        stratify_tr = y_tr_full if can_stratify else None
+        idx_tr, idx_va = train_test_split(idx_tr_full, test_size=float(args.val_size), random_state=RANDOM_STATE, stratify=stratify_tr)
+        X_train, X_val, X_test = X_encoded[idx_tr], X_encoded[idx_va], X_encoded[idx_te]
+        y_train, y_val, y_test = y_encoded[idx_tr], y_encoded[idx_va], y_encoded[idx_te]
+        # Split X_original (SMILES strings for LLM) using same indices
+        X_original_train = [X_original[i] for i in idx_tr]
+        X_original_val = [X_original[i] for i in idx_va]
+        X_original_test = [X_original[i] for i in idx_te]
 
     # Conditionally scale features based on --no_scaling flag
     if not args.no_scaling:
@@ -1609,6 +2165,19 @@ def main():
         import traceback
         logger.warning(f"Traceback: {traceback.format_exc()}")
     
+    # Train and evaluate baseline models (TabPFN, EBM, XGBoost) for comparison
+    baseline_models_metrics = {}
+    try:
+        baseline_models_metrics = train_and_evaluate_baseline_models(
+            X_train_s, y_train, X_test_s, y_test,
+            feature_cols, scaler, class_names,
+            no_scaling=args.no_scaling
+        )
+    except Exception as e:
+        logger.warning(f"Failed to train baseline models: {e}")
+        import traceback
+        traceback.print_exc()
+    
     # Generate performance comparison visualizations
     logger.info("\n[Visualizations] Generating performance comparison plots and confusion matrices...")
     try:
@@ -1634,7 +2203,8 @@ def main():
             class_names=class_names,
             output_dir=output_dir,
             llm_only_metrics=llm_only_metrics,
-            llm_only_pre_metrics=llm_only_pre_metrics
+            llm_only_pre_metrics=llm_only_pre_metrics,
+            baseline_models=baseline_models_metrics
         )
         logger.info("  ✓ Performance comparison plot saved")
         logger.info("  ✓ Confusion matrices saved (ML baseline, MA-ICL pre, MA-ICL post, MA-ICL LLM-only)")
@@ -1675,6 +2245,7 @@ def main():
         },
         "llm_only_pre_training": llm_only_pre_metrics if llm_only_pre_metrics is not None else None,
         "llm_only_post_training": llm_only_metrics if llm_only_metrics is not None else None,
+        "baseline_models": baseline_models_metrics,
         "mechanism_info": {
             "total_mechanisms": len(maicl.mechanisms),
             "mechanism_types": maicl.mechanism_types,
@@ -1741,6 +2312,19 @@ def main():
     logger.info(f"  ΔACC={final_results['improvements']['vs_ml_baseline_post']['acc_delta']:+.4f}, "
                 f"ΔF1={final_results['improvements']['vs_ml_baseline_post']['f1_delta']:+.4f}")
     logger.info("")
+    
+    # Baseline Model Performance
+    if baseline_models_metrics:
+        logger.info("Baseline Model Performance:")
+        for model_name, metrics in baseline_models_metrics.items():
+            logger.info(f"  {model_name.capitalize()}:      ACC={metrics['accuracy']:.4f}, F1={metrics['f1']:.4f}")
+        logger.info("")
+        logger.info("Post-training MA-ICL vs Baselines:")
+        for model_name, metrics in baseline_models_metrics.items():
+            acc_delta = post_acc - metrics['accuracy']
+            f1_delta = post_f1 - metrics['f1']
+            logger.info(f"  vs {model_name.capitalize()}: ΔACC={acc_delta:+.4f}, ΔF1={f1_delta:+.4f}")
+        logger.info("")
     
     # Show individual mechanism performance if available
     if pre_mechanism_performance or post_mechanism_performance:

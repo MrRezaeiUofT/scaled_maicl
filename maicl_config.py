@@ -261,7 +261,12 @@ def get_adaptive_threshold_config() -> dict:
 def get_best_snapshot_threshold(task_type: str, metric: str) -> float:
     """Get threshold for updating best snapshot"""
     key = f"best_snapshot.{task_type}.{metric}_improvement"
-    default = 0.01
+    # Default: match the *acceptance* improvement threshold (primary) so that any
+    # accepted update that improves the best metric can also become the "best snapshot".
+    # This avoids unintuitive behavior where an update is accepted (e.g., MAE improves),
+    # but the run still restores an older snapshot because the best-snapshot threshold
+    # was stricter than acceptance.
+    default = get_metric_improvement_threshold(task_type, metric, level="primary")
     return get_training_config(key, default)
 
 
@@ -301,4 +306,15 @@ def get_confidence_config() -> dict:
 def get_scaling_tolerance() -> float:
     """Get scaling verification tolerance"""
     return get_training_config('scaling.tolerance', 0.01)
+
+
+def get_llm_temperature() -> float:
+    """Get LLM temperature from config
+    
+    Returns:
+        Temperature value (default: 0.8)
+    """
+    config = load_maicl_config()
+    llm_config = config.get('llm', {})
+    return llm_config.get('temperature', 0.8)
 
