@@ -1,0 +1,3057 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+MA-ICL Regression Runner (Biotech/Biological Datasets)
+---------------------------------------------------
+- Trains an ML baseline on scaled features
+- Computes residuals on train set and selects top-K by residual magnitude
+- Trains MA-ICL on the residual-difficult subset (optimization target: MAE or R2, configurable via --regression_loss)
+- Reports pre/post: MAE, R2, and MSE on the test set
+
+Available Datasets:
+- Experimental: gfp_yield, protein_expression, protein_expression_all, dataset_102
+
+Usage examples:
+  
+  # List available protein expression plates:
+  python 018_maicl_regression_biotech.py --list_plates
+  
+  # Select protein expression plate by index (0-based):
+  python 018_maicl_regression_biotech.py --dataset protein_expression --plate_index 0 --top_k 50
+  
+  # Select protein expression plate by filename:
+  python 018_maicl_regression_biotech.py --dataset protein_expression --plate_file plate_AL_1_raw_yield_and_std.csv --top_k 50
+"""
+
+import os
+import sys
+import argparse
+import importlib
+import numpy as np
+from typing import Dict, Any
+import logging
+from pathlib import Path
+import json
+
+# Add workspace root to Python path to allow importing maicl module
+workspace_root = Path(__file__).parent.parent
+if str(workspace_root) not in sys.path:
+    sys.path.insert(0, str(workspace_root))
+
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib
+    matplotlib.use('Agg')  # Non-interactive backend
+    _HAS_MATPLOTLIB = True
+except Exception:
+    _HAS_MATPLOTLIB = False
+
+try:
+    import pandas as pd
+    _HAS_PANDAS = True
+except Exception:
+    _HAS_PANDAS = False
+
+# IMPORTANT: do NOT import deepchem at module import time.
+# In some environments DeepChem (via TF/native deps) can hard-crash the interpreter (e.g., exit code 139),
+# which cannot be caught with try/except. We only import it lazily inside DeepChem-loading functions.
+_HAS_DEEPCHEM = importlib.util.find_spec("deepchem") is not None
+_DEEPCHEM_ERROR = None
+
+from maicl.maicl_lib_v2 import (
+    MinMaxScaler010,
+    TrainableMAICL,
+    MLModelMechanism,
+    BatchedLLM,
+    GoogleAPIKeyManager,
+    validate_scaled_data,
+    compute_ml_residuals,
+    get_top_k_residual_samples,
+    set_output_dir,
+    OUTPUT_DIR,
+    create_result_visualizations,
+    SCALE_MIN,
+    SCALE_MAX,
+)
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+MODEL_NAME = os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash")
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+
+
+def _load_env():
+    """Load environment variables from .env if available (no error if missing)."""
+    try:
+        from dotenv import load_dotenv, find_dotenv
+        here = Path(__file__).resolve().parent
+        env_path = here / ".env"
+        if env_path.exists():
+            load_dotenv(env_path, override=False)
+        else:
+            found = find_dotenv(usecwd=True)
+            if found:
+                load_dotenv(found, override=False)
+    except Exception:
+        pass
+
+
+def _get_gemini_llm(model_name: str):
+    _load_env()
+    keys = []
+    for env_key in ["GOOGLE_API_KEY", "GOOGLE_API_KEY_1", "GOOGLE_API_KEY_2", "GOOGLE_API_KEY_3"]:
+        val = os.environ.get(env_key)
+        if val:
+            keys.append(val)
+    if not keys:
+        raise RuntimeError("No Google API key found. Set GOOGLE_API_KEY or GOOGLE_API_KEY_1/2/3")
+    from maicl.maicl_config import get_llm_temperature
+    temperature = get_llm_temperature()
+    km = GoogleAPIKeyManager(keys, model_name=model_name, temperature=temperature)
+    return BatchedLLM(km)
+
+
+def _subsample_if_needed(X_df: 'pd.DataFrame', y_series: 'pd.Series', max_samples: int):
+    if max_samples and len(X_df) > max_samples:
+        # Sample and capture original indices BEFORE resetting
+        X_df_sampled = X_df.sample(n=max_samples, random_state=RANDOM_STATE)
+        original_indices = X_df_sampled.index
+        # Reset X_df indices
+        X_df = X_df_sampled.reset_index(drop=True)
+        # Use original indices to select corresponding y_series values, then reset
+        y_series = y_series.loc[original_indices].reset_index(drop=True)
+    return X_df, y_series
+
+
+def save_scatter_plot(y_true, y_pred, title, filename, output_dir):
+    """Generate and save a scatter plot of predicted vs actual values."""
+    if not _HAS_MATPLOTLIB:
+        logger.warning("matplotlib not installed, skipping scatter plot")
+        return
+    
+    plt.figure(figsize=(8, 6))
+    plt.scatter(y_true, y_pred, alpha=0.5, edgecolors='k', linewidths=0.5)
+    
+    # Perfect prediction line
+    min_val = min(y_true.min(), y_pred.min())
+    max_val = max(y_true.max(), y_pred.max())
+    plt.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect Prediction')
+    
+    plt.xlabel('Actual Values', fontsize=12)
+    plt.ylabel('Predicted Values', fontsize=12)
+    plt.title(title, fontsize=14)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    save_path = os.path.join(output_dir, filename)
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    logger.info(f"Saved scatter plot to {save_path}")
+
+
+def save_residual_plot(y_true, y_pred, title, filename, output_dir):
+    """Generate and save a residual plot."""
+    if not _HAS_MATPLOTLIB:
+        logger.warning("matplotlib not installed, skipping residual plot")
+        return
+    
+    residuals = y_true - y_pred
+    
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    
+    # Residuals vs Predicted
+    axes[0].scatter(y_pred, residuals, alpha=0.5, edgecolors='k', linewidths=0.5)
+    axes[0].axhline(y=0, color='r', linestyle='--', lw=2)
+    axes[0].set_xlabel('Predicted Values', fontsize=12)
+    axes[0].set_ylabel('Residuals', fontsize=12)
+    axes[0].set_title(f'{title} - Residuals vs Predicted', fontsize=12)
+    axes[0].grid(True, alpha=0.3)
+    
+    # Residuals histogram
+    axes[1].hist(residuals, bins=30, edgecolor='black', alpha=0.7)
+    axes[1].axvline(x=0, color='r', linestyle='--', lw=2)
+    axes[1].set_xlabel('Residuals', fontsize=12)
+    axes[1].set_ylabel('Frequency', fontsize=12)
+    axes[1].set_title(f'{title} - Residual Distribution', fontsize=12)
+    axes[1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    save_path = os.path.join(output_dir, filename)
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    logger.info(f"Saved residual plot to {save_path}")
+
+
+def predict_tabpfn_batch(ml_mechanism, X_data, feature_cols):
+    """
+    Perform batch prediction using TabPFN via subprocess.
+    
+    Args:
+        ml_mechanism: MLModelMechanism instance with TabPFN
+        X_data: numpy array of shape (n_samples, n_features)
+        feature_cols: list of feature column names
+    
+    Returns:
+        numpy array of predictions
+    """
+    if ml_mechanism.model_name != "TabPFN":
+        raise ValueError("This function is only for TabPFN")
+    
+    if not hasattr(ml_mechanism, '_tabpfn_training_data_path') or ml_mechanism._tabpfn_training_data_path is None:
+        raise RuntimeError("TabPFN not properly initialized with subprocess isolation")
+    
+    import subprocess
+    import tempfile
+    from pathlib import Path
+    import sys
+    import json
+    import pandas as pd
+    
+    # Convert to DataFrame
+    X_pred_df = pd.DataFrame(X_data, columns=feature_cols)
+    
+    # Create temporary file for prediction data
+    temp_dir = Path(ml_mechanism._tabpfn_training_data_path['temp_dir'])
+    X_pred_path = temp_dir / "X_pred_batch.csv"
+    output_path = temp_dir / "pred_result_batch.json"
+    
+    # Save prediction data
+    X_pred_df.to_csv(X_pred_path, index=False)
+    
+    # Find subprocess script
+    script_path = Path(__file__).parent.parent / "tabpdf" / "run_tabpfn_ml_mechanism.py"
+    if not script_path.exists():
+        raise RuntimeError(f"TabPFN subprocess script not found at {script_path}")
+    
+    # Run prediction in subprocess
+    result = subprocess.run(
+        [sys.executable, str(script_path), "predict",
+         ml_mechanism._tabpfn_training_data_path['X_train_path'],
+         ml_mechanism._tabpfn_training_data_path['y_train_path'],
+         str(X_pred_path),
+         ml_mechanism.task_type,
+         str(output_path)],
+        capture_output=True,
+        text=True,
+        timeout=300  # 5 minute timeout for batch prediction
+    )
+    
+    if result.returncode != 0:
+        error_msg = result.stderr[:500] if result.stderr else "Unknown error"
+        raise RuntimeError(f"TabPFN batch prediction subprocess failed: {error_msg}")
+    
+    if not output_path.exists():
+        raise RuntimeError("TabPFN batch prediction subprocess completed but no output file found")
+    
+    # Load prediction result
+    with open(output_path, 'r') as f:
+        pred_result = json.load(f)
+    
+    if not pred_result.get('success', False):
+        error_msg = pred_result.get('error', 'Unknown error')
+        raise RuntimeError(f"TabPFN batch prediction failed: {error_msg}")
+    
+    predictions = np.array(pred_result['predictions'], dtype=float)
+    return predictions
+
+
+def load_gfp_yield_dataset(max_samples: int):
+    """Load GFP Yield Prediction dataset (real experimental data)
+    
+    Preprocessing matches the reference implementation:
+    1. Select numeric columns and drop NA
+    2. Group by 'Experiment no' and aggregate (take first row, replace Yield with mean)
+    3. Drop 'Experiment no' column
+    4. Extract features and target
+    """
+    if not _HAS_PANDAS:
+        raise RuntimeError("pandas not installed. pip install pandas")
+    try:
+        csv_path = "MohammadFiles/2025_07_25/2025_07_25_GFP_Results_removed_outliers.csv"
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"File not found: {csv_path}")
+        df = pd.read_csv(csv_path)
+        
+        # Step 1: Select numeric columns and drop NA (before grouping)
+        # Note: We need to preserve 'Experiment no' for grouping even if it's numeric
+        logger.info(f"Raw dataset shape: {df.shape}, columns: {list(df.columns)}")
+        
+        # Check if 'Experiment no' exists and its type
+        has_experiment_no = 'Experiment no' in df.columns
+        if has_experiment_no:
+            exp_no_dtype = df['Experiment no'].dtype
+            logger.info(f"'Experiment no' column found (dtype: {exp_no_dtype})")
+        
+        # Select numeric columns (this will include 'Experiment no' if it's numeric)
+        df = df.select_dtypes(include=[np.number]).dropna()
+        logger.info(f"After selecting numeric columns: {df.shape}, columns: {list(df.columns)}")
+        
+        # Step 2: Group by 'Experiment no' and aggregate
+        if 'Experiment no' in df.columns:
+            logger.info(f"Grouping by 'Experiment no': {df['Experiment no'].nunique()} unique experiments")
+            logger.info(f"  Samples per experiment: min={df.groupby('Experiment no').size().min()}, "
+                       f"max={df.groupby('Experiment no').size().max()}, "
+                       f"mean={df.groupby('Experiment no').size().mean():.2f}")
+            
+            def aggregate_group(group):
+                """Aggregate function: take first row, replace Yield with mean"""
+                row = group.iloc[0].copy()  # take first row as base
+                row['Yield'] = group['Yield'].mean()  # replace yield with mean
+                return row
+            
+            # Apply aggregation (dropna() in case any groups produce NaN)
+            aggregated_rows = df.groupby('Experiment no').apply(aggregate_group).dropna().reset_index(drop=True)
+            df = aggregated_rows
+            logger.info(f"After aggregation: {df.shape} samples")
+            
+            # Step 3: Drop 'Experiment no' column (it's not a feature)
+            df = df.drop(columns=['Experiment no'])
+        else:
+            logger.warning("'Experiment no' column not found after selecting numeric columns - skipping aggregation")
+            logger.warning("  This may indicate 'Experiment no' is non-numeric or was removed during dropna()")
+        
+        # Step 4: Extract features and target
+        feature_cols = [col for col in df.columns if col != 'Yield']
+        if not feature_cols:
+            raise ValueError("No feature columns found")
+        X_df = df[feature_cols].astype(float)
+        y_series = df["Yield"].astype(float)
+        
+        # Log data statistics for debugging
+        logger.info(f"Final dataset: {len(X_df)} samples, {len(feature_cols)} features")
+        logger.info(f"Features: {feature_cols}")
+        logger.info(f"Target (Yield) statistics: min={y_series.min():.4f}, max={y_series.max():.4f}, mean={y_series.mean():.4f}, std={y_series.std():.4f}")
+        
+        # Check for data quality issues
+        constant_features = [col for col in feature_cols if X_df[col].nunique() <= 1]
+        if constant_features:
+            logger.warning(f"⚠️  Constant features detected (will cause issues): {constant_features}")
+        
+        # Check for low variance features
+        low_variance_features = [col for col in feature_cols if X_df[col].std() < 1e-6]
+        if low_variance_features:
+            logger.warning(f"⚠️  Low variance features detected: {low_variance_features}")
+        
+        # Check feature correlations (warn if perfect correlation)
+        if len(feature_cols) > 1:
+            corr_matrix = X_df[feature_cols].corr().abs()
+            high_corr_pairs = []
+            for i in range(len(corr_matrix.columns)):
+                for j in range(i+1, len(corr_matrix.columns)):
+                    if corr_matrix.iloc[i, j] > 0.99:
+                        high_corr_pairs.append((corr_matrix.columns[i], corr_matrix.columns[j]))
+            if high_corr_pairs:
+                logger.warning(f"⚠️  Highly correlated feature pairs (>0.99): {high_corr_pairs}")
+        
+        logger.info(f"Feature statistics (min/max/mean/std):")
+        for col in feature_cols[:5]:  # Show first 5 features
+            logger.info(f"  {col}: min={X_df[col].min():.4f}, max={X_df[col].max():.4f}, mean={X_df[col].mean():.4f}, std={X_df[col].std():.4f}")
+    except Exception as e:
+        logger.warning(f"Failed to load GFP yield data: {e}")
+        raise RuntimeError(f"GFP yield dataset not available: {e}")
+    
+    # Apply max_samples subsampling if needed (handled by _subsample_if_needed)
+    X_df, y_series = _subsample_if_needed(X_df, y_series, max_samples)
+    X_encoded = X_df.values
+    y_values = y_series.values
+    X_original = [X_df.iloc[i].astype(float).to_dict() for i in range(len(X_df))]
+    feature_encoders: Dict[str, Any] = {}
+    return X_encoded, y_values, X_original, feature_cols, feature_encoders, "GFP Yield Prediction"
+
+
+def get_available_protein_plates():
+    """Get list of available protein expression plate files"""
+    try:
+        import glob
+        data_dir = "/Users/mohammadrezarezaei/Desktop/Vector-stuff/ProtienP/active_learning_cell_free/whole_lysate_most_informative_points/data/no_controls"
+        csv_files = glob.glob(os.path.join(data_dir, "plate_AL_*_raw_yield_and_std.csv"))
+        # Return just the filenames, sorted
+        plate_files = [os.path.basename(f) for f in sorted(csv_files)]
+        return plate_files
+    except Exception as e:
+        logger.warning(f"Error getting available plates: {e}")
+        return []
+
+
+def load_protein_expression_dataset(max_samples: int, plate_file: str = None, plate_index: int = None):
+    """Load protein expression data from a specific CSV file
+    
+    Args:
+        max_samples: Maximum number of samples to load
+        plate_file: Name of the plate file (e.g., 'plate_AL_1_raw_yield_and_std.csv')
+        plate_index: Index of the plate (0-based) if plate_file is not provided
+    """
+    if not _HAS_PANDAS:
+        raise RuntimeError("pandas not installed. pip install pandas")
+    try:
+        import glob
+        data_dir = "/Users/mohammadrezarezaei/Desktop/Vector-stuff/ProtienP/active_learning_cell_free/whole_lysate_most_informative_points/data/no_controls"
+        csv_files = sorted(glob.glob(os.path.join(data_dir, "plate_AL_*_raw_yield_and_std.csv")))
+        
+        if not csv_files:
+            raise FileNotFoundError(f"No CSV files found in {data_dir}")
+        
+        if plate_file is None:
+            if plate_index is not None:
+                if plate_index < 0 or plate_index >= len(csv_files):
+                    available = get_available_protein_plates()
+                    raise ValueError(f"Plate index {plate_index} out of range. Available indices: 0-{len(csv_files)-1}\n"
+                                   f"Available plates: {available}")
+                plate_file = csv_files[plate_index]
+                logger.info(f"Using plate index {plate_index}: {os.path.basename(plate_file)}")
+            else:
+                plate_file = csv_files[0]
+                logger.info(f"Using default file (first available): {os.path.basename(plate_file)}")
+        else:
+            if not os.path.isabs(plate_file):
+                plate_file = os.path.join(data_dir, plate_file)
+            if not os.path.exists(plate_file):
+                available = get_available_protein_plates()
+                raise FileNotFoundError(f"File not found: {plate_file}\n"
+                                       f"Available plates: {available}")
+        df = pd.read_csv(plate_file)
+        feature_cols = [
+            'nad', 'folinic_acid', 'coa', 'nucleo_mix', 'spermidin', 
+            'pga', 'aa', 'trna', 'mg_gluta', 'camp', 'K_gluta'
+        ]
+        missing_cols = [col for col in feature_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing columns: {missing_cols}")
+        X_df = df[feature_cols].astype(float)
+        y_series = df['yield'].astype(float)
+        valid_mask = ~(np.isnan(X_df).any(axis=1) | np.isnan(y_series))
+        X_df = X_df[valid_mask].reset_index(drop=True)
+        y_series = y_series[valid_mask].reset_index(drop=True)
+        plate_name = os.path.basename(plate_file).replace('_raw_yield_and_std.csv', '')
+        dataset_name = f"Protein Expression ({plate_name})"
+    except Exception as e:
+        logger.warning(f"Failed to load protein expression data: {e}")
+        raise RuntimeError(f"Protein expression dataset not available: {e}")
+    X_df, y_series = _subsample_if_needed(X_df, y_series, max_samples)
+    X_encoded = X_df.values
+    y_values = y_series.values
+    X_original = [X_df.iloc[i].astype(float).to_dict() for i in range(len(X_df))]
+    feature_encoders: Dict[str, Any] = {}
+    return X_encoded, y_values, X_original, feature_cols, feature_encoders, dataset_name
+
+
+def load_protein_expression_all_plates_dataset(max_samples: int):
+    """Load and combine data from all protein expression plates"""
+    if not _HAS_PANDAS:
+        raise RuntimeError("pandas not installed. pip install pandas")
+    try:
+        import glob
+        data_dir = "/Users/mohammadrezarezaei/Desktop/Vector-stuff/ProtienP/active_learning_cell_free/whole_lysate_most_informative_points/data/no_controls"
+        csv_files = glob.glob(os.path.join(data_dir, "plate_AL_*_raw_yield_and_std.csv"))
+        if not csv_files:
+            raise FileNotFoundError(f"No CSV files found in {data_dir}")
+        all_data = []
+        feature_cols = [
+            'nad', 'folinic_acid', 'coa', 'nucleo_mix', 'spermidin', 
+            'pga', 'aa', 'trna', 'mg_gluta', 'camp', 'K_gluta'
+        ]
+        for csv_file in sorted(csv_files):
+            try:
+                df = pd.read_csv(csv_file)
+                if all(col in df.columns for col in feature_cols + ['yield']):
+                    plate_data = df[feature_cols + ['yield']].copy()
+                    all_data.append(plate_data)
+                    logger.info(f"Loaded {len(plate_data)} samples from {os.path.basename(csv_file)}")
+            except Exception as e:
+                logger.warning(f"Error loading {os.path.basename(csv_file)}: {e}")
+                continue
+        if not all_data:
+            raise ValueError("No valid data loaded")
+        combined_df = pd.concat(all_data, ignore_index=True)
+        X_df = combined_df[feature_cols].astype(float)
+        y_series = combined_df['yield'].astype(float)
+        valid_mask = ~(np.isnan(X_df).any(axis=1) | np.isnan(y_series))
+        X_df = X_df[valid_mask].reset_index(drop=True)
+        y_series = y_series[valid_mask].reset_index(drop=True)
+        dataset_name = "Combined Protein Expression"
+    except Exception as e:
+        logger.warning(f"Failed to load combined protein expression data: {e}")
+        raise RuntimeError(f"Combined protein expression dataset not available: {e}")
+    X_df, y_series = _subsample_if_needed(X_df, y_series, max_samples)
+    X_encoded = X_df.values
+    y_values = y_series.values
+    X_original = [X_df.iloc[i].astype(float).to_dict() for i in range(len(X_df))]
+    feature_encoders: Dict[str, Any] = {}
+    return X_encoded, y_values, X_original, feature_cols, feature_encoders, dataset_name
+
+
+def load_dataset_102(max_samples: int):
+    """Load Dataset 102 (train/test split) for protein expression"""
+    if not _HAS_PANDAS:
+        raise RuntimeError("pandas not installed. pip install pandas")
+    try:
+        data_dir = "/Users/mohammadrezarezaei/Desktop/Vector-stuff/ProtienP/active_learning_cell_free/whole_lysate_most_informative_points/full_on_102"
+        train_file = os.path.join(data_dir, "train.csv")
+        test_file = os.path.join(data_dir, "test.csv")
+        if not os.path.exists(train_file) or not os.path.exists(test_file):
+            raise FileNotFoundError(f"Train or test file not found in {data_dir}")
+        df_train = pd.read_csv(train_file, comment='#', header=None)
+        df_test = pd.read_csv(test_file, comment='#', header=None)
+        column_names = [
+            'nad', 'folinic_acid', 'coa', 'nucleo_mix', 'spermidin', 
+            'pga', 'aa', 'trna', 'mg_gluta', 'camp', 'K_gluta',
+            'y_data', 'y_data_std', 'y_pr', 'y_std_pr'
+        ]
+        df_train.columns = column_names
+        df_test.columns = column_names
+        feature_cols = [
+            'nad', 'folinic_acid', 'coa', 'nucleo_mix', 'spermidin', 
+            'pga', 'aa', 'trna', 'mg_gluta', 'camp', 'K_gluta'
+        ]
+        X_train = df_train[feature_cols].astype(float)
+        y_train = df_train['y_data'].astype(float)
+        X_test = df_test[feature_cols].astype(float)
+        y_test = df_test['y_data'].astype(float)
+        X = np.vstack([X_train.values, X_test.values])
+        y = np.hstack([y_train.values, y_test.values])
+        valid_mask = ~(np.isnan(X).any(axis=1) | np.isnan(y))
+        X = X[valid_mask]
+        y = y[valid_mask]
+        X_df = pd.DataFrame(X, columns=feature_cols)
+        y_series = pd.Series(y, name="target")
+    except Exception as e:
+        logger.warning(f"Failed to load dataset 102: {e}")
+        raise RuntimeError(f"Dataset 102 not available: {e}")
+    X_df, y_series = _subsample_if_needed(X_df, y_series, max_samples)
+    X_encoded = X_df.values
+    y_values = y_series.values
+    X_original = [X_df.iloc[i].astype(float).to_dict() for i in range(len(X_df))]
+    feature_encoders: Dict[str, Any] = {}
+    return X_encoded, y_values, X_original, feature_cols, feature_encoders, "Dataset 102"
+
+
+def _extract_sequence_features(seq: str) -> Dict[str, float]:
+    """Extract numerical features from protein sequence"""
+    if pd.isna(seq) or not seq:
+        return {
+            'seq_length': 0.0,
+            'seq_gc_content': 0.0,
+            'seq_aromatic_count': 0.0,
+            'seq_charged_count': 0.0,
+            'seq_polar_count': 0.0,
+            'seq_hydrophobic_count': 0.0
+        }
+    seq = str(seq).upper()
+    aromatic = set('FWY')
+    charged = set('DEKRH')
+    polar = set('STNQ')
+    hydrophobic = set('AILMV')
+    
+    return {
+        'seq_length': float(len(seq)),
+        'seq_gc_content': float((seq.count('G') + seq.count('C')) / len(seq)) if len(seq) > 0 else 0.0,
+        'seq_aromatic_count': float(sum(1 for aa in seq if aa in aromatic)),
+        'seq_charged_count': float(sum(1 for aa in seq if aa in charged)),
+        'seq_polar_count': float(sum(1 for aa in seq if aa in polar)),
+        'seq_hydrophobic_count': float(sum(1 for aa in seq if aa in hydrophobic))
+    }
+
+
+def _extract_smiles_features(smiles: str) -> Dict[str, float]:
+    """Extract numerical features from SMILES string"""
+    if pd.isna(smiles) or not smiles:
+        return {
+            'smiles_length': 0.0,
+            'smiles_ring_count': 0.0,
+            'smiles_branch_count': 0.0,
+            'smiles_double_bond_count': 0.0,
+            'smiles_triple_bond_count': 0.0,
+            'smiles_aromatic_count': 0.0
+        }
+    smiles = str(smiles)
+    return {
+        'smiles_length': float(len(smiles)),
+        'smiles_ring_count': float(smiles.count('1') + smiles.count('2') + smiles.count('3') + 
+                                   smiles.count('4') + smiles.count('5') + smiles.count('6') + 
+                                   smiles.count('7') + smiles.count('8') + smiles.count('9')),
+        'smiles_branch_count': float(smiles.count('(') + smiles.count(')')) / 2.0,
+        'smiles_double_bond_count': float(smiles.count('=')),
+        'smiles_triple_bond_count': float(smiles.count('#')),
+        'smiles_aromatic_count': float(sum(1 for c in smiles if c.islower()))
+    }
+
+
+def load_enzyme_dataset(dataset_name: str, max_samples: int):
+    """Load enzyme dataset from enzyme-datasets repository
+    
+    Args:
+        dataset_name: Name of the dataset (e.g., 'halogenase_NaBr', 'aminotransferase', 'olea')
+        max_samples: Maximum number of samples to load
+        
+    Returns:
+        X_encoded, y_values, X_original, feature_cols, feature_encoders, dataset_name
+    """
+    if not _HAS_PANDAS:
+        raise RuntimeError("pandas not installed. pip install pandas")
+    
+    try:
+        from enzyme_dataset_analysis import EnzymeDatasetLoader
+        
+        # Initialize loader
+        data_dir = os.path.join(os.path.dirname(__file__), "enzyme-datasets", "data")
+        if not os.path.exists(data_dir):
+            # Try alternative path
+            data_dir = "enzyme-datasets/data"
+        
+        loader = EnzymeDatasetLoader(data_dir)
+        
+        # Load dataset - try exact match first, then case-insensitive match
+        df = loader.load_dataset(dataset_name)
+        loaded_via_case_insensitive = False
+        if df is None:
+            # Try case-insensitive matching in processed directory
+            processed_dir = os.path.join(data_dir, "processed")
+            if os.path.exists(processed_dir):
+                import glob
+                # Look for CSV files that match case-insensitively
+                pattern = os.path.join(processed_dir, "*.csv")
+                all_csv_files = glob.glob(pattern)
+                # Find case-insensitive match
+                dataset_name_lower = dataset_name.lower()
+                matched_file = None
+                for csv_file in all_csv_files:
+                    base_name = os.path.splitext(os.path.basename(csv_file))[0]
+                    if base_name.lower() == dataset_name_lower:
+                        matched_file = csv_file
+                        logger.info(f"Found case-insensitive match: {os.path.basename(matched_file)}")
+                        break
+                
+                if matched_file:
+                    try:
+                        df = pd.read_csv(matched_file, index_col=0)
+                        loaded_via_case_insensitive = True
+                        logger.info(f"Loaded enzyme dataset via case-insensitive match '{os.path.basename(matched_file)}': {len(df)} samples, {len(df.columns)} columns")
+                    except Exception as e:
+                        logger.warning(f"Failed to load matched file {matched_file}: {e}")
+                        df = None
+        
+        if df is None:
+            raise FileNotFoundError(f"Could not load dataset: {dataset_name}")
+        
+        # Only log if we didn't already log via case-insensitive match
+        if not loaded_via_case_insensitive:
+            logger.info(f"Loaded enzyme dataset '{dataset_name}': {len(df)} samples, {len(df.columns)} columns")
+        
+        # Fix column names if they were incorrectly parsed (CSV files have index column)
+        # Sometimes the first column name includes a comma, e.g., ',SEQ,SUBSTRATES,LogSpActivity'
+        if len(df.columns) == 1 and ',' in str(df.columns[0]):
+            # Split the single column name by comma and use as column names
+            col_str = str(df.columns[0])
+            # Remove leading comma if present
+            if col_str.startswith(','):
+                col_str = col_str[1:]
+            new_cols = [col.strip() for col in col_str.split(',')]
+            # Reload with proper column names
+            processed_dir = os.path.join(data_dir, "processed")
+            csv_file = os.path.join(processed_dir, f"{dataset_name}.csv")
+            if os.path.exists(csv_file):
+                df = pd.read_csv(csv_file, index_col=0)  # Use first column as index
+                logger.info(f"Reloaded with index_col=0: {len(df)} samples, {len(df.columns)} columns")
+        
+        # Check required columns
+        if 'SEQ' not in df.columns or 'SUBSTRATES' not in df.columns:
+            raise ValueError(f"Dataset must have 'SEQ' and 'SUBSTRATES' columns. Found: {df.columns.tolist()}")
+        
+        # Find target column (exclude SEQ and SUBSTRATES)
+        target_cols = [col for col in df.columns if col not in ['SEQ', 'SUBSTRATES', 'Unnamed: 0']]
+        if not target_cols:
+            raise ValueError(f"No target column found. Available columns: {df.columns.tolist()}")
+        
+        # Use first numeric column as target, or first column if none are numeric
+        target_col = None
+        for col in target_cols:
+            if df[col].dtype in [np.float64, np.int64, float, int]:
+                target_col = col
+                break
+        if target_col is None:
+            target_col = target_cols[0]
+        
+        logger.info(f"Using '{target_col}' as target column")
+        
+        # Extract features from sequences and SMILES
+        logger.info("Extracting features from sequences and SMILES...")
+        feature_dicts = []
+        for idx, row in df.iterrows():
+            seq_features = _extract_sequence_features(row['SEQ'])
+            smiles_features = _extract_smiles_features(row['SUBSTRATES'])
+            combined = {**seq_features, **smiles_features}
+            feature_dicts.append(combined)
+        
+        # Create feature DataFrame
+        X_df = pd.DataFrame(feature_dicts)
+        feature_cols = X_df.columns.tolist()
+        
+        # Extract target
+        y_series = df[target_col].astype(float)
+        
+        # Remove rows with missing values
+        valid_mask = ~(X_df.isnull().any(axis=1) | y_series.isnull())
+        X_df = X_df[valid_mask].reset_index(drop=True)
+        y_series = y_series[valid_mask].reset_index(drop=True)
+        
+        logger.info(f"After removing missing values: {len(X_df)} samples")
+        
+        # Subsample if needed
+        X_df, y_series = _subsample_if_needed(X_df, y_series, max_samples)
+        
+        # Convert to numpy arrays
+        X_encoded = X_df.values.astype(float)
+        y_values = y_series.values.astype(float)
+        
+        # Create original feature dicts (for LLM context)
+        X_original = []
+        df_valid = df[valid_mask].reset_index(drop=True)
+        # Match X_df with df_valid (they should have the same length after subsampling)
+        df_valid_subset = df_valid.iloc[:len(X_df)].reset_index(drop=True)
+        
+        for idx in range(len(X_df)):
+            if idx >= len(df_valid_subset):
+                break
+            # Include both extracted features and original text for LLM
+            feat_dict = X_df.iloc[idx].to_dict()
+            feat_dict['SEQ'] = str(df_valid_subset.iloc[idx]['SEQ'])
+            feat_dict['SUBSTRATES'] = str(df_valid_subset.iloc[idx]['SUBSTRATES'])
+            X_original.append(feat_dict)
+        
+        feature_encoders: Dict[str, Any] = {}
+        dataset_label = f"Enzyme Dataset: {dataset_name}"
+        
+        logger.info(f"Final dataset: {len(X_df)} samples, {len(feature_cols)} features")
+        logger.info(f"Target range: [{y_values.min():.4f}, {y_values.max():.4f}]")
+        
+        return X_encoded, y_values, X_original, feature_cols, feature_encoders, dataset_label
+        
+    except Exception as e:
+        logger.error(f"Failed to load enzyme dataset '{dataset_name}': {e}")
+        import traceback
+        traceback.print_exc()
+        raise RuntimeError(f"Enzyme dataset '{dataset_name}' not available: {e}")
+
+
+def load_tabarena_regression_dataset(dataset_name: str, max_samples: int):
+    """Load TabArena regression dataset from HuggingFace or sklearn
+    
+    Args:
+        dataset_name: Name of the TabArena dataset (e.g., 'diabetes')
+        max_samples: Maximum number of samples to load
+        
+    Returns:
+        X_encoded, y_values, X_original, feature_cols, feature_encoders, dataset_label
+    """
+    if not _HAS_PANDAS:
+        raise RuntimeError("pandas not installed. pip install pandas")
+    
+    try:
+        from sklearn.preprocessing import LabelEncoder
+        
+        dataset_name_lower = dataset_name.lower()
+        
+        # Special case: diabetes dataset from sklearn (not available on HuggingFace)
+        if dataset_name_lower == "diabetes":
+            from sklearn.datasets import load_diabetes
+            logger.info(f"Loading diabetes dataset from sklearn")
+            data = load_diabetes(as_frame=True)
+            X_df = data.data.astype(float)
+            y_series = data.target.astype(float)
+            feature_cols = list(X_df.columns)
+            
+            # Subsample if needed
+            if max_samples and len(X_df) > max_samples:
+                rng = np.random.RandomState(RANDOM_STATE)
+                indices = rng.choice(len(X_df), max_samples, replace=False)
+                X_df = X_df.iloc[indices]
+                y_series = y_series.iloc[indices]
+                logger.info(f"Subsampled to {len(X_df)} samples")
+            
+            # Create X_original (feature dicts for LLM)
+            X_original = []
+            for i in range(len(X_df)):
+                d = {col: float(X_df.iloc[i][col]) for col in X_df.columns}
+                X_original.append(d)
+            
+            # Convert to numpy
+            X_encoded = X_df.values.astype(float)
+            y_values = y_series.values.astype(float)
+            
+            # No categorical features in diabetes dataset, so empty encoders
+            feature_encoders: Dict[str, Any] = {}
+            
+            logger.info(f"Final dataset: {len(X_encoded)} samples, {len(feature_cols)} features")
+            logger.info(f"Target range: [{y_values.min():.4f}, {y_values.max():.4f}]")
+            
+            dataset_label = "sklearn Diabetes"
+            
+            return X_encoded, y_values, X_original, feature_cols, feature_encoders, dataset_label
+        
+        # Special case: California housing from sklearn (more reliable than HuggingFace)
+        if dataset_name_lower == "housing":
+            try:
+                from sklearn.datasets import fetch_california_housing
+                logger.info(f"Loading California housing dataset from sklearn")
+                data = fetch_california_housing(as_frame=True)
+                X_df = data.data.astype(float)
+                y_series = data.target.astype(float)
+                feature_cols = list(X_df.columns)
+                
+                # Subsample if needed
+                if max_samples and len(X_df) > max_samples:
+                    rng = np.random.RandomState(RANDOM_STATE)
+                    indices = rng.choice(len(X_df), max_samples, replace=False)
+                    X_df = X_df.iloc[indices]
+                    y_series = y_series.iloc[indices]
+                    logger.info(f"Subsampled to {len(X_df)} samples")
+                
+                # Create X_original (feature dicts for LLM)
+                X_original = []
+                for i in range(len(X_df)):
+                    d = {col: float(X_df.iloc[i][col]) for col in X_df.columns}
+                    X_original.append(d)
+                
+                # Convert to numpy
+                X_encoded = X_df.values.astype(float)
+                y_values = y_series.values.astype(float)
+                
+                # No categorical features in california housing dataset, so empty encoders
+                feature_encoders: Dict[str, Any] = {}
+                
+                logger.info(f"Final dataset: {len(X_encoded)} samples, {len(feature_cols)} features")
+                logger.info(f"Target range: [{y_values.min():.4f}, {y_values.max():.4f}]")
+                
+                dataset_label = "sklearn California Housing"
+                
+                return X_encoded, y_values, X_original, feature_cols, feature_encoders, dataset_label
+            except Exception as e:
+                logger.warning(f"Failed to load California housing from sklearn: {e}, trying HuggingFace...")
+                # Fall through to HuggingFace loading
+        
+        # For other datasets, try loading from HuggingFace
+        from datasets import load_dataset
+        
+        # TabArena regression dataset mapping (HuggingFace)
+        # Note: Some datasets may not exist on HuggingFace. We'll try multiple paths or use sklearn alternatives
+        TABARENA_REGRESSION_DATASETS = {
+            "housing": ["scikit-learn/california_housing", "mstz/california-housing"],  # Try sklearn first
+            "bike": ["mstz/bike-sharing"],
+            "insurance": ["mstz/insurance"],
+            "concrete": ["mstz/concrete"],
+            "energy": ["mstz/energy-efficiency"],
+            "airfoil": ["mstz/airfoil"],
+            "yacht": ["mstz/yacht-hydrodynamics"],
+            "auto": ["mstz/auto-mpg"],
+            "abalone": ["mstz/abalone"],
+            "winequality": ["mstz/wine-quality"],
+            "students": ["mstz/student-performance"],
+            "diamonds": ["mstz/diamonds"],
+            "house-prices": ["mstz/house-prices"],
+            "airbnb": ["mstz/airbnb-price"],
+        }
+        
+        if dataset_name_lower not in TABARENA_REGRESSION_DATASETS:
+            available = ["diabetes"] + list(TABARENA_REGRESSION_DATASETS.keys())
+            raise ValueError(f"TabArena regression dataset '{dataset_name}' not found. Available: {available}")
+        
+        # Try loading from multiple possible paths
+        dataset_paths = TABARENA_REGRESSION_DATASETS[dataset_name_lower]
+        if not isinstance(dataset_paths, list):
+            dataset_paths = [dataset_paths]
+        
+        dataset = None
+        last_error = None
+        for path in dataset_paths:
+            try:
+                logger.info(f"Trying to load TabArena regression dataset: {dataset_name} from {path}")
+                dataset = load_dataset(path)
+                logger.info(f"Successfully loaded from {path}")
+                break
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Failed to load from {path}: {e}")
+                continue
+        
+        if dataset is None:
+            available_paths = ", ".join(dataset_paths)
+            raise RuntimeError(f"Failed to load TabArena regression dataset '{dataset_name}' from any of: {available_paths}. Last error: {last_error}")
+        
+        # Convert to pandas DataFrame
+        if 'train' in dataset:
+            df = pd.DataFrame(dataset['train'])
+        else:
+            df = pd.DataFrame(dataset[list(dataset.keys())[0]])
+        
+        logger.info(f"Loaded TabArena dataset: {len(df)} samples, {len(df.columns)} columns")
+        
+        # Auto-detect target column
+        possible_targets = [
+            'target', 'label', 'y', 'target_value', 'value',
+            'price', 'cnt', 'charges', 'strength', 'heating_load',
+            'cooling_load', 'SalePrice', 'MPG', 'rings', 'quality'
+        ]
+        target_column = None
+        for col in possible_targets:
+            if col in df.columns:
+                target_column = col
+                break
+        
+        if target_column is None:
+            target_column = df.columns[-1]
+        
+        logger.info(f"Using '{target_column}' as target column")
+        
+        # Separate features and target
+        X_df = df.drop(columns=[target_column])
+        y_series = df[target_column]
+        
+        # Encode categorical features
+        feature_encoders: Dict[str, Any] = {}
+        categorical_cols = []
+        
+        for col in X_df.columns:
+            if X_df[col].dtype == 'object' or X_df[col].dtype.name == 'category':
+                categorical_cols.append(col)
+                le = LabelEncoder()
+                X_df[col] = le.fit_transform(X_df[col].astype(str))
+                feature_encoders[col] = le
+        
+        # Create X_original (feature dicts for LLM)
+        X_original = []
+        for i in range(len(X_df)):
+            d = {}
+            for col in X_df.columns:
+                if col in categorical_cols:
+                    d[col] = str(df.iloc[i][col])  # Original categorical value
+                else:
+                    d[col] = float(X_df.iloc[i][col])
+            X_original.append(d)
+        
+        # Check if target is actually regression (continuous values)
+        if y_series.dtype == 'object' or y_series.dtype.name == 'category':
+            # Try to convert to numeric
+            try:
+                y_series = pd.to_numeric(y_series, errors='coerce')
+            except Exception:
+                raise ValueError(f"Dataset '{dataset_name}' appears to be classification (categorical target). "
+                               f"Use 017_maicl_classification_residual_topk.py instead.")
+        
+        # Check unique values to ensure it's regression
+        unique_vals = len(np.unique(y_series.dropna()))
+        if unique_vals <= 20:
+            logger.warning(f"Dataset '{dataset_name}' has only {unique_vals} unique target values. "
+                         f"This might be classification. Continuing as regression...")
+        
+        feature_cols = X_df.columns.tolist()
+        
+        # Convert to numpy
+        X_encoded = X_df.values.astype(float)
+        y_values = y_series.values.astype(float)
+        
+        # Handle missing values
+        valid_mask = ~(np.isnan(X_encoded).any(axis=1) | np.isnan(y_values))
+        X_encoded = X_encoded[valid_mask]
+        y_values = y_values[valid_mask]
+        X_original = [X_original[i] for i in range(len(X_original)) if valid_mask[i]]
+        
+        # Subsample if needed
+        if max_samples and len(X_encoded) > max_samples:
+            indices = np.random.choice(len(X_encoded), max_samples, replace=False)
+            X_encoded = X_encoded[indices]
+            y_values = y_values[indices]
+            X_original = [X_original[i] for i in indices]
+            logger.info(f"Subsampled to {len(X_encoded)} samples")
+        
+        logger.info(f"Final dataset: {len(X_encoded)} samples, {len(feature_cols)} features")
+        logger.info(f"Target range: [{y_values.min():.4f}, {y_values.max():.4f}]")
+        
+        dataset_label = f"TabArena {dataset_name}"
+        
+        return X_encoded, y_values, X_original, feature_cols, feature_encoders, dataset_label
+        
+    except ImportError as e:
+        raise RuntimeError(f"datasets library not installed. pip install datasets\n"
+                         f"Import error: {e}")
+    except Exception as e:
+        logger.error(f"Failed to load TabArena regression dataset '{dataset_name}': {e}")
+        import traceback
+        traceback.print_exc()
+        raise RuntimeError(f"TabArena dataset '{dataset_name}' not available: {e}")
+
+
+def load_deepchem_regression_dataset(
+    dataset_name: str,
+    max_samples: int,
+    *,
+    featurizer: str = "ECFP",
+    splitter: str = "random",
+    return_splits: bool = False,
+):
+    """Load DeepChem regression dataset (supports any DeepChem molnet dataset)
+    
+    Args:
+        dataset_name: Name of the dataset. Supports:
+            - Common names: 'esol', 'delaney', 'lipo', 'lipophilicity'
+            - Any DeepChem molnet loader: will try 'load_{dataset_name}' function
+        max_samples: Maximum number of samples to load
+        
+    Returns:
+        X_encoded, y_values, X_original, feature_cols, feature_encoders, dataset_label
+        
+    Note:
+        - ML model receives featurized vectors (ECFP fingerprints)
+        - LLM receives SMILES strings in X_original (extracted from dataset.ids)
+        - Works with any DeepChem dataset that has SMILES in dataset.ids
+    """
+    # Ensure deepchem is available
+    # Get dc from module globals if available, otherwise import it
+    import sys
+    current_module = sys.modules[__name__]
+    if _HAS_DEEPCHEM and hasattr(current_module, 'dc'):
+        # Use module-level dc import
+        deepchem_module = current_module.dc
+    else:
+        # Import deepchem if not available
+        try:
+            import deepchem
+            deepchem_module = deepchem
+            _ = deepchem_module.molnet
+        except ImportError as e:
+            raise RuntimeError(f"DeepChem not installed. pip install deepchem\n"
+                             f"Import error: {e}")
+        except Exception as e:
+            error_msg = f"DeepChem import failed. This may require additional dependencies.\n"
+            error_msg += f"Try: pip install deepchem tensorflow\n"
+            error_msg += f"Import error: {e}"
+            raise RuntimeError(error_msg)
+    
+    try:
+        # Generic approach: try to find loader function dynamically
+        # First check common mappings, then try direct function name lookup
+        dataset_name_lower = dataset_name.lower()
+        
+        # Common dataset name mappings
+        dataset_mappings = {
+            'esol': 'load_delaney',
+            'delaney': 'load_delaney',
+            'lipo': 'load_lipo',
+            'lipophilicity': 'load_lipo',
+        }
+        
+        # Determine loader function name
+        if dataset_name_lower in dataset_mappings:
+            loader_name = dataset_mappings[dataset_name_lower]
+        else:
+            # Try direct mapping: dataset name -> load_{dataset_name}
+            loader_name = f"load_{dataset_name_lower}"
+        
+        # Check if loader exists in molnet
+        if not hasattr(deepchem_module.molnet, loader_name):
+            # List available loaders for better error message
+            available_loaders = [attr for attr in dir(deepchem_module.molnet) 
+                               if attr.startswith('load_') and callable(getattr(deepchem_module.molnet, attr))]
+            raise AttributeError(f"DeepChem loader '{loader_name}' not found. "
+                               f"Available loaders: {available_loaders[:10]}...")
+        
+        loader_func = getattr(deepchem_module.molnet, loader_name)
+        logger.info(
+            f"Loading DeepChem dataset: {dataset_name_lower} (using {loader_name}, featurizer={featurizer}, splitter={splitter})"
+        )
+
+        tasks, datasets, transformers = loader_func(featurizer=featurizer, splitter=splitter)
+        train_dataset, valid_dataset, test_dataset = datasets
+
+        def _extract_split(ds):
+            X = ds.X
+            y = ds.y
+            ids = list(ds.ids)
+            # Flatten y to 1D for regression when appropriate
+            if isinstance(y, np.ndarray) and y.ndim > 1 and y.shape[1] == 1:
+                y = y.flatten()
+            # Remove NaN targets (common in some MolNet tasks)
+            if isinstance(y, np.ndarray):
+                mask = ~np.isnan(y)
+                if mask.ndim > 0:
+                    X = X[mask]
+                    y = y[mask]
+                    ids = [ids[i] for i in range(len(ids)) if mask[i]]
+            return X, y, ids
+
+        X_tr, y_tr, ids_tr = _extract_split(train_dataset)
+        X_va, y_va, ids_va = _extract_split(valid_dataset)
+        X_te, y_te, ids_te = _extract_split(test_dataset)
+
+        logger.info(
+            f"Loaded DeepChem {dataset_name_lower} (after NaN target removal): "
+            f"train={len(X_tr)} valid={len(X_va)} test={len(X_te)}"
+        )
+
+        # Optional subsampling: apply to TRAIN split (so evaluation stays stable).
+        if max_samples and len(X_tr) > max_samples:
+            indices = np.random.choice(len(X_tr), max_samples, replace=False)
+            X_tr = X_tr[indices]
+            y_tr = y_tr[indices]
+            ids_tr = [ids_tr[i] for i in indices]
+            logger.info(f"Subsampled DeepChem TRAIN split to {len(X_tr)} samples (max_samples={max_samples})")
+
+        def _ids_to_original(ids_list):
+            return [{'SMILES': str(s)} for s in ids_list]
+
+        X_original_tr = _ids_to_original(ids_tr)
+        X_original_va = _ids_to_original(ids_va)
+        X_original_te = _ids_to_original(ids_te)
+
+        # Feature column naming: keep ecfp_bit_* when using ECFP to trigger DeepChem/SMILES-specific logic downstream.
+        n_features = int(X_tr.shape[1]) if hasattr(X_tr, "shape") and len(X_tr.shape) > 1 else 0
+        if str(featurizer).upper() == "ECFP":
+            feature_cols = [f"ecfp_bit_{i}" for i in range(n_features)]
+        else:
+            feature_cols = [f"feature_{i}" for i in range(n_features)]
+
+        feature_encoders: Dict[str, Any] = {}
+        
+        # Create dataset label (use friendly names for known datasets, otherwise use dataset name)
+        dataset_labels = {
+            'esol': 'ESOL (Water Solubility)',
+            'delaney': 'Delaney (ESOL)',
+            'lipo': 'Lipophilicity (LogP)',
+            'lipophilicity': 'Lipophilicity (LogP)',
+        }
+        # Capitalize first letter and use dataset name if not in mapping
+        if dataset_name_lower in dataset_labels:
+            dataset_label = dataset_labels[dataset_name_lower]
+        else:
+            # Use capitalized dataset name
+            dataset_label = f"DeepChem {dataset_name_lower.capitalize()}"
+        
+        if return_splits:
+            # Ensure float dtype for downstream scaling/models
+            X_tr_f = X_tr.astype(float)
+            X_va_f = X_va.astype(float)
+            X_te_f = X_te.astype(float)
+            y_tr_f = np.asarray(y_tr, dtype=float)
+            y_va_f = np.asarray(y_va, dtype=float)
+            y_te_f = np.asarray(y_te, dtype=float)
+
+            logger.info(
+                f"DeepChem splits ready (featurizer={featurizer}, splitter={splitter}). "
+                f"Feature dim={X_tr_f.shape[1] if X_tr_f.ndim > 1 else 'N/A'}"
+            )
+            logger.info(f"Target range (train): [{y_tr_f.min():.4f}, {y_tr_f.max():.4f}]")
+            logger.info("LLM will use: SMILES strings from dataset.ids (X_original)")
+
+            return (
+                (X_tr_f, y_tr_f, X_original_tr),
+                (X_va_f, y_va_f, X_original_va),
+                (X_te_f, y_te_f, X_original_te),
+                feature_cols,
+                feature_encoders,
+                dataset_label,
+            )
+
+        # Backwards-compatible behavior: combine splits and return a single pool (script may re-split).
+        all_X = np.vstack([X_tr, X_va, X_te]).astype(float)
+        all_y = np.concatenate([np.asarray(y_tr), np.asarray(y_va), np.asarray(y_te)]).astype(float)
+        all_ids = ids_tr + ids_va + ids_te
+
+        logger.info(f"Loaded DeepChem {dataset_name_lower}: {len(all_X)} total samples (combined splits)")
+        logger.info(f"  Features shape: {all_X.shape} (featurizer={featurizer})")
+        logger.info(f"  Target shape: {all_y.shape}")
+        logger.info(f"  Tasks: {tasks}")
+
+        if max_samples and len(all_X) > max_samples:
+            indices = np.random.choice(len(all_X), max_samples, replace=False)
+            all_X = all_X[indices]
+            all_y = all_y[indices]
+            all_ids = [all_ids[i] for i in indices]
+            logger.info(f"Subsampled combined DeepChem pool to {len(all_X)} samples")
+
+        X_encoded = all_X
+        y_values = all_y
+        logger.info(f"Target range: [{y_values.min():.4f}, {y_values.max():.4f}]")
+
+        X_original = [{'SMILES': str(smiles)} for smiles in all_ids]
+
+        logger.info(f"Final dataset: {len(X_encoded)} samples, {len(feature_cols)} features (featurizer={featurizer})")
+        logger.info(f"  ML model will use: {X_encoded.shape} featurized vectors")
+        logger.info(f"  LLM will use: SMILES strings from dataset")
+
+        return X_encoded, y_values, X_original, feature_cols, feature_encoders, dataset_label
+        
+    except Exception as e:
+        logger.error(f"Failed to load DeepChem regression dataset '{dataset_name}': {e}")
+        import traceback
+        traceback.print_exc()
+        raise RuntimeError(f"DeepChem dataset '{dataset_name}' not available: {e}")
+
+
+def _maybe_add_rdkit_features_to_smiles_dicts(
+    x_original_list,
+    *,
+    enabled: bool,
+    log_prefix: str = "",
+):
+    """
+    Optionally enrich DeepChem-style X_original dicts with interpretable RDKit descriptors.
+
+    We ONLY ever add to/modify X_original (LLM-visible) fields. We do NOT touch ML features (ECFP vectors).
+
+    Expected input format per item: {'SMILES': '...'}
+    """
+    if not enabled or not x_original_list:
+        return x_original_list
+
+    try:
+        # Reuse the evaluator's canonical RDKit property names so LLM formulas are executable later
+        # (the evaluator detects these names and can compute them from SMILES).
+        from evaluate_individual_mechanisms import _compute_molecular_properties
+    except Exception as e:
+        logger.warning(
+            f"{log_prefix}RDKit/evaluator not available; cannot add SMILES molecular properties to LLM input. Error: {e}"
+        )
+        return x_original_list
+
+    enriched = []
+    n_ok = 0
+    for item in x_original_list:
+        if not isinstance(item, dict) or "SMILES" not in item:
+            enriched.append(item)
+            continue
+        smiles = str(item.get("SMILES", ""))
+        d = item.copy()
+        # Canonical, evaluator-supported property names:
+        # molecular_weight, num_rings, num_hydroxyl_groups, num_halogen, num_nitrogen,
+        # num_oxygen, num_atoms, is_aromatic, num_hbd
+        try:
+            props = _compute_molecular_properties(smiles)
+        except Exception:
+            props = {}
+
+        # Only attach the canonical properties to avoid the LLM writing formulas with
+        # variables that the evaluator/engine can't execute later.
+        canonical_keys = [
+            "molecular_weight",
+            "num_rings",
+            "num_hydroxyl_groups",
+            "num_halogen",
+            "num_nitrogen",
+            "num_oxygen",
+            "num_atoms",
+            "is_aromatic",
+            "num_hbd",
+        ]
+        for k in canonical_keys:
+            if k in props:
+                try:
+                    d[k] = float(props[k])
+                except Exception:
+                    d[k] = 0.0
+        enriched.append(d)
+        # Consider it "ok" if RDKit parsed and at least one canonical property is non-zero.
+        try:
+            if any(float(d.get(k, 0.0)) != 0.0 for k in canonical_keys):
+                n_ok += 1
+        except Exception:
+            pass
+
+    logger.info(
+        f"{log_prefix}Added RDKit descriptors to LLM input for {n_ok}/{len(x_original_list)} SMILES entries"
+    )
+    return enriched
+
+
+def train_and_evaluate_baseline_models(X_train, y_train, X_test, y_test, 
+                                       feature_cols, scaler, y_scaler_target,
+                                       no_scaling=False):
+    """
+    Train and evaluate baseline models (TabPFN, EBM, XGBoost) on the same training/test sets.
+    
+    Args:
+        X_train: Training features (scaled if scaling enabled)
+        y_train: Training targets (scaled if scaling enabled)
+        X_test: Test features (scaled if scaling enabled)
+        y_test: Test targets (scaled if scaling enabled)
+        feature_cols: List of feature column names
+        scaler: Feature scaler (or None if no scaling)
+        y_scaler_target: Target scaler (or None if no scaling)
+        no_scaling: Whether scaling is disabled
+        
+    Returns:
+        Dictionary with baseline model metrics: {'tabpfn': {...}, 'ebm': {...}, 'xgboost': {...}}
+    """
+    baseline_results = {}
+    
+    logger.info("=" * 80)
+    logger.info("TRAINING BASELINE MODELS FOR COMPARISON")
+    logger.info("=" * 80)
+    logger.info(f"Training on {len(X_train)} samples, testing on {len(X_test)} samples")
+    
+    # Convert to pandas DataFrame for models that need it (TabPFN, EBM)
+    try:
+        import pandas as pd
+        X_train_df = pd.DataFrame(X_train, columns=feature_cols)
+        X_test_df = pd.DataFrame(X_test, columns=feature_cols)
+    except ImportError:
+        logger.warning("pandas not available, skipping TabPFN and EBM baselines")
+        X_train_df = None
+        X_test_df = None
+    
+    # 1. TabPFN Baseline
+    # Note: TabPFN can cause segmentation faults in some environments.
+    # Set SKIP_TABPFN=1 to skip TabPFN, or leave default to try it (with fixes applied).
+    # 
+    # IMPORTANT: TabPFN results may vary between baseline (subprocess) and ML mechanism (main process):
+    # - Baseline runs in isolated subprocess (fresh state, no GPU/memory interference)
+    # - ML mechanism runs in main process (may have existing PyTorch/GPU state)
+    # - TabPFN has inherent non-determinism even with random seeds set
+    # - Data serialization via CSV may introduce minor floating-point differences
+    # These differences are expected and typically small (< 1% in metrics)
+    import os
+    if os.getenv('SKIP_TABPFN', '0') == '1':  # Can be set to '1' to skip TabPFN
+        logger.info("\n[Baseline] Training TabPFN...")
+        logger.info("  ⏭️  TabPFN skipped (SKIP_TABPFN=1 environment variable set)")
+        logger.info("  Continuing with EBM and XGBoost baselines...")
+    else:
+        logger.info("\n[Baseline] Training TabPFN...")
+        logger.info("  ⚠️  Note: TabPFN may crash with segmentation fault in some environments.")
+        logger.info("  If this happens, set SKIP_TABPFN=1 to skip TabPFN and continue with EBM/XGBoost.")
+        logger.info("  ℹ️  Note: TabPFN baseline runs in isolated subprocess (may differ slightly from ML mechanism)")
+        try:
+        # TabPFN will be run in a subprocess to isolate crashes
+        # TabPFN expects pandas DataFrames
+            if X_train_df is not None:
+                logger.info(f"  Fitting TabPFN on {len(X_train_df)} samples...")
+                logger.info("  Using subprocess isolation to prevent crashes from affecting main script...")
+                
+                try:
+                    import subprocess
+                    import tempfile
+                    from pathlib import Path
+                    
+                    # Ensure data types are correct
+                    X_train_df = X_train_df.astype(float)
+                    X_test_df = X_test_df.astype(float)
+                    y_train_array = np.array(y_train, dtype=float).ravel()
+                    
+                    # Create temporary files for data exchange
+                    with tempfile.TemporaryDirectory() as tmpdir:
+                        tmpdir_path = Path(tmpdir)
+                        X_train_path = tmpdir_path / "X_train.csv"
+                        y_train_path = tmpdir_path / "y_train.npy"
+                        X_test_path = tmpdir_path / "X_test.csv"
+                        output_path = tmpdir_path / "tabpfn_results.json"
+                        
+                        # Save data to temporary files
+                        X_train_df.to_csv(X_train_path, index=False)
+                        np.save(y_train_path, y_train_array)
+                        X_test_df.to_csv(X_test_path, index=False)
+                        
+                        # Run TabPFN in subprocess (isolates crashes)
+                        script_path = Path(__file__).parent.parent / "tabpdf" / "run_tabpfn_subprocess.py"
+                        logger.info(f"  Running TabPFN in isolated subprocess...")
+                        
+                        result = subprocess.run(
+                            [sys.executable, str(script_path), 
+                             str(X_train_path), str(y_train_path), 
+                             str(X_test_path), str(output_path)],
+                            capture_output=True,
+                            text=True,
+                            timeout=300  # 5 minute timeout
+                        )
+                        
+                        if result.returncode != 0:
+                            logger.warning(f"  ✗ TabPFN subprocess failed (exit code {result.returncode})")
+                            if result.stderr:
+                                logger.warning(f"  Error output: {result.stderr[:500]}")
+                            logger.warning("  Skipping TabPFN baseline (continuing with EBM and XGBoost)")
+                        elif not output_path.exists():
+                            logger.warning("  ✗ TabPFN subprocess completed but no output file found")
+                            logger.warning("  Skipping TabPFN baseline (continuing with EBM and XGBoost)")
+                        else:
+                            # Load results
+                            with open(output_path, 'r') as f:
+                                tabpfn_results = json.load(f)
+                            
+                            if not tabpfn_results.get('success', False):
+                                error_msg = tabpfn_results.get('error', 'Unknown error')
+                                error_type = tabpfn_results.get('error_type', 'Unknown')
+                                logger.warning(f"  ✗ TabPFN failed: {error_type}: {error_msg}")
+                                logger.warning("  Skipping TabPFN baseline (continuing with EBM and XGBoost)")
+                            else:
+                                y_pred_tabpfn = np.array(tabpfn_results['predictions'])
+                                
+                                # Clip predictions if targets are scaled
+                                if not no_scaling and y_scaler_target is not None:
+                                    y_pred_tabpfn = np.clip(y_pred_tabpfn, SCALE_MIN, SCALE_MAX)
+                                
+                                r2_tabpfn = r2_score(y_test, y_pred_tabpfn)
+                                mae_tabpfn = mean_absolute_error(y_test, y_pred_tabpfn)
+                                mse_tabpfn = mean_squared_error(y_test, y_pred_tabpfn)
+                                
+                                baseline_results['tabpfn'] = {
+                                    'r2': float(r2_tabpfn),
+                                    'mae': float(mae_tabpfn),
+                                    'mse': float(mse_tabpfn),
+                                    'rmse': float(np.sqrt(mse_tabpfn)),
+                                    'predictions': y_pred_tabpfn.tolist()
+                                }
+                                logger.info(f"  ✓ TabPFN: R2={r2_tabpfn:.4f}, MAE={mae_tabpfn:.4f}, MSE={mse_tabpfn:.4f}")
+                                
+                except subprocess.TimeoutExpired:
+                    logger.warning("  ✗ TabPFN subprocess timed out (>5 minutes)")
+                    logger.warning("  Skipping TabPFN baseline (continuing with EBM and XGBoost)")
+                except FileNotFoundError:
+                    logger.warning("  ✗ TabPFN subprocess script not found")
+                    logger.warning("  Skipping TabPFN baseline (continuing with EBM and XGBoost)")
+                except Exception as e:
+                    logger.warning(f"  ✗ TabPFN subprocess execution failed: {e}")
+                    logger.warning(f"  Error type: {type(e).__name__}")
+                    import traceback
+                    logger.warning(f"  Traceback:\n{traceback.format_exc()}")
+                    logger.warning("  Skipping TabPFN baseline (continuing with EBM and XGBoost)")
+            else:
+                logger.warning("  TabPFN skipped: pandas not available")
+        except ImportError as e:
+            error_msg = str(e)
+            error_str = error_msg.lower()
+            logger.warning(f"  ❌ TabPFN import failed: {error_msg}")
+            if '_is_pandas_df' in error_msg or 'sklearn' in error_str or 'validation' in error_str:
+                logger.warning("  ⚠️  TabPFN 6.2.0 is incompatible with sklearn 1.8.0+")
+                logger.warning("  Possible solutions:")
+                logger.warning("    1. Downgrade sklearn: pip install 'scikit-learn<1.8'")
+                logger.warning("    2. Wait for TabPFN update that supports sklearn 1.8+")
+                logger.warning("    3. Continue without TabPFN (EBM and XGBoost will still run)")
+            else:
+                logger.warning(f"  TabPFN not available. Install with: pip install tabpfn")
+        except Exception as e:
+            logger.warning(f"  TabPFN training failed: {e}")
+            logger.warning(f"  Error type: {type(e).__name__}")
+            import traceback
+            logger.warning(f"  Traceback:\n{traceback.format_exc()}")
+            # Check if it's a HuggingFace authentication issue
+            error_str = str(e).lower()
+            if 'huggingface' in error_str or 'authentication' in error_str or 'login' in error_str:
+                logger.warning("  ⚠️  TabPFN requires HuggingFace authentication. Run: huggingface-cli login")
+                logger.warning("  See: https://huggingface.co/Prior-Labs/tabpfn_2_5 for access instructions")
+    
+    # 2. EBM (Explainable Boosting Machine) Baseline
+    logger.info("\n[Baseline] Training EBM (Explainable Boosting Machine)...")
+    try:
+        # Suppress EBM verbose logging before import
+        import logging as ebm_logging
+        # Suppress all interpret-related loggers
+        ebm_logging.getLogger('interpret').setLevel(ebm_logging.ERROR)
+        ebm_logging.getLogger('interpret.glassbox').setLevel(ebm_logging.ERROR)
+        ebm_logging.getLogger('interpret.glassbox.ebm').setLevel(ebm_logging.ERROR)
+        # Suppress any existing handlers
+        for name in logging.Logger.manager.loggerDict:
+            if 'interpret' in name.lower():
+                logging.getLogger(name).setLevel(logging.ERROR)
+        
+        # Set environment variable to suppress EBM native logging if supported
+        os.environ['EBM_LOG_LEVEL'] = 'ERROR'
+        
+        from interpret.glassbox import ExplainableBoostingRegressor
+        
+        # Suppress again after import (in case new loggers were created)
+        ebm_logging.getLogger('interpret').setLevel(ebm_logging.ERROR)
+        ebm_logging.getLogger('interpret.glassbox').setLevel(ebm_logging.ERROR)
+        
+        # Remove all handlers from interpret loggers to completely silence them
+        for name in logging.Logger.manager.loggerDict:
+            if 'interpret' in name.lower():
+                log = logging.getLogger(name)
+                log.handlers = []
+                log.propagate = False
+        
+        ebm_model = ExplainableBoostingRegressor(random_state=RANDOM_STATE, n_jobs=1)
+        
+        # EBM can work with numpy arrays or pandas DataFrames
+        if X_train_df is not None:
+            ebm_model.fit(X_train_df, y_train)
+            y_pred_ebm = ebm_model.predict(X_test_df)
+        else:
+            ebm_model.fit(X_train, y_train)
+            y_pred_ebm = ebm_model.predict(X_test)
+        
+        # Clip predictions if targets are scaled
+        if not no_scaling and y_scaler_target is not None:
+            y_pred_ebm = np.clip(y_pred_ebm, SCALE_MIN, SCALE_MAX)
+        
+        r2_ebm = r2_score(y_test, y_pred_ebm)
+        mae_ebm = mean_absolute_error(y_test, y_pred_ebm)
+        mse_ebm = mean_squared_error(y_test, y_pred_ebm)
+        
+        baseline_results['ebm'] = {
+            'r2': float(r2_ebm),
+            'mae': float(mae_ebm),
+            'mse': float(mse_ebm),
+            'rmse': float(np.sqrt(mse_ebm)),
+            'predictions': y_pred_ebm.tolist()
+        }
+        logger.info(f"  EBM: R2={r2_ebm:.4f}, MAE={mae_ebm:.4f}, MSE={mse_ebm:.4f}")
+    except ImportError as e:
+        logger.warning(f"  EBM not available (pip install interpret): {e}")
+    except Exception as e:
+        logger.warning(f"  EBM training failed: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # 3. XGBoost Baseline (SHAP-explainable)
+    logger.info("\n[Baseline] Training XGBoost (SHAP-explainable)...")
+    try:
+        import xgboost as xgb
+        
+        xgb_model = xgb.XGBRegressor(
+            random_state=RANDOM_STATE,
+            n_estimators=100,
+            max_depth=6,
+            learning_rate=0.1,
+            n_jobs=1,
+            verbosity=0
+        )
+        
+        xgb_model.fit(X_train, y_train)
+        y_pred_xgb = xgb_model.predict(X_test)
+        
+        # Clip predictions if targets are scaled
+        if not no_scaling and y_scaler_target is not None:
+            y_pred_xgb = np.clip(y_pred_xgb, SCALE_MIN, SCALE_MAX)
+        
+        r2_xgb = r2_score(y_test, y_pred_xgb)
+        mae_xgb = mean_absolute_error(y_test, y_pred_xgb)
+        mse_xgb = mean_squared_error(y_test, y_pred_xgb)
+        
+        baseline_results['xgboost'] = {
+            'r2': float(r2_xgb),
+            'mae': float(mae_xgb),
+            'mse': float(mse_xgb),
+            'rmse': float(np.sqrt(mse_xgb)),
+            'predictions': y_pred_xgb.tolist()
+        }
+        logger.info(f"  XGBoost: R2={r2_xgb:.4f}, MAE={mae_xgb:.4f}, MSE={mse_xgb:.4f}")
+    except ImportError as e:
+        logger.warning(f"  XGBoost not available (pip install xgboost): {e}")
+    except Exception as e:
+        logger.warning(f"  XGBoost training failed: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    logger.info("=" * 80)
+    logger.info("BASELINE MODELS TRAINING COMPLETE")
+    logger.info("=" * 80)
+    
+    return baseline_results
+
+
+def main():
+    parser = argparse.ArgumentParser(description="MA-ICL regression on biotech/experimental datasets with top-K residuals")
+    parser.add_argument("--dataset", type=str, required=True,
+                        help="Dataset name. Options:\n"
+                             "  Built-in: gfp_yield, protein_expression, protein_expression_all, dataset_102\n"
+                             "  TabArena (HuggingFace/sklearn regression):\n"
+                             "    - diabetes (sklearn)\n"
+                             "    - housing (sklearn, with HuggingFace fallback)\n"
+                             "    - bike, insurance, concrete, energy, airfoil, yacht\n"
+                             "    - auto, abalone, winequality, students, diamonds, house-prices, airbnb\n"
+                             "    Note: Some datasets may not be available on HuggingFace. The code will try multiple paths.\n"
+                             "  DeepChem (molecular regression):\n"
+                             "    - esol or delaney (water solubility prediction)\n"
+                             "    - lipo or lipophilicity (LogP prediction)\n"
+                             "  Enzyme Regression (exact names from enzyme-datasets table):\n"
+                             "    - aminotransferase\n"
+                             "    - olea\n"
+                             "    - halogenase_NaBr\n"
+                             "    - halogenase_NaCl\n"
+                             "    - phosphatase_achiral\n"
+                             "    - phosphatase_chiral\n"
+                             "    - davis\n"
+                             "    - davis_filtered")
+    parser.add_argument("--plate_file", type=str, default=None,
+                        help="Plate file name for protein_expression dataset (e.g., 'plate_AL_1_raw_yield_and_std.csv')")
+    parser.add_argument("--plate_index", type=int, default=None,
+                        help="Plate index (0-based) for protein_expression dataset. Use --list_plates to see available indices.")
+    parser.add_argument("--list_plates", action="store_true",
+                        help="List all available protein expression plate files and exit")
+    parser.add_argument("--model_name", default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash"),
+                        help="Gemini model name, e.g., gemini-2.0-flash, gemini-2.5-pro")
+    parser.add_argument("--ml_mech", default="linear", help="Regression ML mechanism: linear|xgboost|kernelridge|tabicl|tabpfn. "
+                        "Note: TabPFN may cause segmentation faults when used as ML mechanism. "
+                        "Consider using TabPFN only as a baseline (it runs in isolated subprocess) "
+                        "or use --ml_mech linear/xgboost for more stable ML mechanism.")
+    parser.add_argument("--tabicl_bins", type=int, default=20,
+                        help="Number of bins for TabICL regression quantization (default: 20). "
+                             "Only used when --ml_mech=tabicl. Higher values = finer granularity but more classes.")
+    parser.add_argument("--use_ml", type=int, default=1, choices=[0,1], help="Include ML mechanism in ensemble")
+    parser.add_argument("--max_samples", type=int, default=200)
+    parser.add_argument("--top_k", type=int, default=1000, help="-1 to use full dataset")
+    parser.add_argument("--iterations", type=int, default=10)
+    parser.add_argument("--acceptance_set", type=str, default="validation",
+                        choices=["test", "validation", "train"],
+                        help="Dataset to use for acceptance evaluation during training. "
+                             "Options: 'test' (risks overfitting to test), 'validation' (default), "
+                             "or 'train' (may overfit to training data).")
+    parser.add_argument("--topk_strategy", choices=["residual", "residual_balanced"], default="residual",
+                        help="Top-K selection: 'residual' = global highest | 'residual_balanced' = highest within y-quantile bins")
+    parser.add_argument("--relax_eval", type=int, default=0, choices=[0,1],
+                        help="Relax ML routing during evaluation to let LLM contribute (default: 1, recommended for regression)")
+    parser.add_argument("--val_size", type=float, default=0.2,
+                        help="Validation fraction of the training split (0-1). Default: 0.2")
+    parser.add_argument("--regression_loss", type=str, default="mae", choices=["mae", "r2"],
+                        help="Regression loss metric: 'mae' (mean absolute error) or 'r2' (R-squared). Default: mae")
+    parser.add_argument("--evaluate_individual_mechanisms", action="store_true",
+                        help="After training, evaluate each mechanism individually on train/test sets")
+    parser.add_argument("--num_mechanisms_unknown", type=int, default=1,
+                        help="Number of unknown mechanisms to generate (default: 1). "
+                             "This controls how many LLM-based mechanisms are created to complement the ML mechanism.")
+    parser.add_argument("--k_shot", type=int, default=0,
+                        help="Number of few-shot examples to use per prediction (default: 0). "
+                             "If > 0, retrieves k_shot examples from training set for each prediction.")
+    parser.add_argument("--no_scaling", action="store_true",
+                        help="Disable all scaling for both features and targets. Use raw/unscaled data throughout.")
+    parser.add_argument("--deepchem_splitter", type=str, default="random",
+                        help="DeepChem MolNet splitter to use when loading DeepChem datasets "
+                             "(common: random, scaffold). Only relevant for DeepChem datasets.")
+    parser.add_argument("--deepchem_use_official_split", type=int, default=1, choices=[0, 1],
+                        help="If 1 (default) and dataset is DeepChem, use DeepChem's official train/valid/test splits "
+                             "directly (recommended for standard MolNet benchmarks). If 0, we combine all splits and "
+                             "create our own stratified split.")
+    parser.add_argument("--deepchem_featurizer", type=str, default="ECFP",
+                        help="DeepChem MolNet featurizer for the ML side (default: ECFP). "
+                             "LLM always uses SMILES strings via X_original; the featurizer only affects ML features.")
+    parser.add_argument("--deepchem_llm_add_rdkit_features", type=int, default=1, choices=[0, 1],
+                        help="If 1, enrich LLM inputs (X_original) for DeepChem datasets with a small set of RDKit "
+                             "molecular descriptors computed from SMILES (e.g., molecular_weight, logp, tpsa, rings, HBD/HBA). "
+                             "This does NOT affect ML features (ECFP) and avoids passing ecfp_bit_* to the LLM.")
+    args = parser.parse_args()
+
+    # Handle --list_plates option
+    if args.list_plates:
+        plates = get_available_protein_plates()
+        if plates:
+            print("\nAvailable Protein Expression Plates:")
+            print("=" * 60)
+            for idx, plate in enumerate(plates):
+                print(f"  [{idx}] {plate}")
+            print("=" * 60)
+            print(f"\nTotal: {len(plates)} plates available")
+            print("\nUsage examples:")
+            print(f"  # Select by index:")
+            print(f"  python {os.path.basename(__file__)} --dataset protein_expression --plate_index 0")
+            print(f"  # Select by filename:")
+            print(f"  python {os.path.basename(__file__)} --dataset protein_expression --plate_file {plates[0]}")
+        else:
+            print("No protein expression plates found.")
+        return
+
+    # IMPORTANT: allow LLM mechanisms to contribute during regression (don't force-route only to ML)
+    os.environ.setdefault("MAICL_REGRESSION_PREFER_ML", "0")
+
+    # Resolve dataset - preserve original case for enzyme datasets, lowercase for built-in datasets
+    dataset_name_lower = args.dataset.lower()
+    dataset_name_original = args.dataset  # Preserve original case for enzyme datasets
+    
+    # Extract plate information for protein_expression dataset to include in output directory
+    plate_suffix = ""
+    if dataset_name_lower == "protein_expression":
+        if args.plate_index is not None:
+            plate_suffix = f"_plate{args.plate_index}"
+        elif args.plate_file is not None:
+            # Extract plate name from filename (e.g., "plate_AL_1" from "plate_AL_1_raw_yield_and_std.csv")
+            plate_name = os.path.basename(args.plate_file).replace('_raw_yield_and_std.csv', '').replace('.csv', '')
+            plate_suffix = f"_{plate_name}"
+    
+    # Build comprehensive run name with all important arguments
+    # Start with base components
+    run_name_parts = [
+        "bio_reg",
+        dataset_name_lower + plate_suffix,
+        f"ml{args.ml_mech}" if args.use_ml else "noML",
+        f"topk{args.top_k}",
+        f"iter{args.iterations}",
+        f"model{args.model_name.replace('-', '_').replace('.', '_')}",  # Sanitize model name for filesystem
+        f"loss{args.regression_loss}",
+        f"accept{args.acceptance_set}",
+        f"topkstrat{args.topk_strategy}",
+    ]
+    
+    # Add optional flags
+    if args.relax_eval:
+        run_name_parts.append("relax")
+    if args.num_mechanisms_unknown > 1:
+        run_name_parts.append(f"nmech{args.num_mechanisms_unknown}")
+    if args.k_shot > 0:
+        run_name_parts.append(f"kshot{args.k_shot}")
+    if args.no_scaling:
+        run_name_parts.append("noscale")
+    if args.val_size != 0.2:  # Only include if non-default
+        run_name_parts.append(f"val{args.val_size:.2f}".replace('.', '_'))
+    if args.ml_mech == "tabicl":  # Include tabicl_bins if using tabicl
+        run_name_parts.append(f"bins{args.tabicl_bins}")
+    
+    # Join all parts with underscores
+    run_name = "_".join(run_name_parts)
+    output_dir = set_output_dir(run_name)
+    logger.info(f"Output directory: {output_dir}")
+
+    # Save experiment configuration for reproducibility
+    experiment_config = {
+        "run_name": run_name,
+        "output_dir": output_dir,
+        "dataset": {
+            "name": args.dataset,
+            "name_lower": dataset_name_lower,
+            "name_original": dataset_name_original,
+            "plate_file": args.plate_file,
+            "plate_index": args.plate_index,
+            "max_samples": args.max_samples
+        },
+        "model": {
+            "llm_model_name": args.model_name,
+            "ml_mechanism": args.ml_mech,
+            "use_ml": bool(args.use_ml),
+            "tabicl_bins": args.tabicl_bins if args.ml_mech.lower() == "tabicl" else None
+        },
+        "training": {
+            "top_k": args.top_k,
+            "topk_strategy": args.topk_strategy,
+            "iterations": args.iterations,
+            "acceptance_set": args.acceptance_set,
+            "val_size": args.val_size,
+            "regression_loss": args.regression_loss,
+            "relax_eval": bool(args.relax_eval),
+            "num_mechanisms_unknown": args.num_mechanisms_unknown,
+            "no_scaling": args.no_scaling
+        },
+        "evaluation": {
+            "evaluate_individual_mechanisms": args.evaluate_individual_mechanisms
+        },
+        "system": {
+            "random_state": RANDOM_STATE,
+            "scale_min": SCALE_MIN,
+            "scale_max": SCALE_MAX,
+            "has_matplotlib": _HAS_MATPLOTLIB,
+            "has_pandas": _HAS_PANDAS,
+            "has_deepchem": _HAS_DEEPCHEM
+        },
+        "command_line_args": vars(args)
+    }
+    
+    config_file = os.path.join(output_dir, "experiment_config.json")
+    with open(config_file, 'w') as f:
+        json.dump(experiment_config, f, indent=2)
+    logger.info(f"Saved experiment configuration to {config_file}")
+
+    llm = _get_gemini_llm(args.model_name)
+
+    deepchem_splits = None  # populated when using DeepChem official train/valid/test splits
+
+    if dataset_name_lower == "gfp_yield":
+        X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_gfp_yield_dataset(args.max_samples)
+    elif dataset_name_lower == "protein_expression":
+        X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_protein_expression_dataset(
+            args.max_samples, plate_file=args.plate_file, plate_index=args.plate_index)
+    elif dataset_name_lower == "protein_expression_all":
+        X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_protein_expression_all_plates_dataset(args.max_samples)
+    elif dataset_name_lower == "dataset_102":
+        X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_dataset_102(args.max_samples)
+    elif (
+        dataset_name_lower in ("esol", "delaney", "lipo", "lipophilicity")
+        or dataset_name_lower.startswith("deepchem_")
+    ):
+        # DeepChem MolNet datasets (commonly used benchmarks; see `https://github.com/deepchem/deepchem/tree/master/datasets`)
+        deepchem_dataset_name = args.dataset
+        if dataset_name_lower.startswith("deepchem_"):
+            # Allow disambiguation when a name could refer to other dataset sources:
+            #   --dataset deepchem_tox21
+            deepchem_dataset_name = args.dataset.split("_", 1)[1]
+        if bool(args.deepchem_use_official_split):
+            deepchem_splits = load_deepchem_regression_dataset(
+                deepchem_dataset_name,
+                args.max_samples,
+                featurizer=args.deepchem_featurizer,
+                splitter=args.deepchem_splitter,
+                return_splits=True,
+            )
+            (X_train_dc, y_train_dc, X_original_train_dc), (X_val_dc, y_val_dc, X_original_val_dc), (X_test_dc, y_test_dc, X_original_test_dc), feature_cols, feature_encoders, ds_label = deepchem_splits
+
+            # Optionally add RDKit descriptors to LLM-visible inputs (SMILES dicts)
+            if bool(args.deepchem_llm_add_rdkit_features):
+                X_original_train_dc = _maybe_add_rdkit_features_to_smiles_dicts(
+                    X_original_train_dc, enabled=True, log_prefix="[DeepChem LLM] "
+                )
+                X_original_val_dc = _maybe_add_rdkit_features_to_smiles_dicts(
+                    X_original_val_dc, enabled=True, log_prefix="[DeepChem LLM] "
+                )
+                X_original_test_dc = _maybe_add_rdkit_features_to_smiles_dicts(
+                    X_original_test_dc, enabled=True, log_prefix="[DeepChem LLM] "
+                )
+                deepchem_splits = (
+                    (X_train_dc, y_train_dc, X_original_train_dc),
+                    (X_val_dc, y_val_dc, X_original_val_dc),
+                    (X_test_dc, y_test_dc, X_original_test_dc),
+                    feature_cols,
+                    feature_encoders,
+                    ds_label,
+                )
+
+            # Build combined pools for bookkeeping/config logging (we still evaluate using official splits).
+            X_all = np.vstack([X_train_dc, X_val_dc, X_test_dc])
+            y_all = np.concatenate([y_train_dc, y_val_dc, y_test_dc])
+            X_original_all = X_original_train_dc + X_original_val_dc + X_original_test_dc
+        else:
+            X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_deepchem_regression_dataset(
+                deepchem_dataset_name,
+                args.max_samples,
+                featurizer=args.deepchem_featurizer,
+                splitter=args.deepchem_splitter,
+                return_splits=False,
+            )
+            if bool(args.deepchem_llm_add_rdkit_features):
+                X_original_all = _maybe_add_rdkit_features_to_smiles_dicts(
+                    X_original_all, enabled=True, log_prefix="[DeepChem LLM] "
+                )
+    elif dataset_name_lower in ("diabetes", "housing", "bike", "insurance", "concrete", "energy", 
+                                  "airfoil", "yacht", "auto", "abalone", "winequality", "students", 
+                                  "diamonds", "house-prices", "airbnb") or dataset_name_lower.startswith("tabarena_"):
+        # TabArena regression datasets from HuggingFace
+        try:
+            # Remove tabarena_ prefix if present
+            tabarena_name = dataset_name_lower.replace("tabarena_", "")
+            X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_tabarena_regression_dataset(
+                tabarena_name, args.max_samples
+            )
+        except Exception as e:
+            raise SystemExit(f"Failed to load TabArena regression dataset '{args.dataset}': {e}")
+    else:
+        # Try loading as enzyme dataset - use original case-preserved name
+        try:
+            X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_enzyme_dataset(dataset_name_original, args.max_samples)
+            loaded = True
+        except Exception as e:
+            # If enzyme loading fails, optionally fall back to DeepChem (lazy import inside loader).
+            # This avoids importing DeepChem for enzyme runs, but still supports arbitrary MolNet names when requested.
+            deepchem_error = None
+            if _HAS_DEEPCHEM:
+                try:
+                    deepchem_dataset_name = args.dataset
+                    if dataset_name_lower.startswith("deepchem_"):
+                        deepchem_dataset_name = args.dataset.split("_", 1)[1]
+                    if bool(args.deepchem_use_official_split):
+                        deepchem_splits = load_deepchem_regression_dataset(
+                            deepchem_dataset_name,
+                            args.max_samples,
+                            featurizer=args.deepchem_featurizer,
+                            splitter=args.deepchem_splitter,
+                            return_splits=True,
+                        )
+                        (
+                            (X_train_dc, y_train_dc, X_original_train_dc),
+                            (X_val_dc, y_val_dc, X_original_val_dc),
+                            (X_test_dc, y_test_dc, X_original_test_dc),
+                            feature_cols,
+                            feature_encoders,
+                            ds_label,
+                        ) = deepchem_splits
+
+                        if bool(args.deepchem_llm_add_rdkit_features):
+                            X_original_train_dc = _maybe_add_rdkit_features_to_smiles_dicts(
+                                X_original_train_dc, enabled=True, log_prefix="[DeepChem LLM] "
+                            )
+                            X_original_val_dc = _maybe_add_rdkit_features_to_smiles_dicts(
+                                X_original_val_dc, enabled=True, log_prefix="[DeepChem LLM] "
+                            )
+                            X_original_test_dc = _maybe_add_rdkit_features_to_smiles_dicts(
+                                X_original_test_dc, enabled=True, log_prefix="[DeepChem LLM] "
+                            )
+                            deepchem_splits = (
+                                (X_train_dc, y_train_dc, X_original_train_dc),
+                                (X_val_dc, y_val_dc, X_original_val_dc),
+                                (X_test_dc, y_test_dc, X_original_test_dc),
+                                feature_cols,
+                                feature_encoders,
+                                ds_label,
+                            )
+
+                        X_all = np.vstack([X_train_dc, X_val_dc, X_test_dc])
+                        y_all = np.concatenate([y_train_dc, y_val_dc, y_test_dc])
+                        X_original_all = X_original_train_dc + X_original_val_dc + X_original_test_dc
+                    else:
+                        X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_deepchem_regression_dataset(
+                            deepchem_dataset_name,
+                            args.max_samples,
+                            featurizer=args.deepchem_featurizer,
+                            splitter=args.deepchem_splitter,
+                            return_splits=False,
+                        )
+                        if bool(args.deepchem_llm_add_rdkit_features):
+                            X_original_all = _maybe_add_rdkit_features_to_smiles_dicts(
+                                X_original_all, enabled=True, log_prefix="[DeepChem LLM] "
+                            )
+                    loaded = True
+                except Exception as _dc_e:
+                    deepchem_error = _dc_e
+
+            if not loaded:
+                msg = (
+                    f"Unknown dataset {args.dataset}. Error: {e}\n"
+                    f"Available options: gfp_yield, protein_expression, protein_expression_all, dataset_102, "
+                    f"TabArena (diabetes), "
+                    f"DeepChem (any molnet dataset, e.g., esol, delaney, lipo, lipophilicity), "
+                    f"or enzyme dataset names (e.g., halogenase_NaBr, aminotransferase, olea, phosphatase_achiral)"
+                )
+                if deepchem_error is not None:
+                    msg += f"\nDeepChem fallback error: {deepchem_error}"
+                raise SystemExit(msg)
+    
+    # Update experiment config with dataset information after loading
+    experiment_config["dataset"]["label"] = ds_label
+    experiment_config["dataset"]["n_samples"] = len(X_all)
+    experiment_config["dataset"]["n_features"] = len(feature_cols) if feature_cols else X_all.shape[1] if hasattr(X_all, 'shape') else None
+    experiment_config["dataset"]["feature_cols"] = feature_cols if feature_cols else None
+    experiment_config["dataset"]["y_min"] = float(y_all.min()) if hasattr(y_all, 'min') else None
+    experiment_config["dataset"]["y_max"] = float(y_all.max()) if hasattr(y_all, 'max') else None
+    experiment_config["dataset"]["y_mean"] = float(y_all.mean()) if hasattr(y_all, 'mean') else None
+    experiment_config["dataset"]["y_std"] = float(y_all.std()) if hasattr(y_all, 'std') else None
+    
+    # Update config file with dataset information
+    config_file = os.path.join(output_dir, "experiment_config.json")
+    with open(config_file, 'w') as f:
+        json.dump(experiment_config, f, indent=2)
+    logger.info(f"Updated experiment configuration with dataset information")
+    
+    from sklearn.model_selection import train_test_split
+    # Regression-friendly stratification: bin y into quantiles and stratify to preserve target distribution.
+    # For DeepChem datasets, default is to use DeepChem's official train/valid/test splits (MolNet benchmark convention).
+    split_method = "random"  # Track which split method was used
+    if deepchem_splits is not None and bool(args.deepchem_use_official_split):
+        (X_train, y_train, X_original_train), (X_val, y_val, X_original_val), (X_test, y_test, X_original_test), _, _, _ = deepchem_splits
+        X_train_full, y_train_full = X_train, y_train
+        idx_tr_full = np.arange(len(X_train))
+        idx_te = np.arange(len(X_test))
+        split_method = f"deepchem_official_{args.deepchem_splitter}"
+        logger.info(f"Using DeepChem official splits (splitter={args.deepchem_splitter}). Ignoring --val_size.")
+    else:
+        try:
+            n_bins = 10
+            quantiles = np.quantile(y_all, np.linspace(0.0, 1.0, n_bins + 1)[1:-1])
+            y_bins = np.digitize(y_all, quantiles, right=True)
+            X_train_full, X_test, y_train_full, y_test, idx_tr_full, idx_te = train_test_split(
+                X_all, y_all, np.arange(len(X_all)), test_size=0.2, random_state=RANDOM_STATE, stratify=y_bins
+            )
+            # Now split train_full into train and validation using stratification on y_train_full
+            try:
+                quantiles_tr = np.quantile(y_train_full, np.linspace(0.0, 1.0, n_bins + 1)[1:-1])
+                y_bins_tr = np.digitize(y_train_full, quantiles_tr, right=True)
+                X_train, X_val, y_train, y_val, idx_tr, idx_va = train_test_split(
+                    X_train_full, y_train_full, np.arange(len(X_train_full)), test_size=float(args.val_size), random_state=RANDOM_STATE, stratify=y_bins_tr
+                )
+                # Split X_original_all using same indices
+                X_original_train = [X_original_all[idx_tr_full[i]] for i in idx_tr]
+                X_original_val = [X_original_all[idx_tr_full[i]] for i in idx_va]
+                X_original_test = [X_original_all[i] for i in idx_te]
+                split_method = "quantile_stratified"
+                logger.info("Used quantile-stratified train/validation/test split for regression.")
+            except Exception:
+                X_train, X_val, y_train, y_val, idx_tr, idx_va = train_test_split(
+                    X_train_full, y_train_full, np.arange(len(X_train_full)), test_size=float(args.val_size), random_state=RANDOM_STATE
+                )
+                # Split X_original_all using same indices
+                X_original_train = [X_original_all[idx_tr_full[i]] for i in idx_tr]
+                X_original_val = [X_original_all[idx_tr_full[i]] for i in idx_va]
+                X_original_test = [X_original_all[i] for i in idx_te]
+                split_method = "partial_stratified"  # First split stratified, second not
+                logger.info("Used random train/validation split (stratification unavailable).")
+        except Exception:
+            # Fallback to regular split if stratification fails (e.g., tiny datasets)
+            X_train_full, X_test, y_train_full, y_test, idx_tr_full, idx_te = train_test_split(
+                X_all, y_all, np.arange(len(X_all)), test_size=0.2, random_state=RANDOM_STATE
+            )
+            X_train, X_val, y_train, y_val, idx_tr, idx_va = train_test_split(
+                X_train_full, y_train_full, np.arange(len(X_train_full)), test_size=float(args.val_size), random_state=RANDOM_STATE
+            )
+            # Split X_original_all using same indices
+            X_original_train = [X_original_all[idx_tr_full[i]] for i in idx_tr]
+            X_original_val = [X_original_all[idx_tr_full[i]] for i in idx_va]
+            X_original_test = [X_original_all[i] for i in idx_te]
+            split_method = "random"
+            logger.info("Used regular random train/validation/test split (stratification unavailable).")
+
+    # Update experiment config with split information
+    experiment_config["data_splits"] = {
+        "n_train": len(X_train),
+        "n_val": len(X_val),
+        "n_test": len(X_test),
+        "n_train_full": len(X_train_full),
+        "test_size": 0.2,
+        "val_size": float(args.val_size),
+        "random_state": RANDOM_STATE,
+        "split_method": split_method
+    }
+    # Update config file with split information
+    config_file = os.path.join(output_dir, "experiment_config.json")
+    with open(config_file, 'w') as f:
+        json.dump(experiment_config, f, indent=2)
+    logger.info(f"Updated experiment configuration with data split information")
+
+    # Log routing mode for clarity
+    if bool(args.relax_eval):
+        logger.info("Evaluation routing: RELAXED (LLM mechanisms can contribute).")
+    else:
+        logger.info("Evaluation routing: STRICT ML preference (LLM contributions limited).")
+
+    # Detect if this is a DeepChem dataset (for special handling of SMILES strings)
+    is_deepchem_dataset = dataset_name_lower in ("esol", "delaney", "lipo", "lipophilicity") or (
+        feature_cols and len(feature_cols) > 0 and 
+        all(feat.startswith('ecfp_bit_') for feat in feature_cols[:10])
+    )
+    
+    # For DeepChem datasets, create index mapping table for SMILES strings
+    # This ensures we can map from residual indices to SMILES strings correctly
+    if is_deepchem_dataset:
+        logger.info("Detected DeepChem dataset - will use SMILES strings (non-vectorized features) for LLM mechanisms")
+        # Verify that X_original contains SMILES strings
+        if X_original_all and len(X_original_all) > 0:
+            first_original = X_original_all[0]
+            if isinstance(first_original, dict) and 'SMILES' in first_original:
+                logger.info(f"  ✓ SMILES strings available in X_original (e.g., '{first_original['SMILES'][:50]}...')")
+            else:
+                logger.warning(f"  ⚠ X_original does not contain SMILES strings (type: {type(first_original)})")
+        else:
+            logger.warning("  ⚠ X_original is empty or None for DeepChem dataset")
+
+    # Conditionally scale features based on --no_scaling flag
+    if args.no_scaling:
+        logger.info("Scaling DISABLED - using raw/unscaled data for features and targets")
+        scaler = None
+        X_train_s = X_train
+        X_val_s = X_val
+        X_test_s = X_test
+        logger.info(f"Features NOT scaled (X min={X_train_s.min():.3f}, max={X_train_s.max():.3f})")
+        
+        # No scaling for targets either
+        y_scaler_target = None
+        y_train_s = y_train
+        y_val_s = y_val
+        y_test_s = y_test
+        logger.info(f"Targets NOT scaled (y min={y_train_s.min():.3f}, max={y_train_s.max():.3f})")
+        logger.info(f"NOTE: All models (ML and LLM) use raw/unscaled data")
+    else:
+        # Scale features to [SCALE_MIN, SCALE_MAX] using MinMaxScaler010 (default: [0.0, 1.0])
+        scaler = MinMaxScaler010()
+        X_train_s = scaler.fit_transform(X_train)
+        X_val_s = scaler.transform(X_val)
+        X_test_s = scaler.transform(X_test)
+        validate_scaled_data(X_train_s, feature_cols, scaler=scaler)
+        logger.info(f"Features scaled to [{SCALE_MIN}, {SCALE_MAX}] range (X min={X_train_s.min():.3f}, max={X_train_s.max():.3f})")
+
+        # Scale target to [SCALE_MIN, SCALE_MAX] to match feature scaling for consistency
+        # Use MinMaxScaler010 to ensure same scaling range as features (default: [0.0, 1.0])
+        y_scaler_target = MinMaxScaler010()  # Uses SCALE_MIN and SCALE_MAX from config (default: [0.0, 1.0])
+        y_train_s = y_scaler_target.fit_transform(y_train.reshape(-1, 1)).ravel()
+        y_val_s = y_scaler_target.transform(y_val.reshape(-1, 1)).ravel()
+        y_test_s = y_scaler_target.transform(y_test.reshape(-1, 1)).ravel()
+        logger.info(f"Targets scaled to [{SCALE_MIN}, {SCALE_MAX}] range (y min={y_train_s.min():.3f}, max={y_train_s.max():.3f})")
+        logger.info(f"NOTE: All models (ML and LLM) use the same scaled data - features and targets both in [{SCALE_MIN}, {SCALE_MAX}]")
+
+    # Only create and train ML model if use_ml is enabled
+    pretrained_ml = None
+    residuals = None
+    sorted_idx = None
+    ml_preds = None
+    
+    # Define model_name for logging purposes (even when ML is disabled)
+    mech_map = {"linear": "LinearRegression", "xgboost": "XGBoost", "kernelridge": "KernelRidge", "tabicl": "TabICL", "tabpfn": "TabPFN"}
+    model_name = mech_map.get(args.ml_mech.lower(), "KernelRidge")
+    
+    if args.use_ml:
+
+        pretrained_ml = MLModelMechanism(model_name, task_type="regression")
+        # Pass tabicl_bins parameter for TabICL regression quantization
+        if model_name == "TabICL":
+            pretrained_ml._tabicl_regression_bins = args.tabicl_bins
+            logger.info(f"Using TabICL for regression with {args.tabicl_bins} quantization bins")
+        pretrained_ml.train(X_train_s, y_train_s, feature_cols, y_scaler=None)
+        pretrained_ml._maicl_feature_cols = feature_cols
+        pretrained_ml._maicl_feature_encoders = feature_encoders
+        pretrained_ml._maicl_scaler = scaler
+
+        # Initial residuals computed on full training set (needed for top-K selection)
+        sorted_idx, residuals, ml_preds, _ = compute_ml_residuals(
+            pretrained_ml, X_train_s, y_train_s, feature_cols, class_names=None, task_type="regression"
+        )
+        logger.info("ML model trained and residuals computed for top-K selection")
+    else:
+        logger.info("ML mechanism disabled (--use_ml 0) - using LLM-only learning")
+
+    def _select_topk_residual_balanced(X_tr_s, y_tr_s, residual_vec, k, bins=10):
+        if k <= 0 or k >= len(y_tr_s):
+            return X_tr_s, y_tr_s, np.arange(len(y_tr_s))
+        abs_res = np.abs(residual_vec)
+        q = np.quantile(y_tr_s, np.linspace(0.0, 1.0, bins + 1)[1:-1])
+        yb = np.digitize(y_tr_s, q, right=True)
+        idxs = []
+        # Allocate k proportionally to bin sizes, minimum 1 if bin non-empty
+        unique_bins, counts = np.unique(yb, return_counts=True)
+        proportions = {b: c / len(y_tr_s) for b, c in zip(unique_bins, counts)}
+        allocated = {b: max(1, int(round(k * proportions[b]))) for b in unique_bins}
+        # Adjust allocation to exactly k
+        total_alloc = sum(allocated.values())
+        # Trim or add to match k
+        while total_alloc > k:
+            bmax = max(allocated, key=lambda b: allocated[b])
+            if allocated[bmax] > 1:
+                allocated[bmax] -= 1
+                total_alloc -= 1
+            else:
+                break
+        while total_alloc < k:
+            bmin = min(allocated, key=lambda b: allocated[b])
+            allocated[bmin] += 1
+            total_alloc += 1
+        # Pick within each bin
+        for b in unique_bins:
+            bin_idx = np.where(yb == b)[0]
+            if len(bin_idx) == 0:
+                continue
+            take = min(allocated[b], len(bin_idx))
+            top_in_bin = bin_idx[np.argsort(abs_res[bin_idx])[::-1][:take]]
+            idxs.extend(top_in_bin.tolist())
+        idxs = np.array(sorted(set(idxs)))
+        return X_tr_s[idxs], y_tr_s[idxs], idxs
+    
+    def _select_topk_balanced_y_quantile(X_tr_s, y_tr_s, k, bins=10):
+        """Select top-K samples with balanced y-quantile coverage (for LLM-only mode)"""
+        if k <= 0 or k >= len(y_tr_s):
+            return X_tr_s, y_tr_s, np.arange(len(y_tr_s))
+        q = np.quantile(y_tr_s, np.linspace(0.0, 1.0, bins + 1)[1:-1])
+        yb = np.digitize(y_tr_s, q, right=True)
+        idxs = []
+        # Allocate k proportionally to bin sizes, minimum 1 if bin non-empty
+        unique_bins, counts = np.unique(yb, return_counts=True)
+        proportions = {b: c / len(y_tr_s) for b, c in zip(unique_bins, counts)}
+        allocated = {b: max(1, int(round(k * proportions[b]))) for b in unique_bins}
+        # Adjust allocation to exactly k
+        total_alloc = sum(allocated.values())
+        # Trim or add to match k
+        while total_alloc > k:
+            bmax = max(allocated, key=lambda b: allocated[b])
+            if allocated[bmax] > 1:
+                allocated[bmax] -= 1
+                total_alloc -= 1
+            else:
+                break
+        while total_alloc < k:
+            bmin = min(allocated, key=lambda b: allocated[b])
+            allocated[bmin] += 1
+            total_alloc += 1
+        # Pick randomly within each bin (since we don't have residuals)
+        rng = np.random.RandomState(RANDOM_STATE)
+        for b in unique_bins:
+            bin_idx = np.where(yb == b)[0]
+            if len(bin_idx) == 0:
+                continue
+            take = min(allocated[b], len(bin_idx))
+            selected = rng.choice(bin_idx, size=take, replace=False)
+            idxs.extend(selected.tolist())
+        idxs = np.array(sorted(set(idxs)))
+        return X_tr_s[idxs], y_tr_s[idxs], idxs
+
+    if args.top_k == -1:
+        X_topk, y_topk, top_indices = X_train_s, y_train_s, np.arange(len(X_train_s))
+        X_original_topk = X_original_train
+    else:
+        if args.use_ml:
+            # Use ML residuals for top-K selection when ML is enabled
+            if args.topk_strategy == "residual_balanced":
+                logger.info(f"Selecting top-K residuals with balanced y-quantile coverage (K={args.top_k})")
+                X_topk, y_topk, top_indices = _select_topk_residual_balanced(
+                    X_train_s, y_train_s, residuals, args.top_k, bins=10
+                )
+            else:
+                X_topk, y_topk, top_indices = get_top_k_residual_samples(
+                    sorted_idx, residuals, X_train_s, y_train_s, args.top_k,
+                    ml_predictions=ml_preds, task_type="regression", selection_strategy="residual"
+                )
+            if len(top_indices) == 0:
+                logger.warning("No top-K samples found (perfect ML?). Falling back to full dataset.")
+                X_topk, y_topk, top_indices = X_train_s, y_train_s, np.arange(len(X_train_s))
+                X_original_topk = X_original_train
+            else:
+                # Extract corresponding X_original samples (SMILES strings for LLM)
+                # For DeepChem datasets, this ensures we use SMILES strings instead of vectorized features
+                X_original_topk = [X_original_train[i] for i in top_indices]
+                
+                # For DeepChem datasets, log a sample of SMILES strings to verify correct mapping
+                if is_deepchem_dataset and X_original_topk and len(X_original_topk) > 0:
+                    sample_smiles = []
+                    for idx in top_indices[:min(5, len(top_indices))]:
+                        if idx < len(X_original_train):
+                            orig = X_original_train[idx]
+                            if isinstance(orig, dict) and 'SMILES' in orig:
+                                sample_smiles.append(f"idx={idx}: SMILES={orig['SMILES']}")
+                    if sample_smiles:
+                        logger.info(f"  Sample SMILES strings from top-K residuals: {', '.join(sample_smiles[:3])}")
+            logger.info(f"Top-K selection: strategy={args.topk_strategy}, selected={len(top_indices)} examples.")
+        else:
+            # LLM-only mode: use balanced y-quantile selection (no ML residuals available)
+            logger.info(f"LLM-only mode: Selecting top-K samples with balanced y-quantile coverage (K={args.top_k})")
+            X_topk, y_topk, top_indices = _select_topk_balanced_y_quantile(
+                X_train_s, y_train_s, args.top_k, bins=10
+            )
+            X_original_topk = [X_original_train[i] for i in top_indices]
+            logger.info(f"Top-K selection: balanced y-quantile, selected={len(top_indices)} examples.")
+    
+    # ML model is FROZEN after initial training on full training set
+    # Compute residuals on the top-K subset using the frozen model (for MA-ICL training)
+    residuals_topk = None
+    if args.use_ml:
+        # ML model stays frozen - trained once on full training set and never retrained
+        logger.info(f"ML model is FROZEN (trained on full training set: {len(X_train_s)} samples)")
+        logger.info(f"MA-ICL will train on {len(X_topk)} top-K samples, but ML model remains frozen")
+        
+        if args.top_k != -1:
+            # Compute residuals on the subset using the frozen model (trained on full set)
+            sorted_idx, residuals_topk, ml_preds, _ = compute_ml_residuals(
+                pretrained_ml, X_topk, y_topk, feature_cols, class_names=None, task_type="regression"
+            )
+            logger.info(f"Computed residuals on top-K subset using frozen ML model (trained on full set)")
+        else:
+            # Both train on full set, use original residuals
+            residuals_topk = residuals
+            logger.info(f"Using full training set ({len(X_topk)} samples) - residuals already computed")
+        
+        # Compute ML baseline metrics on test set using frozen model
+        ml_baseline_metrics: Dict[str, Any] = {}
+        try:
+            model = pretrained_ml.model
+            # TabPFN and TabICL require DataFrames, not numpy arrays
+            if model_name == "TabPFN":
+                # TabPFN uses subprocess isolation - model is None, use batch prediction helper
+                y_pred = predict_tabpfn_batch(pretrained_ml, X_test_s, feature_cols).astype(float)
+            elif model_name == "TabICL":
+                import pandas as pd
+                X_test_df = pd.DataFrame(X_test_s, columns=feature_cols)
+                # For TabICL regression, handle quantization/dequantization
+                if hasattr(pretrained_ml, '_tabicl_bin_centers') and pretrained_ml._tabicl_bin_centers is not None:
+                    # TabICL regression: predict bin, then map to continuous value
+                    try:
+                        if hasattr(model, 'predict_proba'):
+                            # Use probabilities for weighted prediction (more accurate)
+                            proba = model.predict_proba(X_test_df)
+                            # Get class indices (bins) that the model knows about
+                            if hasattr(model, 'classes_'):
+                                class_indices = model.classes_
+                                # Map probabilities to bin centers and compute weighted average
+                                y_pred = np.zeros(len(X_test_df))
+                                for i in range(len(X_test_df)):
+                                    weighted_sum = 0.0
+                                    total_prob = 0.0
+                                    for j, class_idx in enumerate(class_indices):
+                                        if 0 <= class_idx < len(pretrained_ml._tabicl_bin_centers):
+                                            weighted_sum += proba[i, j] * pretrained_ml._tabicl_bin_centers[class_idx]
+                                            total_prob += proba[i, j]
+                                    if total_prob > 0:
+                                        y_pred[i] = weighted_sum / total_prob
+                                    else:
+                                        # Fallback: use hard prediction
+                                        bin_idx = int(model.predict(X_test_df.iloc[[i]])[0])
+                                        bin_idx = np.clip(bin_idx, 0, len(pretrained_ml._tabicl_bin_centers) - 1)
+                                        y_pred[i] = pretrained_ml._tabicl_bin_centers[bin_idx]
+                            else:
+                                # Fallback: use hard prediction
+                                bin_preds = model.predict(X_test_df)
+                                y_pred = np.array([pretrained_ml._tabicl_bin_centers[np.clip(int(b), 0, len(pretrained_ml._tabicl_bin_centers) - 1)] for b in bin_preds])
+                        else:
+                            # Fallback: use hard prediction
+                            bin_preds = model.predict(X_test_df)
+                            y_pred = np.array([pretrained_ml._tabicl_bin_centers[np.clip(int(b), 0, len(pretrained_ml._tabicl_bin_centers) - 1)] for b in bin_preds])
+                    except Exception as e:
+                        logger.warning(f"TabICL regression prediction failed, using fallback: {e}")
+                        bin_preds = model.predict(X_test_df)
+                        mid_idx = len(pretrained_ml._tabicl_bin_centers) // 2
+                        y_pred = np.full(len(X_test_df), pretrained_ml._tabicl_bin_centers[mid_idx])
+                else:
+                    y_pred = model.predict(X_test_df).astype(float)
+            else:
+                y_pred = model.predict(X_test_s).astype(float)
+            
+            # Clip predictions to [0,1] if targets are scaled (regression with scaling)
+            if not args.no_scaling and y_scaler_target is not None:
+                y_pred_clipped = np.clip(y_pred, SCALE_MIN, SCALE_MAX)
+                n_out_of_range = np.sum((y_pred < SCALE_MIN) | (y_pred > SCALE_MAX))
+                if n_out_of_range > 0:
+                    logger.warning(f"⚠️  ML predictions out of range [{SCALE_MIN}, {SCALE_MAX}]: {n_out_of_range}/{len(y_pred)} samples")
+                    logger.warning(f"   Prediction range: [{y_pred.min():.4f}, {y_pred.max():.4f}]")
+                    logger.warning(f"   Target range: [{y_test_s.min():.4f}, {y_test_s.max():.4f}]")
+                    logger.info(f"   Using clipped predictions for metrics (clipped {n_out_of_range} values)")
+                    y_pred = y_pred_clipped
+            
+            r2 = r2_score(y_test_s, y_pred)
+            mae = mean_absolute_error(y_test_s, y_pred)
+            mse = mean_squared_error(y_test_s, y_pred)
+            
+            # Check for multicollinearity (can cause unstable coefficients)
+            if len(feature_cols) > 1:
+                from sklearn.preprocessing import StandardScaler
+                # Compute correlation matrix of features
+                feature_corr = np.corrcoef(X_train_s.T)
+                high_corr_pairs = []
+                for i in range(len(feature_cols)):
+                    for j in range(i+1, len(feature_cols)):
+                        if abs(feature_corr[i, j]) > 0.9:
+                            high_corr_pairs.append((feature_cols[i], feature_cols[j], feature_corr[i, j]))
+                if high_corr_pairs:
+                    logger.warning(f"⚠️  High multicollinearity detected (|corr| > 0.9):")
+                    for feat1, feat2, corr in high_corr_pairs:
+                        logger.warning(f"   {feat1} ↔ {feat2}: {corr:.4f}")
+                    logger.warning(f"   This can cause unstable/unreliable coefficients in linear models")
+            
+            # Additional diagnostics for poor performance
+            if r2 < 0:
+                logger.warning(f"⚠️  Negative R² ({r2:.4f}) indicates model performs worse than predicting the mean")
+                logger.warning(f"   This suggests:")
+                logger.warning(f"   1. Model may be overfitting or extrapolating poorly")
+                logger.warning(f"   2. Non-linear relationships not captured by linear model")
+                logger.warning(f"   3. High experimental noise relative to signal")
+                logger.warning(f"   4. Small sample size ({len(X_train_s)} samples) may be insufficient")
+                
+                # Check if predictions are systematically biased
+                mean_pred = y_pred.mean()
+                mean_true = y_test_s.mean()
+                pred_std = y_pred.std()
+                true_std = y_test_s.std()
+                logger.info(f"   Prediction mean: {mean_pred:.4f}, Target mean: {mean_true:.4f} (bias: {mean_pred - mean_true:.4f})")
+                logger.info(f"   Prediction std: {pred_std:.4f}, Target std: {true_std:.4f}")
+                
+                # Check correlation
+                correlation = np.corrcoef(y_test_s, y_pred)[0, 1]
+                logger.info(f"   Correlation: {correlation:.4f}")
+                
+                # CRITICAL: Negative correlation means model predicts opposite direction
+                if correlation < 0:
+                    logger.error(f"   ❌ NEGATIVE CORRELATION ({correlation:.4f}) - Model predicts OPPOSITE direction!")
+                    logger.error(f"   This indicates a fundamental problem with the model or data")
+                
+                # Check model coefficients to understand what the model learned
+                if hasattr(model, 'coef_') and hasattr(model, 'intercept_'):
+                    logger.info(f"   Model coefficients:")
+                    logger.info(f"     Intercept: {model.intercept_:.6f}")
+                    for i, col in enumerate(feature_cols):
+                        logger.info(f"     {col}: {model.coef_[i]:.6f}")
+                    
+                    # Check if coefficients are all very small (model barely using features)
+                    max_coef = np.max(np.abs(model.coef_))
+                    if max_coef < 0.1:
+                        logger.warning(f"   ⚠️  All coefficients are very small (max={max_coef:.6f})")
+                        logger.warning(f"   Model is barely using features - essentially predicting constant")
+                    
+                    # Check feature correlations with target
+                    logger.info(f"   Feature-target correlations (on training set):")
+                    for i, col in enumerate(feature_cols):
+                        feat_corr = np.corrcoef(X_train_s[:, i], y_train_s)[0, 1]
+                        logger.info(f"     {col}: {feat_corr:.4f} (coef: {model.coef_[i]:.6f})")
+                        if np.sign(feat_corr) != np.sign(model.coef_[i]) and abs(feat_corr) > 0.1:
+                            logger.warning(f"       ⚠️  Coefficient sign mismatch! Feature correlation={feat_corr:.4f}, coef={model.coef_[i]:.6f}")
+                
+                # Check if predictions are essentially constant
+                pred_range = y_pred.max() - y_pred.min()
+                true_range = y_test_s.max() - y_test_s.min()
+                if pred_range < 0.1:
+                    logger.error(f"   ❌ Predictions are nearly constant (range={pred_range:.4f} vs target range={true_range:.4f})")
+                    logger.error(f"   Model is not learning meaningful patterns from features")
+            
+            ml_baseline_metrics = {
+                "r2": r2, "mae": mae, "mse": mse,
+                "predictions": y_pred.tolist()
+            }
+            # Also check training set performance for overfitting diagnosis
+            # TabPFN and TabICL require DataFrames
+            if model_name == "TabPFN":
+                # TabPFN uses subprocess isolation - model is None, use batch prediction helper
+                y_pred_train = predict_tabpfn_batch(pretrained_ml, X_train_s, feature_cols).astype(float)
+            elif model_name == "TabICL":
+                import pandas as pd
+                X_train_df = pd.DataFrame(X_train_s, columns=feature_cols)
+                # For TabICL regression, handle quantization/dequantization
+                if hasattr(pretrained_ml, '_tabicl_bin_centers') and pretrained_ml._tabicl_bin_centers is not None:
+                    try:
+                        if hasattr(model, 'predict_proba'):
+                            proba = model.predict_proba(X_train_df)
+                            if hasattr(model, 'classes_'):
+                                class_indices = model.classes_
+                                y_pred_train = np.zeros(len(X_train_df))
+                                for i in range(len(X_train_df)):
+                                    weighted_sum = 0.0
+                                    total_prob = 0.0
+                                    for j, class_idx in enumerate(class_indices):
+                                        if 0 <= class_idx < len(pretrained_ml._tabicl_bin_centers):
+                                            weighted_sum += proba[i, j] * pretrained_ml._tabicl_bin_centers[class_idx]
+                                            total_prob += proba[i, j]
+                                    if total_prob > 0:
+                                        y_pred_train[i] = weighted_sum / total_prob
+                                    else:
+                                        bin_idx = int(model.predict(X_train_df.iloc[[i]])[0])
+                                        bin_idx = np.clip(bin_idx, 0, len(pretrained_ml._tabicl_bin_centers) - 1)
+                                        y_pred_train[i] = pretrained_ml._tabicl_bin_centers[bin_idx]
+                            else:
+                                bin_preds = model.predict(X_train_df)
+                                y_pred_train = np.array([pretrained_ml._tabicl_bin_centers[np.clip(int(b), 0, len(pretrained_ml._tabicl_bin_centers) - 1)] for b in bin_preds])
+                        else:
+                            bin_preds = model.predict(X_train_df)
+                            y_pred_train = np.array([pretrained_ml._tabicl_bin_centers[np.clip(int(b), 0, len(pretrained_ml._tabicl_bin_centers) - 1)] for b in bin_preds])
+                    except Exception:
+                        bin_preds = model.predict(X_train_df)
+                        mid_idx = len(pretrained_ml._tabicl_bin_centers) // 2
+                        y_pred_train = np.full(len(X_train_df), pretrained_ml._tabicl_bin_centers[mid_idx])
+                else:
+                    y_pred_train = model.predict(X_train_df).astype(float)
+            else:
+                y_pred_train = model.predict(X_train_s).astype(float)
+            if not args.no_scaling and y_scaler_target is not None:
+                y_pred_train = np.clip(y_pred_train, SCALE_MIN, SCALE_MAX)
+            r2_train = r2_score(y_train_s, y_pred_train)
+            mae_train = mean_absolute_error(y_train_s, y_pred_train)
+            
+            logger.info(f"ML baseline (frozen, trained on full set: {len(X_train_s)} samples):")
+            logger.info(f"  TEST:  R2={r2:.4f} MAE={mae:.4f} MSE={mse:.4f}")
+            logger.info(f"  TRAIN: R2={r2_train:.4f} MAE={mae_train:.4f}")
+            
+            if r2_train > 0 and r2 < 0:
+                logger.warning(f"⚠️  Model overfitting: Train R²={r2_train:.4f} > 0, but Test R²={r2:.4f} < 0")
+                logger.warning(f"   Model fits training data but generalizes poorly to test set")
+            elif r2_train < 0 and r2 < 0:
+                logger.warning(f"⚠️  Model underfitting: Both Train R²={r2_train:.4f} and Test R²={r2:.4f} are negative")
+                logger.warning(f"   Linear model cannot capture the relationships in this dataset")
+            
+            ml_baseline_metrics["train_r2"] = r2_train
+            ml_baseline_metrics["train_mae"] = mae_train
+        except Exception as e:
+            logger.warning(f"Failed to compute ML baseline metrics: {e}")
+    else:
+        # LLM-only mode: no ML residuals or baseline metrics
+        ml_baseline_metrics = {}
+        logger.info(f"LLM-only mode: Training on {len(X_topk)} samples (no ML baseline)")
+
+    maicl = TrainableMAICL(
+        llm, feature_cols, scaler,
+        use_ml_mechanism=bool(args.use_ml),
+        dataset_name=ds_label,  # Use actual dataset label instead of generic "BIO/BIOTECH Regression"
+        y_scaler=None,
+        pretrained_ml_mechanism=pretrained_ml if args.use_ml else None,  # Only pass ML mechanism if enabled
+        data_insights=None,
+        task_type="regression",
+        class_names=None,
+        regression_loss_metric=args.regression_loss,
+        num_mechanisms_unknown=args.num_mechanisms_unknown,
+        use_scaling=not args.no_scaling  # Enable scaling unless --no_scaling flag is set
+    )
+    # Set output directory early to ensure all artifacts are saved to the correct location
+    maicl.output_dir = output_dir
+    if ml_baseline_metrics:
+        try:
+            maicl.set_ml_baseline_performance(ml_baseline_metrics)
+        except Exception:
+            pass
+
+    # Pre metrics (MAE as loss; also R2/MSE)
+    logger.info("=" * 80)
+    logger.info("PRE-TRAINING EVALUATION")
+    logger.info("=" * 80)
+    
+    pre = maicl.evaluate(X_test_s, y_test_s, X_train_s, y_train_s, return_details=True, relax_routing=bool(args.relax_eval),
+                         X_original=X_original_test, X_pool_original=X_original_train)
+    pre_r2 = float(pre.get('r2', 0.0))
+    pre_mae = float(pre.get('mae', 0.0))
+    pre_rmse = float(pre.get('rmse', 0.0))
+    pre_mse = float(pre_rmse ** 2)
+    logger.info(f"Pre-training: R2={pre_r2:.4f} MAE={pre_mae:.4f} MSE={pre_mse:.4f}")
+    
+    # Extract pre-training predictions from evaluate results
+    y_pred_pre = np.array(pre.get('predictions', [])) if 'predictions' in pre else None
+    
+    # Track individual mechanism performance (pre-training)
+    pre_mechanism_performance = {}
+    if hasattr(maicl, 'mechanism_performance_snapshot'):
+        pre_mechanism_performance = maicl.mechanism_performance_snapshot.copy()
+        logger.info(f"Pre-training mechanism performance: {pre_mechanism_performance}")
+    
+    # Generate initial LLM mechanism(s) before pre-training evaluation for better LLM-only baseline
+    logger.info("\n" + "=" * 80)
+    logger.info("GENERATING INITIAL LLM MECHANISM(S) FOR PRE-TRAINING EVALUATION")
+    logger.info("=" * 80)
+    initial_llm_mechanisms_count = len([t for t in maicl.mechanism_types if t == "llm"])
+    if initial_llm_mechanisms_count == 0:
+        logger.info("No LLM mechanisms found. Generating initial mechanism(s) for pre-training evaluation...")
+        try:
+            # Set X_train_original for mechanism generator (needed for DeepChem SMILES strings)
+            if is_deepchem_dataset and X_original_topk:
+                maicl.mech_generator.X_train_original = X_original_topk
+                logger.info("  Set X_train_original for mechanism generator (DeepChem dataset with SMILES)")
+            
+            # Use ML residuals if available, otherwise use simple baseline
+            if args.use_ml and residuals_topk is not None and len(residuals_topk) == len(X_topk):
+                prediction_errors = np.abs(residuals_topk)
+                ml_residuals_for_init = residuals_topk
+            else:
+                # Simple baseline: use mean-centered errors
+                prediction_errors = np.abs(y_topk - np.mean(y_topk))
+                ml_residuals_for_init = None
+            
+            # Generate initial mechanism(s)
+            initial_mechanisms = maicl.mech_generator.generate_unknown_mechanisms(
+                X_topk, y_topk, prediction_errors, ml_residuals=ml_residuals_for_init
+            )
+            
+            if initial_mechanisms and len(initial_mechanisms) > 0:
+                # Update mechanisms list
+                maicl.mech_generator.unknown_mechanisms = initial_mechanisms
+                maicl.mechanisms = maicl.mech_generator.get_all_mechanisms()
+                maicl.mechanism_types = maicl.mech_generator.get_mechanism_types()
+                logger.info(f"  ✓ Generated {len(initial_mechanisms)} initial LLM mechanism(s) for pre-training evaluation")
+                logger.info(f"  Total mechanisms now: {len(maicl.mechanisms)} ({len([t for t in maicl.mechanism_types if t == 'llm'])} LLM + {len([t for t in maicl.mechanism_types if t == 'ml'])} ML)")
+            else:
+                logger.warning("  ⚠️  Failed to generate initial LLM mechanisms")
+        except Exception as e:
+            logger.warning(f"Failed to generate initial LLM mechanisms: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        logger.info(f"Found {initial_llm_mechanisms_count} existing LLM mechanism(s), skipping initial generation")
+    
+    # Evaluate LLM-only mechanisms pre-training (excluding ML) to assess initial LLM performance
+    logger.info("\n" + "=" * 80)
+    logger.info("LLM-ONLY EVALUATION PRE-TRAINING (excluding ML mechanisms)")
+    logger.info("=" * 80)
+    llm_only_pre_metrics = None
+    try:
+        # For DeepChem datasets, pass X_original to use SMILES strings instead of vectorized features
+        llm_only_pre_kwargs = {}
+        if is_deepchem_dataset:
+            llm_only_pre_kwargs['X_original'] = X_original_test
+            llm_only_pre_kwargs['X_pool_original'] = X_original_train
+        llm_only_pre_metrics = maicl.evaluate_llm_only(X_test_s, y_test_s, X_train_s, y_train_s, 
+                                                        return_details=True, k_shot=args.k_shot,
+                                                        **llm_only_pre_kwargs)
+        llm_only_pre_r2 = float(llm_only_pre_metrics.get('r2', -1.0))
+        llm_only_pre_mae = float(llm_only_pre_metrics.get('mae', 1e9))
+        llm_only_pre_mse = float(llm_only_pre_metrics.get('mse', 1e9))
+        logger.info(f"LLM-only (pre-training): R2={llm_only_pre_r2:.4f} MAE={llm_only_pre_mae:.4f} MSE={llm_only_pre_mse:.4f}")
+    except Exception as e:
+        logger.warning(f"Failed to evaluate LLM-only mechanisms pre-training: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Generate pre-training plots
+    if y_pred_pre is not None and len(y_pred_pre) > 0:
+        save_scatter_plot(y_test_s, y_pred_pre, 
+                         f"Pre-Training: Predicted vs Actual ({ds_label})", 
+                         "pre_scatter.png", output_dir)
+        save_residual_plot(y_test_s, y_pred_pre,
+                          f"Pre-Training ({ds_label})",
+                          "pre_residuals.png", output_dir)
+
+    logger.info("TRAINING MA-ICL")
+    logger.info("=" * 80)
+    logger.info(f"Training on {len(X_topk)} top-K residual samples for {args.iterations} iterations")
+    if args.acceptance_set == "test":
+        logger.info(f"Using TEST set ({len(X_test_s)} samples) for acceptance evaluation")
+    elif args.acceptance_set == "train":
+        logger.info(f"Using TRAIN set ({len(X_topk)} samples) for acceptance evaluation")
+    else:
+        logger.info(f"Using VALIDATION set ({len(X_val_s)} samples) for acceptance evaluation")
+    # Use selected set (test/validation/train) for acceptance; pass only TRAIN residuals to LLM
+    # accept_eval_max=None means use full acceptance set
+    # Use residuals_topk to ensure consistency with training data (X_topk)
+    # For DeepChem datasets, pass X_original for validation and test sets to use SMILES strings
+    train_kwargs = {'X_train_original': X_original_topk, 'output_dir': output_dir}
+    if is_deepchem_dataset:
+        train_kwargs['X_val_original'] = X_original_val
+        train_kwargs['X_test_original'] = X_original_test
+    maicl.train(X_topk, y_topk, X_val_s, y_val_s, iterations=args.iterations, 
+                ml_residuals=residuals_topk if args.use_ml else None,  # Only pass residuals if ML is enabled
+                accept_eval_max=None, X_test=X_test_s, y_test=y_test_s, 
+                acceptance_set=args.acceptance_set, k_shot=args.k_shot, **train_kwargs)
+
+    # Post metrics
+    logger.info("=" * 80)
+    logger.info("POST-TRAINING EVALUATION")
+    logger.info("=" * 80)
+    
+    # CRITICAL FIX: For fair comparison with baseline models, ALWAYS use test set for final evaluation
+    # Training uses acceptance_set (default: "validation") to avoid overfitting to test set
+    # But final evaluation should use test set to compare fairly with all baseline models
+    # This ensures all models (ML baseline, TabPFN, EBM, XGBoost, MA-ICL) are evaluated on the same test set
+    X_final_eval = X_test_s
+    y_final_eval = y_test_s
+    X_original_final_eval = X_original_test if is_deepchem_dataset else None
+    eval_set_name = "test"
+    
+    logger.info(f"Final evaluation: Using TEST set for fair comparison with all baseline models")
+    logger.info(f"  - Training used {args.acceptance_set} set for acceptance (to avoid overfitting)")
+    logger.info(f"  - Final evaluation uses test set (same as baseline models and pre-training evaluation)")
+    
+    # CRITICAL: Always use relax_routing=True to match training mode
+    # Training always uses relax_routing=True, so final evaluation must match
+    final_relax_routing = True
+    logger.info(f"  - Routing mode: relax_routing=True (same as training)")
+    
+    # CRITICAL: Always preserve mechanism performance scores from best snapshot
+    # This ensures final evaluation uses the exact same routing weights as the best iteration
+    preserve_perf = True
+    logger.info(f"Preserving mechanism performance scores from best snapshot (calculated on {args.acceptance_set} set during training)")
+    logger.info(f"  Note: Mechanism routing weights were learned during training on {args.acceptance_set} set")
+    logger.info(f"  Note: Final evaluation uses test set for fair comparison with baseline models")
+    
+    # Log final accepted mechanisms for transparency
+    final_mechanism_count = len(maicl.mechanisms) if hasattr(maicl, 'mechanisms') else 0
+    final_llm_count = sum(1 for t in maicl.mechanism_types if t == "llm") if hasattr(maicl, 'mechanism_types') else 0
+    final_ml_count = sum(1 for t in maicl.mechanism_types if t == "ml") if hasattr(maicl, 'mechanism_types') else 0
+    logger.info(f"Evaluating with final accepted mechanisms: {final_mechanism_count} total ({final_llm_count} LLM, {final_ml_count} ML)")
+    
+    # Log best snapshot metrics for comparison
+    if hasattr(maicl, '_best_iteration') and maicl._best_iteration is not None:
+        best_iter = maicl._best_iteration
+        logger.info(f"  [Best Iteration] Using mechanisms from iteration {best_iter}")
+        # Try to get best snapshot metrics if available
+        if hasattr(maicl, 'training_history') and 'best_snapshot' in str(maicl.training_history):
+            # The best snapshot metrics are stored internally, log them if we can access them
+            logger.info(f"  [Best Iteration] Best iteration {best_iter} achieved the best performance during training")
+    
+    # For DeepChem datasets, pass X_original to use SMILES strings instead of vectorized features
+    # CRITICAL: Use same evaluation set as acceptance_set for exact reproduction
+    # CRITICAL FIX: Explicitly pass k_shot to ensure final evaluation uses same value as training
+    post = maicl.evaluate(X_final_eval, y_final_eval, X_train_s, y_train_s, return_details=True, 
+                          relax_routing=final_relax_routing, preserve_mechanism_performance=preserve_perf,
+                          k_shot=args.k_shot,  # CRITICAL: Use same k_shot as training to ensure consistency
+                          X_original=X_original_final_eval,
+                          X_pool_original=X_original_train if is_deepchem_dataset else None)
+    post_mae = float(post.get('mae', 0.0))
+    post_r2 = float(post.get('r2', 0.0))
+    post_rmse = float(post.get('rmse', 0.0))
+    post_mse = float(post_rmse ** 2)
+    logger.info(f"Post-training (TEST set): R2={post_r2:.4f} MAE={post_mae:.4f} MSE={post_mse:.4f}")
+    logger.info(f"  Note: Using TEST set for fair comparison with all baseline models (same as pre-training evaluation)")
+    
+    # Compare with best iteration metrics if available
+    # Get the actual acceptance set name used during training
+    acceptance_set_name = getattr(maicl, '_acceptance_set_name', 'validation')
+    acceptance_set_display = acceptance_set_name.upper() if acceptance_set_name else 'VALIDATION'
+    
+    # NOTE: Best iteration metrics are from acceptance_set (could be test/validation/train), final evaluation is on TEST set
+    # This comparison is for reference only - different datasets may have different performance
+    if hasattr(maicl, '_best_iteration') and maicl._best_iteration is not None:
+        best_iter = maicl._best_iteration
+        best_r2 = getattr(maicl, '_best_r2', None)
+        best_mae = getattr(maicl, '_best_mae', None)
+        if best_r2 is not None:
+            r2_diff = post_r2 - best_r2
+            logger.info(f"  [Comparison] Best iteration {best_iter} had R2={best_r2:.4f} on {acceptance_set_display} set (during training)")
+            logger.info(f"  [Comparison] Final evaluation R2={post_r2:.4f} on TEST set (difference: {r2_diff:+.4f})")
+            if abs(r2_diff) > 0.01:
+                logger.warning(f"  [Comparison] ⚠️  Final R2 (test set) differs from best iteration R2 ({acceptance_set_name} set) by {abs(r2_diff):.4f}")
+                if acceptance_set_name == "test":
+                    logger.warning(f"  [Comparison] NOTE: Training used TEST set for acceptance evaluation, so this comparison is on the same set")
+                    logger.warning(f"  [Comparison] The discrepancy may indicate:")
+                    logger.warning(f"    1. Overfitting to test set during training")
+                    logger.warning(f"    2. Different evaluation conditions (routing weights, few-shot examples, etc.)")
+                else:
+                    logger.warning(f"  [Comparison] This difference is expected since best iteration was evaluated on {acceptance_set_display} set, not TEST set")
+                    logger.warning(f"  [Comparison] The discrepancy may indicate:")
+                    logger.warning(f"    1. Overfitting to {acceptance_set_name} set")
+                    logger.warning(f"    2. Different distributions between {acceptance_set_name} and test sets")
+                    logger.warning(f"    3. Mechanisms learned on {acceptance_set_name} set don't generalize well to test set")
+        if best_mae is not None:
+            mae_diff = post_mae - best_mae
+            logger.info(f"  [Comparison] Best iteration {best_iter} had MAE={best_mae:.4f} on {acceptance_set_display} set (during training)")
+            logger.info(f"  [Comparison] Final evaluation MAE={post_mae:.4f} on TEST set (difference: {mae_diff:+.4f})")
+    
+    # Extract post-training predictions from evaluate results
+    y_pred_post = np.array(post.get('predictions', [])) if 'predictions' in post else None
+    
+    # Track individual mechanism performance (post-training)
+    post_mechanism_performance = {}
+    if hasattr(maicl, 'mechanism_performance_snapshot'):
+        post_mechanism_performance = maicl.mechanism_performance_snapshot.copy()
+        logger.info(f"Post-training mechanism performance: {post_mechanism_performance}")
+    
+    # Generate post-training plots
+    # Use the same evaluation set that was used for evaluation (for consistency)
+    if y_pred_post is not None and len(y_pred_post) > 0:
+        save_scatter_plot(y_final_eval, y_pred_post,
+                         f"Post-Training: Predicted vs Actual ({ds_label}, {eval_set_name} set)",
+                         "post_scatter.png", output_dir)
+        save_residual_plot(y_final_eval, y_pred_post,
+                          f"Post-Training ({ds_label}, {eval_set_name} set)",
+                          "post_residuals.png", output_dir)
+    
+    # Evaluate LLM-only mechanisms (excluding ML) to assess LLM learning
+    logger.info("\n" + "=" * 80)
+    logger.info("LLM-ONLY EVALUATION (excluding ML mechanisms)")
+    logger.info("=" * 80)
+    llm_only_metrics = None
+    y_pred_llm_only = None
+    try:
+        # For DeepChem datasets, pass X_original to use SMILES strings instead of vectorized features
+        llm_only_kwargs = {}
+        if is_deepchem_dataset:
+            llm_only_kwargs['X_original'] = X_original_test
+            llm_only_kwargs['X_pool_original'] = X_original_train
+        llm_only_metrics = maicl.evaluate_llm_only(X_test_s, y_test_s, X_train_s, y_train_s, 
+                                                    return_details=True, k_shot=args.k_shot,
+                                                    **llm_only_kwargs)
+        llm_only_r2 = float(llm_only_metrics.get('r2', -1.0))
+        llm_only_mae = float(llm_only_metrics.get('mae', 1e9))
+        llm_only_mse = float(llm_only_metrics.get('mse', 1e9))
+        logger.info(f"LLM-only: R2={llm_only_r2:.4f} MAE={llm_only_mae:.4f} MSE={llm_only_mse:.4f}")
+        
+        y_pred_llm_only = np.array(llm_only_metrics.get('predictions', [])) if 'predictions' in llm_only_metrics else None
+        if y_pred_llm_only is not None and len(y_pred_llm_only) > 0:
+            save_scatter_plot(y_test_s, y_pred_llm_only,
+                             f"LLM-Only: Predicted vs Actual ({ds_label})",
+                             "llm_only_scatter.png", output_dir)
+            save_residual_plot(y_test_s, y_pred_llm_only,
+                              f"LLM-Only ({ds_label})",
+                              "llm_only_residuals.png", output_dir)
+    except Exception as e:
+        logger.warning(f"Failed to evaluate LLM-only mechanisms: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Train and evaluate baseline models (TabPFN, EBM, XGBoost) for comparison
+    baseline_models_metrics = {}
+    try:
+        baseline_models_metrics = train_and_evaluate_baseline_models(
+            X_train_s, y_train_s, X_test_s, y_test_s,
+            feature_cols, scaler, y_scaler_target,
+            no_scaling=args.no_scaling
+        )
+    except Exception as e:
+        logger.warning(f"Failed to train baseline models: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Generate performance comparison visualizations
+    logger.info("\n[Visualizations] Generating performance comparison plots...")
+    try:
+        create_result_visualizations(
+            y_test=y_test_s,
+            ml_baseline_metrics=ml_baseline_metrics,
+            pre_metrics=pre,
+            post_metrics=post,
+            task_type="regression",
+            class_names=None,
+            output_dir=output_dir,
+            llm_only_metrics=llm_only_metrics,
+            llm_only_pre_metrics=llm_only_pre_metrics,
+            baseline_models=baseline_models_metrics
+        )
+    except Exception as e:
+        logger.warning(f"Failed to generate visualizations: {e}")
+    
+    # Save final metrics
+    # Compute improvements vs ML baseline
+    ml_r2 = ml_baseline_metrics.get('r2', 0.0)
+    ml_mae = ml_baseline_metrics.get('mae', 0.0)
+    ml_mse = ml_baseline_metrics.get('mse', 0.0)
+    
+    final_results = {
+        "dataset": ds_label,
+        "dataset_name": dataset_name_lower,
+        "run_name": run_name,
+        "model_name": args.model_name,
+        "ml_mechanism": args.ml_mech,
+        "top_k": args.top_k,
+        "iterations": args.iterations,
+        "n_train": len(X_train_s),
+        "n_val": len(X_val_s),
+        "n_test": len(X_test_s),
+        "n_topk_trained": len(X_topk),
+        "ml_baseline": ml_baseline_metrics,
+        "pre_training": {
+            "r2": pre_r2,
+            "mae": pre_mae,
+            "mse": pre_mse,
+            "rmse": pre_rmse,
+            "mechanism_performance": pre_mechanism_performance
+        },
+        "post_training": {
+            "r2": post_r2,
+            "mae": post_mae,
+            "mse": post_mse,
+            "rmse": post_rmse,
+            "mechanism_performance": post_mechanism_performance
+        },
+        "llm_only_pre": {
+            "r2": float(llm_only_pre_metrics.get('r2', -1.0)) if llm_only_pre_metrics else None,
+            "mae": float(llm_only_pre_metrics.get('mae', 1e9)) if llm_only_pre_metrics else None,
+            "mse": float(llm_only_pre_metrics.get('mse', 1e9)) if llm_only_pre_metrics else None,
+            "rmse": float(np.sqrt(llm_only_pre_metrics.get('mse', 1e9))) if llm_only_pre_metrics and 'mse' in llm_only_pre_metrics else None
+        } if llm_only_pre_metrics else None,
+        "llm_only_post": {
+            "r2": float(llm_only_metrics.get('r2', -1.0)) if llm_only_metrics else None,
+            "mae": float(llm_only_metrics.get('mae', 1e9)) if llm_only_metrics else None,
+            "mse": float(llm_only_metrics.get('mse', 1e9)) if llm_only_metrics else None,
+            "rmse": float(np.sqrt(llm_only_metrics.get('mse', 1e9))) if llm_only_metrics and 'mse' in llm_only_metrics else None
+        } if llm_only_metrics else None,
+        "baseline_models": baseline_models_metrics,
+        "mechanism_info": {
+            "total_mechanisms": len(maicl.mechanisms),
+            "mechanism_types": maicl.mechanism_types,
+            "ml_mechanism_index": [i for i, t in enumerate(maicl.mechanism_types) if t == "ml"],
+            "llm_mechanism_indices": [i for i, t in enumerate(maicl.mechanism_types) if t == "llm"]
+        },
+        "improvements": {
+            "training_improvement": {
+                "r2_delta": post_r2 - pre_r2,
+                "mae_delta": pre_mae - post_mae,  # Positive is better (reduction)
+                "mse_delta": pre_mse - post_mse,   # Positive is better (reduction)
+            },
+            "vs_ml_baseline_pre": {
+                "r2_delta": pre_r2 - ml_r2,
+                "mae_delta": ml_mae - pre_mae,  # Positive is better (reduction)
+                "mse_delta": ml_mse - pre_mse,   # Positive is better (reduction)
+            },
+            "vs_ml_baseline_post": {
+                "r2_delta": post_r2 - ml_r2,
+                "mae_delta": ml_mae - post_mae,  # Positive is better (reduction)
+                "mse_delta": ml_mse - post_mse,   # Positive is better (reduction)
+            }
+        }
+    }
+    
+    results_file = os.path.join(output_dir, "final_results.json")
+    with open(results_file, 'w') as f:
+        json.dump(final_results, f, indent=2)
+    logger.info(f"Saved final results to {results_file}")
+    
+    # Print summary
+    logger.info("=" * 80)
+    logger.info("SUMMARY")
+    logger.info("=" * 80)
+    logger.info(f"Dataset: {ds_label}")
+    logger.info(f"ML Mechanism: {args.ml_mech} ({model_name})")
+    logger.info(f"Total Mechanisms: {len(maicl.mechanisms)} ({len([t for t in maicl.mechanism_types if t == 'llm'])} LLM + {len([t for t in maicl.mechanism_types if t == 'ml'])} ML)")
+    logger.info("")
+    logger.info("Performance Comparison:")
+    logger.info(f"  ML Baseline:        R2={ml_r2:.4f}, MAE={ml_mae:.4f}, MSE={ml_mse:.4f}")
+    logger.info(f"  Pre-training:       R2={pre_r2:.4f}, MAE={pre_mae:.4f}, MSE={pre_mse:.4f}")
+    if llm_only_pre_metrics:
+        llm_only_pre_r2 = float(llm_only_pre_metrics.get('r2', -1.0))
+        llm_only_pre_mae = float(llm_only_pre_metrics.get('mae', 1e9))
+        llm_only_pre_mse = float(llm_only_pre_metrics.get('mse', 1e9))
+        logger.info(f"  LLM-only (pre):    R2={llm_only_pre_r2:.4f}, MAE={llm_only_pre_mae:.4f}, MSE={llm_only_pre_mse:.4f}")
+    logger.info(f"  Post-training:      R2={post_r2:.4f}, MAE={post_mae:.4f}, MSE={post_mse:.4f}")
+    if llm_only_metrics:
+        llm_only_r2 = float(llm_only_metrics.get('r2', -1.0))
+        llm_only_mae = float(llm_only_metrics.get('mae', 1e9))
+        llm_only_mse = float(llm_only_metrics.get('mse', 1e9))
+        logger.info(f"  LLM-only (post):   R2={llm_only_r2:.4f}, MAE={llm_only_mae:.4f}, MSE={llm_only_mse:.4f}")
+    logger.info("")
+    logger.info("Training Improvement (Post vs Pre):")
+    logger.info(f"  ΔR2={final_results['improvements']['training_improvement']['r2_delta']:+.4f}, "
+                f"ΔMAE={final_results['improvements']['training_improvement']['mae_delta']:+.4f}, "
+                f"ΔMSE={final_results['improvements']['training_improvement']['mse_delta']:+.4f}")
+    logger.info("")
+    logger.info("Pre-training vs ML Baseline:")
+    logger.info(f"  ΔR2={final_results['improvements']['vs_ml_baseline_pre']['r2_delta']:+.4f}, "
+                f"ΔMAE={final_results['improvements']['vs_ml_baseline_pre']['mae_delta']:+.4f}, "
+                f"ΔMSE={final_results['improvements']['vs_ml_baseline_pre']['mse_delta']:+.4f}")
+    logger.info("")
+    logger.info("Post-training vs ML Baseline:")
+    logger.info(f"  ΔR2={final_results['improvements']['vs_ml_baseline_post']['r2_delta']:+.4f}, "
+                f"ΔMAE={final_results['improvements']['vs_ml_baseline_post']['mae_delta']:+.4f}, "
+                f"ΔMSE={final_results['improvements']['vs_ml_baseline_post']['mse_delta']:+.4f}")
+    logger.info("")
+    
+    # Show baseline model comparisons
+    if baseline_models_metrics:
+        logger.info("Baseline Model Comparisons:")
+        baseline_model_names = {
+            'tabpfn': 'TabPFN',
+            'ebm': 'EBM',
+            'xgboost': 'XGBoost'
+        }
+        for model_key, model_name in baseline_model_names.items():
+            if model_key in baseline_models_metrics:
+                baseline_r2 = baseline_models_metrics[model_key].get('r2', 0.0)
+                baseline_mae = baseline_models_metrics[model_key].get('mae', 0.0)
+                baseline_mse = baseline_models_metrics[model_key].get('mse', 0.0)
+                logger.info(f"  {model_name:15s} R2={baseline_r2:.4f}, MAE={baseline_mae:.4f}, MSE={baseline_mse:.4f}")
+                
+                # Compare with post-training MA-ICL
+                r2_diff = post_r2 - baseline_r2
+                mae_diff = baseline_mae - post_mae  # Positive is better (reduction)
+                mse_diff = baseline_mse - post_mse  # Positive is better (reduction)
+                logger.info(f"    vs MA-ICL (post): ΔR2={r2_diff:+.4f}, ΔMAE={mae_diff:+.4f}, ΔMSE={mse_diff:+.4f}")
+        logger.info("")
+    
+    # Show individual mechanism performance if available
+    if pre_mechanism_performance or post_mechanism_performance:
+        logger.info("Individual Mechanism Performance Scores:")
+        ml_indices = [i for i, t in enumerate(maicl.mechanism_types) if t == "ml"]
+        llm_indices = [i for i, t in enumerate(maicl.mechanism_types) if t == "llm"]
+        
+        if ml_indices:
+            ml_idx = ml_indices[0]
+            pre_ml_perf = pre_mechanism_performance.get(ml_idx, "N/A")
+            post_ml_perf = post_mechanism_performance.get(ml_idx, "N/A")
+            logger.info(f"  ML Mechanism (idx={ml_idx}):  Pre={pre_ml_perf}, Post={post_ml_perf}")
+        
+        for llm_idx in llm_indices:
+            pre_llm_perf = pre_mechanism_performance.get(llm_idx, "N/A")
+            post_llm_perf = post_mechanism_performance.get(llm_idx, "N/A")
+            logger.info(f"  LLM Mechanism (idx={llm_idx}): Pre={pre_llm_perf}, Post={post_llm_perf}")
+    
+    logger.info("=" * 80)
+    
+    # Optionally evaluate individual mechanisms
+    if args.evaluate_individual_mechanisms:
+        logger.info("=" * 80)
+        logger.info("EVALUATING INDIVIDUAL MECHANISMS")
+        logger.info("=" * 80)
+        try:
+            # Import the evaluation module
+            from pathlib import Path
+            experiment_dir = Path(__file__).parent
+            eval_module_path = str(experiment_dir / "evaluate_individual_mechanisms.py")
+            if os.path.exists(eval_module_path):
+                # Run evaluation for the final iteration
+                final_iteration = args.iterations
+                mechanisms_file = os.path.join(output_dir, f"mechanisms_iter_{final_iteration}.txt")
+                
+                if os.path.exists(mechanisms_file):
+                    logger.info(f"Evaluating mechanisms from iteration {final_iteration}")
+                    
+                    # Prepare data for evaluation
+                    eval_data = {
+                        "X_train": X_train_s,
+                        "y_train": y_train_s,
+                        "X_test": X_test_s,
+                        "y_test": y_test_s,
+                        "feature_cols": feature_cols,
+                        "scaler": scaler,
+                        "y_scaler": y_scaler_target,
+                        "dataset_name": ds_label
+                    }
+                    
+                    # Import and run evaluation
+                    import sys
+                    from pathlib import Path
+                    from evaluate_individual_mechanisms import (
+                        parse_mechanisms_file,
+                        extract_formula_from_llm_mechanism,
+                        evaluate_llm_formula,
+                        evaluate_ml_mechanism,
+                        save_mechanism_scatter_plot
+                    )
+                    
+                    mechanisms = parse_mechanisms_file(mechanisms_file)
+                    individual_results = []
+                    
+                    for mech_idx, (mech_type, mech_text) in enumerate(mechanisms):
+                        logger.info(f"\nEvaluating Mechanism {mech_idx+1}/{len(mechanisms)}: [{mech_type.upper()}]")
+                        try:
+                            if mech_type == "llm" or mech_type == "known":
+                                formula = extract_formula_from_llm_mechanism(mech_text)
+                                if formula is None:
+                                    formula = mech_text
+                                # For DeepChem datasets, pass X_original (SMILES strings) for molecular property computation
+                                # X_original_train and X_original_test are defined earlier in this function
+                                train_preds = evaluate_llm_formula(formula, X_train_s, feature_cols, scaler, y_scaler_target, X_original=X_original_train)
+                                test_preds = evaluate_llm_formula(formula, X_test_s, feature_cols, scaler, y_scaler_target, X_original=X_original_test)
+                            elif mech_type == "ml":
+                                train_preds, test_preds = evaluate_ml_mechanism(
+                                    mech_text, X_train_s, y_train_s, X_test_s, feature_cols, scaler, y_scaler_target
+                                )
+                            else:
+                                continue
+                            
+                            train_r2 = r2_score(y_train_s, train_preds)
+                            train_mae = mean_absolute_error(y_train_s, train_preds)
+                            train_mse = mean_squared_error(y_train_s, train_preds)
+                            test_r2 = r2_score(y_test_s, test_preds)
+                            test_mae = mean_absolute_error(y_test_s, test_preds)
+                            test_mse = mean_squared_error(y_test_s, test_preds)
+                            
+                            individual_results.append({
+                                "mechanism_index": mech_idx,
+                                "mechanism_type": mech_type,
+                                "train_metrics": {"r2": float(train_r2), "mae": float(train_mae), "mse": float(train_mse)},
+                                "test_metrics": {"r2": float(test_r2), "mae": float(test_mae), "mse": float(test_mse)}
+                            })
+                            
+                            logger.info(f"  Train: R2={train_r2:.4f}, MAE={train_mae:.4f}, MSE={train_mse:.4f}")
+                            logger.info(f"  Test:  R2={test_r2:.4f}, MAE={test_mae:.4f}, MSE={test_mse:.4f}")
+                            
+                            # Generate scatter plots for train and test
+                            save_mechanism_scatter_plot(
+                                y_train_s, train_preds,
+                                f"Mechanism {mech_idx} ({mech_type.upper()}) - Train Set",
+                                f"mechanism_{mech_idx}_{mech_type}_train_scatter.png",
+                                output_dir,
+                                train_r2, train_mae, train_mse
+                            )
+                            save_mechanism_scatter_plot(
+                                y_test_s, test_preds,
+                                f"Mechanism {mech_idx} ({mech_type.upper()}) - Test Set",
+                                f"mechanism_{mech_idx}_{mech_type}_test_scatter.png",
+                                output_dir,
+                                test_r2, test_mae, test_mse
+                            )
+                        except Exception as e:
+                            logger.warning(f"  Failed to evaluate mechanism {mech_idx+1}: {e}")
+                    
+                    # Save individual mechanism results
+                    individual_results_file = os.path.join(output_dir, f"individual_mechanism_performance_iter_{final_iteration}.json")
+                    with open(individual_results_file, 'w') as f:
+                        json.dump({
+                            "iteration": final_iteration,
+                            "dataset": ds_label,
+                            "n_train": len(X_train_s),
+                            "n_test": len(X_test_s),
+                            "mechanisms": individual_results
+                        }, f, indent=2)
+                    logger.info(f"\nIndividual mechanism results saved to: {individual_results_file}")
+                    
+                    # Also save CSV summary
+                    try:
+                        import pandas as pd
+                        csv_data = []
+                        for r in individual_results:
+                            csv_data.append({
+                                "mechanism_index": r["mechanism_index"],
+                                "mechanism_type": r["mechanism_type"],
+                                "train_r2": r["train_metrics"]["r2"],
+                                "train_mae": r["train_metrics"]["mae"],
+                                "train_mse": r["train_metrics"]["mse"],
+                                "test_r2": r["test_metrics"]["r2"],
+                                "test_mae": r["test_metrics"]["mae"],
+                                "test_mse": r["test_metrics"]["mse"],
+                            })
+                        df = pd.DataFrame(csv_data)
+                        csv_file = os.path.join(output_dir, f"individual_mechanism_performance_iter_{final_iteration}.csv")
+                        df.to_csv(csv_file, index=False)
+                        logger.info(f"CSV summary saved to: {csv_file}")
+                    except Exception as e:
+                        logger.warning(f"Could not save CSV summary: {e}")
+                else:
+                    logger.warning(f"Mechanisms file not found: {mechanisms_file}")
+            else:
+                logger.warning(f"Evaluation module not found: {eval_module_path}")
+        except Exception as e:
+            logger.warning(f"Failed to evaluate individual mechanisms: {e}")
+            import traceback
+            traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
+
+

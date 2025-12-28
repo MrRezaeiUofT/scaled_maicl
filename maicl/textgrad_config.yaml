@@ -1,0 +1,505 @@
+# TextGrad Configuration
+# This file contains all prompts and templates used by the TextGrad optimizer
+
+prompts:
+  optimization:
+    main_template: |
+      You are optimizing a SCIENTIFIC MECHANISM that is currently making systematic errors.
+      {dataset_context}
+      {iteration_history_context}
+
+      CURRENT MECHANISM (making errors):
+
+      {mechanism}
+
+      {error_feedback}
+      {class_dist_context}
+
+      {feature_instruction}
+
+      YOUR TASK: BUILD A STRONG, INDEPENDENT PREDICTIVE MECHANISM
+
+      🎯 PRIMARY GOAL: Your mechanism must work WELL ON ITS OWN as a standalone predictor.
+      While it may complement other mechanisms in an ensemble, it should be independently predictive.
+      Focus on building a mechanism that can make accurate predictions by itself, not just one that fills gaps.
+      
+      ⚠️ CRITICAL: You are evaluated on TWO metrics:
+      1. ENSEMBLE PERFORMANCE (with ML): This is used for acceptance/rejection
+      2. INDEPENDENT PERFORMANCE (LLM-only): This shows how well your mechanism works alone
+      
+      Both metrics are tracked and displayed. Your mechanism should improve BOTH:
+      - If your LLM-only R² < 0.5, you MUST significantly improve independent performance
+      - Target: LLM-only R² > 0.7, MAE < 0.1 (for regression) or ACC > 0.7, F1 > 0.7 (for classification)
+      - Don't sacrifice independent performance just to complement ML - both are important
+
+      ⚠️ CRITICAL: If previous iterations were REJECTED, you MUST make SIGNIFICANT structural changes:
+      - Change at least 2-3 coefficients by meaningful amounts (not just 0.1-0.2 adjustments)
+      - Add or modify at least one interaction term or nonlinear transformation
+      - Don't just tweak existing terms - make substantial changes to the formula structure
+      - If R² is low (<0.5), increase important feature coefficients by 50-100% or more
+      - If MAE is high, systematically adjust coefficients to better match TARGET values from examples
+      
+      KEEP IT SHORT (IMPORTANT):
+      - DIAGNOSIS: 1 sentence. FIX: 1 sentence.
+      - REVISED MECHANISM description: 2-4 sentences max.
+      - Prefer editing the formula directly; do not add long "the mechanism does..." filler.
+
+      📚 LEARNING FROM RESIDUAL SAMPLES (MOST CRITICAL - READ CAREFULLY):
+      
+      The examples above show EXACT input-output pairs: features → TARGET value.
+      These are your PRIMARY learning signal. Use them systematically with CHAIN-OF-THOUGHT reasoning:
+      
+      STEP-BY-STEP LEARNING PROCESS:
+      
+      1. FOR EACH EXAMPLE, calculate what your current mechanism would predict
+         - Write out the calculation: "For Example #1 with features [A=0.8, B=0.2], my formula gives..."
+         - Compare to TARGET value - calculate the error
+         - Identify which terms in your formula are causing the error
+      
+      2. IDENTIFY PATTERNS ACROSS EXAMPLES (think systematically):
+         - Group examples by TARGET value ranges (high, medium, low)
+         - For high TARGET examples: What features are consistently high?
+         - For low TARGET examples: What features are consistently low?
+         - Are there feature combinations that always lead to specific TARGET values?
+         - Example reasoning: "Examples with high Feature X AND high Feature Y → high TARGET, so I need X*Y interaction"
+      
+      3. DESIGN INTERMEDIATE VARIABLES (for complex interactions):
+         - Think: "What intermediate concepts would help capture these patterns?"
+         - Example: "ribosome_stability = Mg * K+ / (K + Mg * K+)" for synergistic effect
+         - Example: "temperature_effectiveness = exp(-((T - T_opt)^2) / (2*sigma^2))" for optimum
+         - Example: "transcription_rate = NTPs * DNA / (K + NTPs * DNA)" for dual requirement
+         - Combine intermediates: ŷ = base * intermediate1 * intermediate2 * ...
+      
+      4. SYSTEMATICALLY ADJUST COEFFICIENTS:
+         - For each pattern identified, determine what coefficient change is needed
+         - Example: "High Feature X → high TARGET, but my coefficient is 0.8. Examples suggest I need 1.5-2.0"
+         - Try specific values: "Change Feature X coefficient from 0.8 to 1.5"
+         - For saturation terms: "Examples show saturation at Feature Y=0.3, so K should be ~0.1-0.2"
+      
+      5. VERIFY FOR EACH EXAMPLE:
+         - Calculate: "With new coefficients, Example #1 gives X.XX (target is X.XX, error is ±X.XX)"
+         - If error is still large, adjust further
+         - Goal: All examples should have small errors (<0.05 for regression)
+      
+      6. THINK ABOUT GENERALIZATION:
+         - Does your formula make sense for feature values NOT in examples?
+         - Are there edge cases (very high/low feature values) that might break your formula?
+         - Add safeguards: saturation terms, clipping, threshold effects
+      
+      SYSTEMATIC COEFFICIENT OPTIMIZATION:
+      - Your current coefficients are starting values - they likely need significant changes
+      - For regression: Target R² > 0.7, MAE < 0.1 (on scaled data)
+      - If current R² < 0.5: Increase important feature coefficients by 2-3x
+      - If current MAE > 0.15: Adjust coefficients to better match TARGET values from examples
+      - Try coefficient values: 0.1, 0.2, 0.5, 1.0, 1.5, 2.0, 3.0 (not just 0.8-1.2 range)
+      - For saturation terms (feature/(K+feature)): Adjust K values (try 0.05, 0.1, 0.2, 0.3, 0.5)
+      - For interactions: Use multiplicative terms with appropriate scaling (0.5-2.0 range)
+      
+      ACTION CHECKLIST (use this systematically with CoT reasoning):
+      
+      PHASE 1 - ANALYSIS:
+      - [ ] Study ALL learning examples above - write out what each example shows
+      - [ ] Calculate what your current mechanism predicts for each example (write the calculation)
+      - [ ] Identify patterns: Group examples by TARGET ranges, identify common features
+      - [ ] Think about intermediate variables: What concepts would help capture these patterns?
+      
+      PHASE 2 - DESIGN:
+      - [ ] Design intermediate variables if needed (e.g., "ribosome_stability = ...")
+      - [ ] Determine which coefficients need to change and by how much
+      - [ ] Plan interaction terms: Which features should interact and how?
+      - [ ] Think about nonlinear forms: saturation, inverse-U, threshold effects
+      
+      PHASE 3 - IMPLEMENTATION:
+      - [ ] Make at least 2-3 significant coefficient changes (not tiny tweaks)
+      - [ ] Add/modify at least 1 interaction or nonlinear term if needed
+      - [ ] Use intermediate variables if they help capture complex patterns
+      
+      PHASE 4 - VERIFICATION:
+      - [ ] For each example, calculate: does my new formula predict close to TARGET?
+      - [ ] If not, adjust coefficients further
+      - [ ] Check generalization: Does formula make sense for edge cases?
+      - [ ] Ensure your mechanism can work independently (not just complement ML)
+      
+      INDEPENDENT PERFORMANCE TARGET:
+      - Your mechanism should achieve R² > 0.7 and MAE < 0.1 when used alone (LLM-only evaluation)
+      - Don't specialize only for complementarity - build a robust standalone predictor
+      - Use all relevant features and interactions that improve independent predictive power
+
+      QUALITY REQUIREMENTS:
+
+      ✓ Use actual feature names (not x1, x2, etc.)
+
+      ✓ Directly address the error patterns identified above
+
+      ✓ Keep mechanism interpretable (3-5 key terms)
+
+      ✓ Each term must have clear mechanistic meaning
+
+      ✓ For regression: Output must be in scaled range [{scale_min}, {scale_max}] (use clip() function)
+      ✓ For classification: Output must be a CLASS INDEX (integer: 0, 1, 2, ...), NOT a probability or continuous value
+        - Use thresholds, argmax, or conditional logic to map feature values to class indices
+        - DO NOT use sigmoid or other probability functions - output must be a discrete class index
+        - Be creative and expressive in your formulation while maintaining mechanistic interpretability
+
+      OUTPUT FORMAT (USE CHAIN-OF-THOUGHT REASONING):
+
+      STEP 1 - ANALYZE LEARNING EXAMPLES:
+      [Think through each example systematically]
+      - Example #1: Features = [...], TARGET = X.XX. What should my formula predict?
+      - Example #2: Features = [...], TARGET = X.XX. What pattern do I see?
+      - Pattern identification: Which features correlate with high/low TARGET values?
+      - What intermediate concepts might help? (e.g., "ribosome_stability", "transcription_rate", "temperature_effectiveness")
+
+      STEP 2 - DESIGN INTERMEDIATE VARIABLES (if needed):
+      [Think about multi-step reasoning with intermediate concepts]
+      - What intermediate variables would help capture complex interactions?
+      - Example: intermediate1 = f(feature1, feature2) where f is nonlinear
+      - Example: intermediate2 = feature3 * feature4 / (K + feature3 * feature4) for saturation
+      - How do these intermediates combine to predict the TARGET?
+
+      STEP 3 - REASON ABOUT COEFFICIENTS:
+      [Systematically think about coefficient values]
+      - Current coefficients: [list current values]
+      - For each example, what coefficients would make my formula match the TARGET?
+      - Try specific values: [e.g., "For Feature X, try 1.5 instead of 0.8 because examples show high X → high TARGET"]
+      - Verify: For Example #1, with new coefficients, does my formula give ~TARGET?
+
+      STEP 4 - DIAGNOSIS:
+      [1-2 sentences: What is causing the errors based on the patterns above?]
+
+      STEP 5 - FIX:
+      [1-2 sentences: What specific change will reduce these errors?]
+
+      REVISED MECHANISM:
+
+      [Clear description of the causal process, including intermediate variables if used]
+
+      Formula: ŷ = [executable expression with ACTUAL feature names]
+      {formula_instruction}
+      
+      NOTE: You can use intermediate variables in your formula. For example:
+      - intermediate1 = feature1 * feature2 / (0.2 + feature1 * feature2)
+      - intermediate2 = exp(-((feature3 - 0.7)^2) / (2*0.15^2))
+      - ŷ = clip(base_coefficient * intermediate1 * intermediate2 * ..., min, max)
+
+      CRITICAL REQUIREMENTS FOR YOUR FORMULA:
+      
+      COEFFICIENT OPTIMIZATION (MANDATORY):
+      - If current formula has coefficients like 0.783, 0.301, 0.194, you MUST change them significantly
+      - Try these coefficient ranges systematically:
+        * Base scaling: 0.5, 1.0, 1.5, 2.0, 2.5, 3.0
+        * Saturation K values: 0.05, 0.1, 0.2, 0.3, 0.5, 0.8
+        * Interaction scaling: 0.5, 1.0, 1.5, 2.0
+      - If R² < 0.5: Increase important feature coefficients by 2-3x (e.g., 0.3 → 0.9 or 1.2)
+      - If MAE > 0.15: Adjust coefficients to better match TARGET values from learning examples
+      - Don't make tiny changes (0.8 → 0.9) - make meaningful changes (0.8 → 1.5 or 2.0)
+      
+      MATCHING LEARNING EXAMPLES:
+      - For each example above, calculate: does my formula predict close to the TARGET?
+      - If Example shows [Feature A=0.8, Feature B=0.2] → TARGET=0.75:
+        * Your formula should output ~0.75 for these feature values
+        * If it outputs 0.5, increase coefficients for features that should push it higher
+        * If it outputs 0.9, decrease coefficients or add inhibition terms
+      - Adjust coefficients iteratively until examples are matched
+      
+      STRUCTURAL CHANGES (if previous iterations rejected):
+      - Add new interaction terms (e.g., Feature1 * Feature2 / (K + Feature1 * Feature2))
+      - Change nonlinear forms (linear → saturation, saturation → inverse-U, etc.)
+      - Add inhibition/gating terms (e.g., 1 / (1 + factor * threshold))
+      - Modify temperature/optimum terms (change Gaussian width, center, or form)
+      
+      The goal is to maximize R² and minimize MAE by:
+      1. Learning from the TARGET values in examples
+      2. Systematically optimizing coefficients (not just adding terms)
+      3. Making structural changes if needed
+
+      Now provide YOUR fix:
+
+  update_mechanism:
+    template: |
+      Update this mechanism by incorporating the improvement suggestions:
+
+      Original mechanism:
+      {mechanism}
+
+      Improvement suggestions:
+      {gradient}
+
+      {update_instruction}
+
+      Updated mechanism (2-3 concise sentences):
+
+  update_instructions:
+    classification: "Update the mechanism to improve Accuracy and F1 score (primary metrics) by refining feature interactions, thresholds, and decision boundaries. Do NOT use feature importance values as coefficients - learn proper coefficients (0.1-2.0 range) by optimizing Accuracy and F1. Preserve correctness on easy cases and focus on systematic residual patterns."
+    regression: "Update the mechanism to maximize R² and minimize MAE (primary metrics) by refining monotonic trends, curvature, and interaction terms. Do NOT use feature importance values as coefficients - learn proper coefficients (0.1-2.0 range) by optimizing R² and MAE. Explicitly address residual bias and outliers while keeping predictions in the correct scaled range."
+
+templates:
+  feature_instruction:
+    deepchem: |
+      
+      CRITICAL: This is a molecular dataset (DeepChem). You will receive SMILES strings as input, NOT ECFP bit features.
+      
+      DO NOT use ECFP bit features (ecfp_bit_0, ecfp_bit_1, etc.) in your mechanism formula.
+      INSTEAD, work with molecular properties that can be derived from SMILES strings:
+      - Molecular weight
+      - Number of atoms
+      - Number of rings
+      - Presence of specific functional groups (e.g., -OH, -COOH, -NH2)
+      - Aromaticity
+      - Polarity
+      - Hydrophobicity
+      - Branching complexity
+      
+      Your mechanism should reason about molecular STRUCTURE and PROPERTIES, not ECFP fingerprint bits.
+      Example: "Molecules with more hydroxyl groups (-OH) tend to have higher solubility" NOT "ecfp_bit_27 correlates with solubility"
+      
+      When writing your formula, use molecular properties or structural features that can be computed from SMILES, not ECFP bit indices.
+      
+    standard: |
+      
+      CRITICAL: USE ACTUAL FEATURE NAMES
+      
+      Your mechanism MUST use these exact feature names:
+      
+      {feature_list}
+      
+      Example: Instead of "x1 + x2", write "{feature_example}"
+
+  dataset_contexts:
+    enzyme: |
+      DATASET: Enzyme Activity Prediction
+      DOMAIN: Biochemistry / Biocatalysis
+      KEY MECHANISMS: Michaelis-Menten kinetics, cofactor dependencies, temperature optima, pH effects, competitive inhibition
+      COMMON ERROR SOURCES:
+      - Ignoring saturation effects (use Michaelis-Menten: V*S/(Km+S))
+      - Missing cofactor synergies (multiply cofactor * substrate)
+      - Not modeling temperature optimum (use Gaussian or inverse-U shape)
+      - Ignoring pH effects (optimal pH range, drops outside)
+      - Missing competitive inhibition (divide by (1 + I/Ki))
+      FEATURES: {features}
+    protein: |
+      DATASET: Protein Expression Yield
+      DOMAIN: Molecular Biology / Synthetic Biology
+      KEY MECHANISMS: Translation machinery, nucleotide pools, amino acid availability, cofactor requirements
+      COMMON ERROR SOURCES:
+      - Not capturing NAD/ATP as limiting factors (use saturation)
+      - Missing tRNA-amino acid dependencies (multiply tRNA * amino_acids)
+      - Ignoring magnesium as cofactor (add Mg^2+ term)
+      - Not modeling template concentration effects
+      - Missing competitive resource allocation
+      FEATURES: {features}
+    gfp_yield: |
+      DATASET: GFP Yield Prediction (Cell-Free Expression)
+      DOMAIN: Synthetic Biology / Cell-Free Protein Expression
+      TASK: Predict GFP (Green Fluorescent Protein) production yield from experimental conditions
+      KEY MECHANISMS:
+      - Temperature optimum: Transcription/translation has optimal temperature (typically 30-37°C)
+      - Magnesium saturation: Mg2+ is essential cofactor for DNA/RNA polymerases and ribosomes (Michaelis-Menten: Mg/(Km+Mg), Km ~ 8-12 mM)
+      - Potassium saturation: K+ stabilizes ribosomes and affects translation (saturation: K/(Km+K), Km ~ 100-150 mM)
+      - NTP saturation: Nucleotides required for transcription (strong saturation: NTPs/(Km+NTPs), Km ~ 0.5-1.5 mM)
+      - DNA template saturation: Transcription initiation depends on DNA (saturation: DNA/(Km+DNA), Km ~ 5-15 nM)
+      - Synergistic interactions: Mg2+ * K+ for ribosome stability, Temperature * Mg2+ (higher temp needs more Mg)
+      - Resource competition: Very high DNA concentrations may compete for limited resources
+      COMMON ERROR SOURCES:
+      - Ignoring temperature optimum (use Gaussian or inverse-U: exp(-((T-T_opt)^2)/(2*sigma^2)))
+      - Missing Mg2+ saturation (use Michaelis-Menten: Mg/(Km_Mg+Mg) where Km_Mg ~ 0.08-0.12 for scaled data)
+      - Not modeling K+ effects (use saturation: K/(Km_K+K) where Km_K ~ 0.5-0.75 for scaled data)
+      - Ignoring NTP saturation (critical limiting factor: NTPs/(Km_NTP+NTPs) where Km_NTP ~ 0.01-0.03 for scaled data)
+      - Missing DNA template effects (saturation: DNA/(Km_DNA+DNA) where Km_DNA ~ 0.05-0.15 for scaled data)
+      - Not capturing Mg2+ * K+ synergy (multiply: (Mg/(Km_Mg+Mg)) * (K/(Km_K+K)))
+      - Missing Temperature * Mg2+ interaction (higher temperature requires more Mg for enzyme stability)
+      - Ignoring NTPs * DNA interaction (both needed for transcription: multiply saturation terms)
+      - Linear modeling instead of saturation kinetics (use Michaelis-Menten forms)
+      - Not accounting for resource competition at high DNA concentrations
+      FEATURES: {features}
+      CRITICAL SCALING INFORMATION:
+      {scale_info}
+      All predictions must be clipped to [{scale_min}, {scale_max}] using clip(expression, {scale_min}, {scale_max})
+      NOTE: All feature values are scaled to [0, 1]. Adjust Km values proportionally (e.g., if Mg range is 0-20 mM scaled to [0,1], then Km_Mg ~ 0.4-0.6 for 8-12 mM optimal).
+    concrete: |
+      DATASET: Concrete Strength
+      DOMAIN: Materials Science / Civil Engineering
+      KEY MECHANISMS: Cement hydration, water-cement ratio, aggregate properties, curing time
+      COMMON ERROR SOURCES:
+      - Not capturing optimal water-cement ratio (inverse-U shape)
+      - Missing cement-water interaction (multiply components)
+      - Ignoring curing time effects (logarithmic or root)
+      - Not modeling aggregate size distribution
+      - Missing temperature effects on hydration
+      FEATURES: {features}
+    esol: |
+      DATASET: ESOL (Water Solubility)
+      DOMAIN: Computational Chemistry / Drug Discovery
+      TASK: Predict aqueous solubility (log solubility in mols per litre) from molecular structure
+      KEY MECHANISMS: 
+      - Polar functional groups (hydroxyl, carboxyl, amino) increase solubility via hydrogen bonding
+      - Molecular weight and hydrophobicity decrease solubility
+      - Aromatic rings and halogens reduce water solubility
+      - Number of rings affects molecular flexibility and solubility
+      COMMON ERROR SOURCES:
+      - Ignoring molecular weight effects (larger molecules less soluble)
+      - Missing functional group contributions (hydroxyl groups strongly increase solubility)
+      - Not accounting for halogen effects (Cl, Br, F reduce solubility)
+      - Overlooking ring count effects (more rings often reduce flexibility and solubility)
+      - Incorrect output scaling (must match target range)
+      CRITICAL SCALING INFORMATION:
+      {scale_info}
+      All predictions must be clipped to [{scale_min}, {scale_max}] using clip(expression, {scale_min}, {scale_max})
+      FEATURES: {features}
+      NOTE: This dataset uses SMILES strings. Work with molecular properties (molecular_weight, num_hydroxyl_groups, num_halogen, num_rings, etc.) derived from SMILES, NOT ECFP bit features.
+    generic: |
+      DATASET: {dataset_name}
+      FEATURES: {features}
+      OPTIMIZATION GUIDANCE:
+      - Use actual feature names (not generic x1, x2, etc.)
+      - Model nonlinear effects (saturation, thresholds, synergies)
+      - Include domain-relevant interactions
+      CRITICAL SCALING INFORMATION:
+      {scale_info}
+      - Ensure output stays in valid range [{scale_min}, {scale_max}] using clip(expression, {scale_min}, {scale_max})
+
+  error_feedback:
+    performance_analysis_header: |
+      PERFORMANCE ANALYSIS:
+      Current Loss: {current_loss:.4f}
+      {metrics_str}{improvement_target_str}{routing_guidance_str}{ml_model_type}
+      
+      🎯 YOUR MISSION: Build a STRONG, INDEPENDENT PREDICTIVE MECHANISM that works well on its own.
+      
+      While the ML mechanism has systematic failures (shown below), your primary goal is to create a mechanism that:
+      1. Makes accurate predictions independently (high R², low MAE when used alone)
+      2. Handles the error cases shown below correctly
+      3. Uses all relevant features and patterns that improve standalone performance
+      
+      The examples below show WHERE and WHY the ML model fails. Use these to improve your mechanism's independent predictive power, not just to complement the ML model.
+      
+      CRITICAL ERROR PATTERNS (ML Model Failures):
+      
+      {error_patterns}
+      
+      FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
+      
+    deepchem_molecular_guidance: |
+        • Focus on molecular properties that can be derived from SMILES:
+        - Molecular weight (larger molecules typically have lower solubility - use negative coefficient)
+        - Number of rings (more rings often reduce flexibility and solubility - use negative coefficient)
+        - Functional groups (hydroxyl groups strongly increase solubility - use positive coefficient ~0.2-0.5)
+        - Halogen atoms (Cl, Br, I reduce solubility - use negative coefficient ~-0.1 to -0.2)
+        - Aromaticity (aromatic rings reduce solubility compared to aliphatic - use negative coefficient)
+        - Polarity (polar groups like -OH, -COOH, -NH2 increase water solubility - use positive coefficients)
+        - Nitrogen and oxygen atoms (generally increase solubility - use small positive coefficients ~0.05-0.1)
+        
+        DO NOT use ECFP bit features - work with interpretable molecular properties instead.
+        
+        COEFFICIENT GUIDANCE FOR ESOL:
+        - Base intercept: typically 0.4-0.7 for [0,1] scaled data
+        - Hydroxyl groups: +0.2 to +0.5 per group (strong positive effect)
+        - Halogens: -0.1 to -0.2 per atom (negative effect)
+        - Molecular weight: -0.001 to -0.01 per 100 Da (negative effect, scale appropriately)
+        - Rings: -0.05 to -0.15 per ring (negative effect)
+        - Nitrogen/Oxygen: +0.05 to +0.15 per atom (moderate positive effect)
+        
+        Remember: All outputs must be clipped to [{scale_min}, {scale_max}]
+    worst_predictions_header: |
+      
+      ML MECHANISM FAILURES - YOUR MECHANISM SHOULD FIX THESE SPECIFIC ERRORS:
+      These are the cases where the ML model fails most severely.
+      Your mechanism's job is to correct these systematic failures.
+      Focus on understanding WHY the ML model failed on these examples and design your mechanism to handle them correctly.
+      
+      WORST PREDICTION EXAMPLES (ML model errors - fix these):
+
+  iteration_history:
+    header: |
+      
+      ================================================================================
+      📚 ITERATION HISTORY - LEARN FROM PREVIOUS CHANGES
+      ================================================================================
+      
+      The following shows what changed in previous iterations and what worked/didn't work.
+      Use this to avoid repeating mistakes and build on successful changes.
+    iteration_separator: |
+      
+      --- Iteration {iter_num} ---
+    accepted_label: "✓ ACCEPTED: {reason}"
+    rejected_label: "✗ REJECTED: {reason}"
+    performance_label: "  Performance: {perf_changes}"
+    mechanism_changed_label: |
+      
+        Mechanism changed:
+        Before: {before_summary}
+        After:  {after_summary}
+        ✓ This change improved performance - consider similar improvements
+    rejected_warning: "  ⚠️ This change did NOT improve performance - avoid similar changes"
+    footer: |
+      
+      ================================================================================
+      KEY INSIGHTS:
+      {insights}
+      
+      YOUR TASK: Learn from this history. Build on successful changes and avoid repeating rejected approaches.
+      ================================================================================
+
+  routing_guidance:
+    low_performance: |
+      
+      ⚠️ ROUTING AWARENESS:
+      - Your mechanism performance: {my_perf:.3f} (below threshold of {min_weight_threshold:.2f})
+      - Average mechanism performance: {avg_perf:.3f}
+      - To contribute meaningfully to the ensemble, you need to improve performance to ≥{min_weight_threshold:.2f}
+      - This requires significant improvement in core prediction accuracy
+    below_average: |
+      
+      📊 ROUTING AWARENESS:
+      - Your mechanism performance: {my_perf:.3f} (below average of {avg_perf:.3f})
+      - Improving to ≥{avg_perf:.3f} will increase your contribution to the ensemble
+    routing_awareness_low: |
+      
+      ⚠️ ROUTING AWARENESS: This mechanism currently has a low performance score ({mech_perf:.3f}), meaning it receives low weight in the ensemble. To contribute meaningfully, you need to improve this mechanism's individual performance significantly. Focus on reducing systematic errors and improving predictions on the residual samples shown above.
+    routing_awareness_moderate: |
+      
+      📊 ROUTING AWARENESS: This mechanism has moderate performance ({mech_perf:.3f}). Improving it will increase its contribution to the ensemble. Focus on the specific error patterns identified above.
+    routing_awareness_good: |
+      
+      ✅ ROUTING AWARENESS: This mechanism has good performance ({mech_perf:.3f}) and contributes significantly. Maintain quality while addressing the specific errors shown above.
+
+  complexity_guidance:
+    linear_with_nonlinear_errors: |
+      
+      ⚠️ COMPLEXITY GUIDANCE: The ML baseline is LINEAR, but errors show NONLINEAR patterns (errors increase faster than linear with feature values). Consider using nonlinear transformations (saturations, interactions, powers, ratios) to capture these patterns.
+    linear_with_linear_errors: |
+      
+      📊 COMPLEXITY GUIDANCE: The ML baseline is LINEAR. Errors appear relatively linear. You can use linear or simple nonlinear forms - let the data guide complexity rather than forcing it.
+    nonlinear_baseline: |
+      
+      📊 COMPLEXITY GUIDANCE: The ML baseline is NONLINEAR. Your mechanism should complement it with different functional forms or focus on patterns the ML model misses.
+
+  performance_target:
+    template: |
+      
+      PERFORMANCE TARGET:
+      - Current loss: {current_loss:.4f}
+      - Target loss: {target_loss:.4f}
+      - Improvement needed: {improvement_needed:.1%} reduction
+      - Focus on achieving at least {target_loss:.4f} to meet target
+      
+
+  metrics:
+    regression_r2: "R²: {r2:.4f} (target: maximize, higher is better)\n"
+    regression_mae: "MAE: {mae:.4f} (target: minimize, lower is better)\n"
+    regression_mse: "MSE: {mse:.4f} (target: minimize, lower is better)\n"
+    classification_accuracy: "Accuracy: {acc:.4f} (target: maximize, higher is better)\n"
+    classification_f1: "F1: {f1:.4f} (target: maximize, higher is better)\n"
+
+  class_distribution:
+    header: |
+      
+      CLASS DISTRIBUTION IN TRAINING DATA:
+    class_line: "  - {class_name}: {count} samples ({percentage:.1f}%)"
+    footer: |
+      
+      IMPORTANT: Your mechanism must correctly predict ALL classes, not just the majority classes. Pay special attention to classes with fewer samples.
+
+formula_instructions:
+  classification: "- For classification: Formula MUST output a CLASS INDEX (integer: 0, 1, 2, ...), NOT a probability or continuous value. Use thresholds, argmax, or conditional logic as needed."
+  regression: "- For regression: Clipped to [{scale_min}, {scale_max}]"
