@@ -93,7 +93,7 @@ from .maicl_config import (
     SCALE_MIN, SCALE_MAX, MAX_BATCH_SIZE, BATCH_TIMEOUT, EVAL_BATCH_SIZE, GRADIENT_BATCH_SIZE,
     LLM_GROUP_SIZE, LLM_COMBINE_MECHANISMS, ATTENTION_TEMP, RANDOM_STATE,
     IMPROVEMENT_THRESHOLD_CLASSIFICATION, ML_HIGH_CONFIDENCE_THRESHOLD, ML_LOW_CONFIDENCE_THRESHOLD,
-    MIN_ML_WEIGHT, MAX_ML_WEIGHT, HARD_ML_GATE_THRESHOLD, OUTPUT_ROOT, RUN_FOLDER_NAME, OUTPUT_DIR,
+    MIN_ML_WEIGHT, MAX_ML_WEIGHT, INITIAL_ML_WEIGHT, HARD_ML_GATE_THRESHOLD, OUTPUT_ROOT, RUN_FOLDER_NAME, OUTPUT_DIR,
     MAX_TOP_FEATURES, MAX_TOP_FEATURES_DISPLAY, MAX_TOP_ERROR_FEATURES, MAX_TOP_ERROR_FEATURES_CHECK,
     MAX_FEATURE_INTERACTIONS, MAX_FEATURE_IMPORTANCE_TOP, MAX_WORST_PREDICTIONS_COLLECT,
     MAX_WORST_PREDICTIONS_DISPLAY, MAX_WORST_INDICES, MAX_WORST_RESIDUAL_SAMPLES,
@@ -131,6 +131,7 @@ class MultiAgentPredictor:
                  hard_ml_gate_threshold: Optional[float] = None,
                  min_ml_weight: Optional[float] = None,
                  max_ml_weight: Optional[float] = None,
+                 ml_weight: Optional[float] = None,  # NEW: Single learned weight (overrides confidence routing)
                  use_scaling: bool = True):
         self.llm = batched_llm
         self.mechanisms = mechanisms
@@ -152,6 +153,9 @@ class MultiAgentPredictor:
         self.attention_prompt = self._init_attention_prompt()
         self._setup_parsers()
         self.mechanism_performance = {}
+        
+        # NEW: Single learned weight for ML vs LLM (if provided, use it instead of confidence routing)
+        self.ml_weight = ml_weight  # None means use confidence-based routing (backward compatibility)
     
     def _scaled_range_from(self, scaler):
         """Get the actual scaling range from scaler or use defaults"""
@@ -196,7 +200,7 @@ class MultiAgentPredictor:
         self.agent_parser = None
     
     def predict_single(self, x_dict: Dict, few_shot: List[Dict] = None) -> Tuple[float, List[float], np.ndarray, Optional[np.ndarray]]:
-        """Predict for a single input with confidence-based routing"""
+        """Predict for a single input with fixed weight or confidence-based routing"""
         if few_shot is None:
             few_shot = []
         
@@ -684,25 +688,42 @@ Apply the mechanism's mathematical description to compute the output value from 
                     else:
                         results[idx] = (0.0, 0.1)
             
-            # Aggregate with confidence-based routing (same as predict_single)
+            # Aggregate predictions
             agent_preds = [r[0] if r is not None else 0.0 for r in results]
             confidences = [r[1] if r is not None else 0.1 for r in results]
             
             ml_indices_list = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "ml"]
-            ml_confidence = 0.5
+            llm_indices_list = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "llm"]
             
-            if len(ml_indices_list) > 0 and self.ml_mechanism is not None and self.ml_mechanism.is_trained:
-                ml_idx = ml_indices_list[0]
-                ml_pred = agent_preds[ml_idx]
-                ml_predicted_class, ml_max_prob, ml_proba = get_ml_prediction_probability(
-                    self.ml_mechanism, x_ml_dict, predicted_class=int(ml_pred) if ml_pred is not None else None, 
-                    scaler=self.scaler
-                )
-                if ml_max_prob is not None:
-                    ml_confidence = ml_max_prob
-            
-            # Compute weights
-            if self.task_type == "regression" and self.prefer_ml_for_regression and len(ml_indices_list) > 0:
+            # SIMPLIFIED WEIGHTING: Use single learned weight if provided (no confidence routing)
+            if self.ml_weight is not None:
+                # Use fixed learned weight instead of confidence-based routing
+                weights = np.zeros(len(results))
+                
+                if len(ml_indices_list) > 0 and len(llm_indices_list) > 0:
+                    # Distribute ML weight among ML mechanisms
+                    ml_weight_per_mech = self.ml_weight / len(ml_indices_list)
+                    for idx in ml_indices_list:
+                        weights[idx] = ml_weight_per_mech
+                    
+                    # Distribute LLM weight among LLM mechanisms
+                    llm_weight_total = 1.0 - self.ml_weight
+                    llm_weight_per_mech = llm_weight_total / len(llm_indices_list)
+                    for idx in llm_indices_list:
+                        weights[idx] = llm_weight_per_mech
+                elif len(ml_indices_list) > 0:
+                    # Only ML mechanisms
+                    for idx in ml_indices_list:
+                        weights[idx] = 1.0 / len(ml_indices_list)
+                elif len(llm_indices_list) > 0:
+                    # Only LLM mechanisms
+                    for idx in llm_indices_list:
+                        weights[idx] = 1.0 / len(llm_indices_list)
+                else:
+                    # Fallback: uniform weights
+                    weights = np.ones(len(results)) / len(results)
+            elif self.task_type == "regression" and self.prefer_ml_for_regression and len(ml_indices_list) > 0:
+                # Legacy: prefer ML for regression (backward compatibility)
                 weights = np.zeros(len(results))
                 for ml_idx in ml_indices_list:
                     weights[ml_idx] = 1.0 / len(ml_indices_list)
@@ -832,9 +853,43 @@ Apply the mechanism's mathematical description to compute the output value from 
         return batch_results
     
     def _compute_attention_weights(self, predictions: List[Any], x_dict: Dict) -> np.ndarray:
-        """Compute attention weights for mechanisms based on confidence"""
-        # Simple uniform weights for now (can be enhanced with confidence-based routing)
+        """Compute attention weights for mechanisms"""
         n_mechanisms = len(predictions)
+        ml_indices = [i for i, mech_type in enumerate(self.mechanism_types) if mech_type == "ml"]
+        llm_indices = [i for i, mech_type in enumerate(self.mechanism_types) if mech_type == "llm"]
+        
+        # SIMPLIFIED WEIGHTING: Use single learned weight if provided (no confidence routing)
+        if self.ml_weight is not None:
+            # Use fixed learned weight instead of confidence-based routing
+            weights = np.zeros(n_mechanisms)
+            
+            if len(ml_indices) > 0 and len(llm_indices) > 0:
+                # Distribute ML weight among ML mechanisms
+                ml_weight_per_mech = self.ml_weight / len(ml_indices)
+                for idx in ml_indices:
+                    weights[idx] = ml_weight_per_mech
+                
+                # Distribute LLM weight among LLM mechanisms
+                llm_weight_total = 1.0 - self.ml_weight
+                llm_weight_per_mech = llm_weight_total / len(llm_indices)
+                for idx in llm_indices:
+                    weights[idx] = llm_weight_per_mech
+            elif len(ml_indices) > 0:
+                # Only ML mechanisms
+                for idx in ml_indices:
+                    weights[idx] = 1.0 / len(ml_indices)
+            elif len(llm_indices) > 0:
+                # Only LLM mechanisms
+                for idx in llm_indices:
+                    weights[idx] = 1.0 / len(llm_indices)
+            else:
+                # Fallback: uniform weights
+                weights = np.ones(n_mechanisms) / n_mechanisms
+            
+            return weights
+        
+        # Legacy: confidence-based routing (backward compatibility)
+        # Simple uniform weights for now (can be enhanced with confidence-based routing)
         weights = np.ones(n_mechanisms) / n_mechanisms
         
         # Apply ML confidence-based routing if enabled
@@ -1728,14 +1783,16 @@ Look at the example samples provided in the latent mechanism z to understand the
 
 ⚠️ CRITICAL: You are NOT building a mechanism to complement ML. You are building an INDEPENDENT PREDICTOR that learns the underlying patterns in the data. Your mechanism should achieve R² > 0.5 (ideally > 0.7) when used alone.
 
-1. MECHANISM DESCRIPTION (be generous with text - 5-8 sentences):
-   - Start with a detailed explanation of what latent process you hypothesize based on the actual samples you see
+1. MECHANISM DESCRIPTION (PRIMARY - write as a clear narrative, 5-8 sentences):
+   - Write this as a step-by-step story of the causal process, not just a list of facts
+   - Use natural language: "When feature X is high and feature Y is low, the process behaves like..."
    - Describe how inputs map to the target by analyzing the example samples provided
    - Explain which features are primary drivers vs secondary modulators based on patterns in the data
-   - Describe at least 1-2 nonlinearities (saturation, diminishing returns, inverse-U, log/exp, soft-thresholds) and WHY they are needed based on the data
-   - Describe at least 1-2 interactions (synergy, inhibition, ratio effects, gating) and HOW they manifest in the samples
+   - Describe at least 1-2 nonlinearities (saturation, diminishing returns, inverse-U, log/exp, soft-thresholds) in WORDS: "The effect of X saturates when X exceeds 0.5, meaning..."
+   - Describe at least 1-2 interactions (synergy, inhibition, ratio effects, gating) in WORDS: "Magnesium and potassium work together synergistically - both must be present for high stability"
    - Explain the domain-specific reasoning: what makes sense mechanistically given the dataset context
    - Be specific about what you observe in the samples that leads to your mechanism design
+   - ⚠️ IMPORTANT: Write this as a narrative that someone could follow step-by-step, not just a formula
    - ⚠️ IMPORTANT: Design your mechanism to predict accurately INDEPENDENTLY, not just to correct ML's mistakes
 
 2. INTERMEDIATE STEPS AND FORMULAS (REQUIRED - show your work):
@@ -1769,13 +1826,15 @@ Look at the example samples provided in the latent mechanism z to understand the
    - Include any final transformations, offsets, or scaling
    - This becomes your FINAL FORMULA
 
-3. FINAL FORMULA REQUIREMENTS (do not violate):
-   - Provide EXACTLY ONE SINGLE-LINE formula starting with "Formula:" so it can be extracted programmatically.
-   - The final formula should INLINE/EXPAND all intermediate variables (do not reference intermediate names)
+3. FINAL FORMULA REQUIREMENTS (OPTIONAL - text description is PRIMARY):
+   - The TEXTUAL DESCRIPTION above is the most important part - it should be clear and complete
+   - OPTIONAL: Provide a simple formula starting with "Formula:" if it helps, but keep it simple
+   - The formula can reference intermediate concepts from your narrative (e.g., "temperature_effectiveness * ribosome_stability")
+   - Or provide a basic expanded formula - but don't make it overly complex
    - Do NOT output Python code blocks, def statements, or multi-line equations.
    - {scaling_note}
    - Use stable coefficients and reasonable constants (avoid extreme values).
-   - The final formula should be the complete, expanded version of all the intermediate steps combined.
+   - Remember: The LLM will reason through your TEXTUAL DESCRIPTION primarily - the formula is just a guide
    
 4. ⚠️ CRITICAL PERFORMANCE TARGET FOR FIRST ITERATION:
    - Your mechanism MUST achieve R² > 0.5 (ideally > 0.7) when used ALONE (LLM-only evaluation)
@@ -1785,31 +1844,35 @@ Look at the example samples provided in the latent mechanism z to understand the
    - DO NOT design a mechanism that only works when combined with ML - it must work well independently
    - Think: "If I had to predict using ONLY this mechanism, would it work well?" The answer should be YES.
 
-OUTPUT FORMAT (exact order - be generous with descriptions):
+OUTPUT FORMAT (exact order - TEXTUAL DESCRIPTION IS PRIMARY):
 MECHANISM DESCRIPTION:
-<5-8 sentences with detailed explanation of the mechanism, data patterns observed, and reasoning>
+<Write a clear, narrative story of the causal process - 5-8 sentences>
+<Use natural language to describe step-by-step how features interact>
+<Example style: "The yield depends on temperature effectiveness, which follows a Gaussian curve centered at 0.75. When temperature deviates from this optimum, effectiveness decreases. Ribosome stability requires both magnesium and potassium - they work synergistically, with saturation when both are high. NTPs drive transcription rate with diminishing returns. High DNA concentration inhibits the process by competing for resources. The final yield is the product of temperature effectiveness, ribosome stability, transcription rate, and DNA inhibition.">
+<Make it readable and logical - someone should be able to follow your reasoning>
 
-STEP 1 - FEATURE TRANSFORMATIONS:
-<For each key feature, show the transformation formula and explain why>
-- transformed_feature1 = <formula>  # Explanation of why this transformation
-- transformed_feature2 = <formula>  # Explanation of why this transformation
+STEP 1 - FEATURE TRANSFORMATIONS (describe in text, then optionally show formula):
+<For each key feature, describe in words how it's transformed and why>
+- Feature1: <Textual description of transformation and why> (Optional: transformed_feature1 = <formula>)
+- Feature2: <Textual description of transformation and why> (Optional: transformed_feature2 = <formula>)
 - ...
 
-STEP 2 - INTERMEDIATE CONCEPTS:
-<For each intermediate concept, provide name, detailed explanation, and formula>
-- <intermediate_name>: <2-3 sentence explanation of what it represents mechanistically>
-  Formula: <intermediate_name> = <formula>
-- <intermediate_name>: <2-3 sentence explanation of what it represents mechanistically>
-  Formula: <intermediate_name> = <formula>
+STEP 2 - INTERMEDIATE CONCEPTS (describe in text first):
+<For each intermediate concept, provide name and detailed textual explanation>
+- <intermediate_name>: <2-3 sentence explanation in natural language of what it represents and how it works>
+  <Optional: Formula: <intermediate_name> = <formula> if it helps clarify>
+- <intermediate_name>: <2-3 sentence explanation in natural language>
+  <Optional: Formula: <intermediate_name> = <formula> if it helps clarify>
 - ...
 
-STEP 3 - COMBINING INTERMEDIATES:
-<Show how intermediates are combined>
-combined_signal = <formula using intermediate concepts>
-<Explanation of combination logic>
+STEP 3 - COMBINING INTERMEDIATES (describe in text):
+<Describe in words how the intermediate concepts combine>
+<Example: "The final yield combines temperature effectiveness, ribosome stability, and transcription rate multiplicatively, then applies DNA inhibition as a multiplicative factor.">
+<Optional: combined_signal = <simple formula using intermediate concepts>>
 
-STEP 4 - FINAL PREDICTION:
-<Final formula that inlines all intermediates>
+STEP 4 - FINAL PREDICTION (optional simple formula):
+<Optional: A simple formula that matches your narrative description>
+<The formula can be basic - the textual description above is what matters most>
 {scaling_line}
 
 EXAMPLE STRUCTURE:
@@ -1978,9 +2041,6 @@ class TrainableMAICL:
                  class_names: Optional[List[str]] = None, regression_loss_metric: Optional[str] = None,
                  classification_loss_metric: Optional[str] = None,
                  attention_temp: Optional[float] = None,
-                 min_ml_weight: Optional[float] = None,
-                 max_ml_weight: Optional[float] = None,
-                 hard_ml_gate_threshold: Optional[float] = None,
                  num_mechanisms_unknown: Optional[int] = None,
                  use_scaling: bool = True):
         self.llm = batched_llm
@@ -2057,9 +2117,7 @@ class TrainableMAICL:
         )
         # Routing parameters (can be overridden)
         self.attention_temp = attention_temp if attention_temp is not None else ATTENTION_TEMP
-        self.min_ml_weight = min_ml_weight if min_ml_weight is not None else MIN_ML_WEIGHT
-        self.max_ml_weight = max_ml_weight if max_ml_weight is not None else MAX_ML_WEIGHT
-        self.hard_ml_gate_threshold = hard_ml_gate_threshold if hard_ml_gate_threshold is not None else HARD_ML_GATE_THRESHOLD
+        # NOTE: min_ml_weight, max_ml_weight, hard_ml_gate_threshold removed - not needed with learned ml_weight
         self.k_shot = 0  # Default: use 0 (can be overridden via train() or evaluate())
         self.mechanisms = self.mech_generator.get_all_mechanisms()
         self.mechanism_types = self.mech_generator.get_mechanism_types()
@@ -2081,15 +2139,58 @@ class TrainableMAICL:
             "llm_only_r2": [],
             "llm_only_mae": [],
             "llm_only_accuracy": [],
-            "llm_only_f1": []
+            "llm_only_f1": [],
+            "ml_weight": []  # NEW: Track ML weight evolution across iterations
         }
         
         self.ml_baseline_performance = None
         self.mechanism_performance_snapshot = {}
         
+        # NEW: Single learnable weight for ML vs LLM (0 = all LLM, 1 = all ML)
+        self.ml_weight = INITIAL_ML_WEIGHT  # Initial weight from config, will be learned via TextGrad
+        self.ml_weight_history = []  # Track weight evolution
+        
         logger.info(f"  Initialized MA-ICL with {len(self.mechanisms)} mechanisms:")
         logger.info(f"    • {len([t for t in self.mechanism_types if t == 'llm'])} LLM mechanisms")
         logger.info(f"    • {len([t for t in self.mechanism_types if t == 'ml'])} ML mechanism(s)")
+        logger.info(f"    • Initial ML weight: {self.ml_weight:.4f}")
+    
+    def _get_performance_score(self, metrics: Dict) -> float:
+        """Convert metrics to single performance score for comparison"""
+        if self.task_type == "classification":
+            # Prioritize F1, then accuracy
+            return metrics.get('f1', 0.0) * 0.7 + metrics.get('accuracy', 0.0) * 0.3
+        else:
+            # Prioritize R2, penalize high MAE
+            r2 = metrics.get('r2', -1.0)
+            mae = metrics.get('mae', 1.0)
+            return r2 - 0.1 * mae  # R2 focused with MAE penalty
+    
+    def _compute_weight_gradient(self, X_val, y_val, X_train, y_train) -> float:
+        """Compute gradient for ml_weight using finite differences"""
+        epsilon = 0.05
+        
+        # Evaluate at current weight
+        current_metrics = self.evaluate(X_val, y_val, X_train, y_train, relax_routing=True)
+        current_score = self._get_performance_score(current_metrics)
+        
+        # Evaluate at weight + epsilon
+        original_weight = self.ml_weight
+        self.ml_weight = min(1.0, original_weight + epsilon)
+        plus_metrics = self.evaluate(X_val, y_val, X_train, y_train, relax_routing=True)
+        plus_score = self._get_performance_score(plus_metrics)
+        
+        # Evaluate at weight - epsilon
+        self.ml_weight = max(0.0, original_weight - epsilon)
+        minus_metrics = self.evaluate(X_val, y_val, X_train, y_train, relax_routing=True)
+        minus_score = self._get_performance_score(minus_metrics)
+        
+        # Restore original weight
+        self.ml_weight = original_weight
+        
+        # Compute gradient (central difference)
+        gradient = (plus_score - minus_score) / (2 * epsilon)
+        return gradient
     
     def train_ml_mechanism(self, X_train: np.ndarray, y_train: np.ndarray, y_scaler: Any = None):
         """Train the ML mechanism"""
@@ -2520,6 +2621,7 @@ class TrainableMAICL:
             self.mech_generator.ml_mechanism, self.feature_cols, self.scaler, att_temp,
             task_type=self.task_type, class_names=self.class_names,
             hard_ml_gate_threshold=hard_gate, min_ml_weight=min_w, max_ml_weight=max_w,
+            ml_weight=getattr(self, 'ml_weight', None),  # NEW: Pass learned ML weight (None = use confidence routing)
             use_scaling=getattr(self, 'use_scaling', True)  # Pass use_scaling flag
         )
         
@@ -3370,12 +3472,7 @@ class TrainableMAICL:
         routing_kwargs = {}
         if hasattr(self, 'attention_temp'):
             routing_kwargs['attention_temp'] = self.attention_temp
-        if hasattr(self, 'min_ml_weight'):
-            routing_kwargs['min_ml_weight'] = self.min_ml_weight
-        if hasattr(self, 'max_ml_weight'):
-            routing_kwargs['max_ml_weight'] = self.max_ml_weight
-        if hasattr(self, 'hard_ml_gate_threshold'):
-            routing_kwargs['hard_ml_gate_threshold'] = self.hard_ml_gate_threshold
+        # NOTE: min_ml_weight, max_ml_weight, hard_ml_gate_threshold removed - not needed with learned ml_weight
         
         # Pass X_original and X_pool_original for DeepChem datasets
         if X_accept_original is not None:
@@ -3441,10 +3538,8 @@ class TrainableMAICL:
         # Store routing config for exact restoration
         routing_config = {
             'relax_routing': True,  # Training always uses relax_routing=True
-            'min_ml_weight': routing_kwargs.get('min_ml_weight', getattr(self, 'min_ml_weight', None)),
-            'max_ml_weight': routing_kwargs.get('max_ml_weight', getattr(self, 'max_ml_weight', None)),
-            'attention_temp': routing_kwargs.get('attention_temp', getattr(self, 'attention_temp', None)),
-            'hard_ml_gate_threshold': routing_kwargs.get('hard_ml_gate_threshold', getattr(self, 'hard_ml_gate_threshold', None))
+            # NOTE: min_ml_weight, max_ml_weight, hard_ml_gate_threshold removed - not needed with learned ml_weight
+            'attention_temp': routing_kwargs.get('attention_temp', getattr(self, 'attention_temp', None))
         }
         
         best_snapshot = {
@@ -3456,7 +3551,8 @@ class TrainableMAICL:
             "mechanism_metrics": copy.deepcopy(getattr(self, 'mechanism_metrics_snapshot', {})),
             "few_shot_examples": copy.deepcopy(few_shot_examples_from_initial) if few_shot_examples_from_initial is not None else [],  # Always save list (empty if k_shot=0)
             "k_shot": self.k_shot,  # CRITICAL: Save k_shot value to ensure final evaluation uses same value
-            "routing_config": routing_config  # Store routing config for exact restoration
+            "routing_config": routing_config,  # Store routing config for exact restoration
+            "ml_weight": self.ml_weight  # NEW: Store initial ML weight
         }
         logger.info(f"  [Initial Checkpoint] Saved pre-training state with {len(self.mechanisms)} mechanisms")
         if self.task_type == "classification":
@@ -3645,12 +3741,7 @@ class TrainableMAICL:
                 routing_kwargs_temp = {}
                 if hasattr(self, 'attention_temp'):
                     routing_kwargs_temp['attention_temp'] = self.attention_temp
-                if hasattr(self, 'min_ml_weight'):
-                    routing_kwargs_temp['min_ml_weight'] = self.min_ml_weight
-                if hasattr(self, 'max_ml_weight'):
-                    routing_kwargs_temp['max_ml_weight'] = self.max_ml_weight
-                if hasattr(self, 'hard_ml_gate_threshold'):
-                    routing_kwargs_temp['hard_ml_gate_threshold'] = self.hard_ml_gate_threshold
+                # NOTE: min_ml_weight, max_ml_weight, hard_ml_gate_threshold removed - not needed with learned ml_weight
                 
                 # Pass X_original and X_pool_original for DeepChem datasets
                 if X_accept_original is not None:
@@ -3732,12 +3823,7 @@ class TrainableMAICL:
             routing_kwargs = {}
             if hasattr(self, 'attention_temp'):
                 routing_kwargs['attention_temp'] = self.attention_temp
-            if hasattr(self, 'min_ml_weight'):
-                routing_kwargs['min_ml_weight'] = self.min_ml_weight
-            if hasattr(self, 'max_ml_weight'):
-                routing_kwargs['max_ml_weight'] = self.max_ml_weight
-            if hasattr(self, 'hard_ml_gate_threshold'):
-                routing_kwargs['hard_ml_gate_threshold'] = self.hard_ml_gate_threshold
+            # NOTE: min_ml_weight, max_ml_weight, hard_ml_gate_threshold removed - not needed with learned ml_weight
             
             # For DeepChem datasets, pass X_original for acceptance evaluation
             eval_kwargs = dict(routing_kwargs)
@@ -4210,13 +4296,30 @@ class TrainableMAICL:
                         self.mechanisms[i_m] = updated_mechanisms[llm_idx]
                         llm_idx += 1
                 
-                # Re-evaluate ON THE SAME CONSISTENT SUBSET
+                # NEW: Optimize ml_weight via TextGrad (gradient descent)
+                logger.info("  [Weight Learning] Optimizing ML weight via gradient descent...")
+                try:
+                    weight_gradient = self._compute_weight_gradient(
+                        X_accept_consistent, y_accept_consistent, X_train, y_train
+                    )
+                    
+                    # Update weight with gradient (simple gradient descent)
+                    learning_rate = 0.1
+                    old_weight = self.ml_weight
+                    self.ml_weight = np.clip(self.ml_weight + weight_gradient * learning_rate, 0.0, 1.0)
+                    self.ml_weight_history.append(self.ml_weight)
+                    
+                    logger.info(f"  [Weight Update] ML weight: {old_weight:.4f} → {self.ml_weight:.4f} (gradient: {weight_gradient:+.4f})")
+                except Exception as e:
+                    logger.warning(f"  [Weight Learning] Failed to compute weight gradient: {e}, keeping current weight {self.ml_weight:.4f}")
+                
+                # Re-evaluate ON THE SAME CONSISTENT SUBSET with updated weight
                 # Log which set is being used for acceptance evaluation
                 acceptance_set_name = getattr(self, '_acceptance_set_name', 'validation')
                 logger.debug(f"  [Acceptance Eval] Evaluating on {acceptance_set_name.upper()} set ({len(X_accept_consistent)} samples) for acceptance decision")
                 new_metrics = self.evaluate(X_accept_consistent, y_accept_consistent, X_train, y_train, relax_routing=True,
                                             k_shot=self.k_shot, **routing_kwargs)
-                new_loss = new_metrics['loss']
+                new_loss = new_metrics.get('loss', float('inf'))
                 
                 # Also evaluate LLM-only performance on acceptance set for tracking
                 llm_only_new_metrics = None
@@ -4545,10 +4648,8 @@ class TrainableMAICL:
                         # Store routing config for exact restoration
                         routing_config = {
                             'relax_routing': True,  # Training always uses relax_routing=True
-                            'min_ml_weight': routing_kwargs.get('min_ml_weight', getattr(self, 'min_ml_weight', None)),
-                            'max_ml_weight': routing_kwargs.get('max_ml_weight', getattr(self, 'max_ml_weight', None)),
-                            'attention_temp': routing_kwargs.get('attention_temp', getattr(self, 'attention_temp', None)),
-                            'hard_ml_gate_threshold': routing_kwargs.get('hard_ml_gate_threshold', getattr(self, 'hard_ml_gate_threshold', None))
+                            # NOTE: min_ml_weight, max_ml_weight, hard_ml_gate_threshold removed - not needed with learned ml_weight
+                            'attention_temp': routing_kwargs.get('attention_temp', getattr(self, 'attention_temp', None))
                         }
                         
                         best_snapshot = {
@@ -4560,7 +4661,8 @@ class TrainableMAICL:
                             "mechanism_metrics": metrics_snapshot,
                             "few_shot_examples": copy.deepcopy(few_shot_examples_from_eval) if few_shot_examples_from_eval is not None else [],  # Always save list (empty if k_shot=0)
                             "k_shot": self.k_shot,  # CRITICAL: Save k_shot value to ensure final evaluation uses same value
-                            "routing_config": routing_config  # Store routing config for exact restoration
+                            "routing_config": routing_config,  # Store routing config for exact restoration
+                            "ml_weight": self.ml_weight  # NEW: Store learned ML weight
                         }
                         if self.task_type == "classification":
                             logger.info(f"  [Best Snapshot] Updated best-performing model: ACC={best_acc:.4f}, F1={best_f1:.4f}")
@@ -4783,10 +4885,8 @@ class TrainableMAICL:
                         # Store routing config for exact restoration
                         routing_config = {
                             'relax_routing': True,  # Training always uses relax_routing=True
-                            'min_ml_weight': routing_kwargs.get('min_ml_weight', getattr(self, 'min_ml_weight', None)),
-                            'max_ml_weight': routing_kwargs.get('max_ml_weight', getattr(self, 'max_ml_weight', None)),
-                            'attention_temp': routing_kwargs.get('attention_temp', getattr(self, 'attention_temp', None)),
-                            'hard_ml_gate_threshold': routing_kwargs.get('hard_ml_gate_threshold', getattr(self, 'hard_ml_gate_threshold', None))
+                            # NOTE: min_ml_weight, max_ml_weight, hard_ml_gate_threshold removed - not needed with learned ml_weight
+                            'attention_temp': routing_kwargs.get('attention_temp', getattr(self, 'attention_temp', None))
                         }
                         
                         best_snapshot = {
@@ -4799,7 +4899,8 @@ class TrainableMAICL:
                             # Always save list (empty if k_shot=0 or missing), for consistent restoration
                             "few_shot_examples": copy.deepcopy(few_shot_examples_from_metrics),
                             "k_shot": self.k_shot,  # CRITICAL: Save k_shot value to ensure final evaluation uses same value
-                            "routing_config": routing_config  # Store routing config for exact restoration
+                            "routing_config": routing_config,  # Store routing config for exact restoration
+                            "ml_weight": self.ml_weight  # NEW: Store learned ML weight
                         }
                         if self.task_type == "classification":
                             logger.info(f"  [Best Checkpoint] Updated best-performing model at iteration {i+1} after rejection: ACC={current_acc:.4f}, F1={current_f1:.4f}")
@@ -4918,7 +5019,8 @@ class TrainableMAICL:
                         # Always save list (empty if k_shot=0 or missing), for consistent restoration
                         "few_shot_examples": copy.deepcopy(few_shot_examples_from_metrics) if few_shot_examples_from_metrics is not None else [],
                         "k_shot": self.k_shot,  # CRITICAL: Save k_shot value to ensure final evaluation uses same value
-                        "routing_config": routing_config  # Store routing config for exact restoration
+                        "routing_config": routing_config,  # Store routing config for exact restoration
+                        "ml_weight": self.ml_weight  # NEW: Store learned ML weight
                     }
                     if self.task_type == "classification":
                         logger.info(f"  [Best Checkpoint] Updated best-performing model at iteration {i+1}: ACC={current_acc:.4f}, F1={current_f1:.4f}")
@@ -5020,10 +5122,8 @@ class TrainableMAICL:
                     # Store routing config
                     routing_config = {
                         'relax_routing': True,
-                        'min_ml_weight': routing_kwargs.get('min_ml_weight', getattr(self, 'min_ml_weight', None)),
-                        'max_ml_weight': routing_kwargs.get('max_ml_weight', getattr(self, 'max_ml_weight', None)),
-                        'attention_temp': routing_kwargs.get('attention_temp', getattr(self, 'attention_temp', None)),
-                        'hard_ml_gate_threshold': routing_kwargs.get('hard_ml_gate_threshold', getattr(self, 'hard_ml_gate_threshold', None))
+                        # NOTE: min_ml_weight, max_ml_weight, hard_ml_gate_threshold removed - not needed with learned ml_weight
+                        'attention_temp': routing_kwargs.get('attention_temp', getattr(self, 'attention_temp', None))
                     }
                     
                     best_snapshot = {
@@ -5035,7 +5135,8 @@ class TrainableMAICL:
                         "mechanism_metrics": metrics_snapshot,
                         "few_shot_examples": copy.deepcopy(few_shot_examples_final),
                         "k_shot": self.k_shot,
-                        "routing_config": routing_config
+                        "routing_config": routing_config,
+                        "ml_weight": self.ml_weight  # NEW: Store learned ML weight
                     }
                     self._best_iteration = i + 1
                     logger.info(f"  [Best Checkpoint] Updated best snapshot to iteration {i+1} based on final state metrics")
@@ -5165,6 +5266,7 @@ class TrainableMAICL:
                 "loss": float(current_loss),
                 "mechanisms": self.mechanisms,
                 "mechanism_types": self.mechanism_types,
+                "ml_weight": float(self.ml_weight) if hasattr(self, 'ml_weight') else None,  # NEW: Log learned ML weight
                 "timestamp": datetime.utcnow().isoformat() + "Z"
             }
             self.training_history['mechanism_evolution'].append(mech_snapshot)
@@ -5183,8 +5285,29 @@ class TrainableMAICL:
             self.training_history['llm_calls'].append(delta_calls)
             self.training_history['llm_batches'].append(delta_batches)
             logger.info(f"  [LLM Usage] calls+={delta_calls}, batches+={delta_batches} (cum calls={stats_after.get('total_calls', 0)})")
+            
+            # NEW: Log learned ML weight for this iteration
+            if hasattr(self, 'ml_weight'):
+                self.training_history['ml_weight'].append(float(self.ml_weight))
+                logger.info(f"  [ML Weight] Learned weight for iteration {i+1}: {self.ml_weight:.4f}")
+                if hasattr(self, 'ml_weight_history') and len(self.ml_weight_history) > 0:
+                    weight_change = self.ml_weight_history[-1] - (self.ml_weight_history[-2] if len(self.ml_weight_history) > 1 else 0.5)
+                    logger.info(f"  [ML Weight] Weight change: {weight_change:+.4f} (history: {self.ml_weight_history[-5:] if len(self.ml_weight_history) >= 5 else self.ml_weight_history})")
+            else:
+                self.training_history['ml_weight'].append(None)
         
         logger.info("  ✓ Training complete")
+        
+        # NEW: Log final ML weight summary
+        if hasattr(self, 'ml_weight') and hasattr(self, 'ml_weight_history') and len(self.ml_weight_history) > 0:
+            logger.info(f"\n  [ML Weight Summary]")
+            logger.info(f"    • Initial weight: {INITIAL_ML_WEIGHT:.4f}")
+            logger.info(f"    • Final weight: {self.ml_weight:.4f}")
+            logger.info(f"    • Weight evolution: {[f'{w:.4f}' for w in self.ml_weight_history]}")
+            logger.info(f"    • Total weight updates: {len(self.ml_weight_history)}")
+            if len(self.ml_weight_history) > 1:
+                total_change = self.ml_weight_history[-1] - 0.5
+                logger.info(f"    • Net change from initial: {total_change:+.4f}")
         # CRITICAL: Always restore the best-performing model based on PERFORMANCE METRICS (R2/MAE or Accuracy/F1)
         # This ensures final results use the model with highest performance, not just lowest loss
         try:
@@ -5343,11 +5466,17 @@ class TrainableMAICL:
                 if should_restore:
                     logger.info(f"  [Restoration] Restoring best-performing model from iteration {best_snapshot['iteration']}: {best_performance_reason}")
                     logger.info(f"  [Restoration] Final evaluation will use mechanisms from iteration {best_snapshot['iteration']} (best performance across all {iterations} iterations)")
+                    # NEW: Log ML weight from best snapshot
+                    if "ml_weight" in best_snapshot:
+                        logger.info(f"  [Restoration] ML weight from best iteration {best_snapshot['iteration']}: {best_snapshot['ml_weight']:.4f}")
                 else:
                     logger.info(f"  [Restoration] Keeping current state (already best): {best_performance_reason}")
                     logger.info(f"  [Restoration] Final evaluation will use mechanisms from iteration {iterations} (current/last iteration)")
                     # Store current iteration as best
                     self._best_iteration = iterations
+                    # NEW: Log current ML weight
+                    if hasattr(self, 'ml_weight'):
+                        logger.info(f"  [Restoration] ML weight from current iteration {iterations}: {self.ml_weight:.4f}")
                 
                 if should_restore:
                     # CRITICAL: Restore EXACTLY the mechanisms from the best snapshot
@@ -5357,6 +5486,13 @@ class TrainableMAICL:
                     # Restore mechanisms from best snapshot
                     self.mechanisms = copy.deepcopy(best_snapshot["mechanisms"])
                     self.mechanism_types = copy.deepcopy(best_snapshot["mechanism_types"])
+                    
+                    # NEW: Restore learned ML weight from best snapshot
+                    if "ml_weight" in best_snapshot:
+                        self.ml_weight = best_snapshot["ml_weight"]
+                        logger.info(f"  [Restoration] ✓ Restored ML weight: {self.ml_weight:.4f} from best iteration (iter {best_snapshot['iteration']})")
+                    else:
+                        logger.warning(f"  [Restoration] ⚠️  Best snapshot missing ml_weight, keeping current: {self.ml_weight:.4f}")
                     
                     # Update the generator's unknown_mechanisms to match the restored snapshot
                     num_known = len(self.mech_generator.known_mechanisms)
@@ -5407,15 +5543,10 @@ class TrainableMAICL:
                     # This ensures final evaluation uses the exact same config as the best iteration
                     restored_routing_config = best_snapshot.get("routing_config", {})
                     if restored_routing_config:
-                        if 'min_ml_weight' in restored_routing_config and restored_routing_config['min_ml_weight'] is not None:
-                            self.min_ml_weight = restored_routing_config['min_ml_weight']
-                        if 'max_ml_weight' in restored_routing_config and restored_routing_config['max_ml_weight'] is not None:
-                            self.max_ml_weight = restored_routing_config['max_ml_weight']
                         if 'attention_temp' in restored_routing_config and restored_routing_config['attention_temp'] is not None:
                             self.attention_temp = restored_routing_config['attention_temp']
-                        if 'hard_ml_gate_threshold' in restored_routing_config and restored_routing_config['hard_ml_gate_threshold'] is not None:
-                            self.hard_ml_gate_threshold = restored_routing_config['hard_ml_gate_threshold']
-                        logger.info(f"  [Restoration] Restored routing config from best iteration: min_ml_weight={restored_routing_config.get('min_ml_weight')}, max_ml_weight={restored_routing_config.get('max_ml_weight')}")
+                        # NOTE: min_ml_weight, max_ml_weight, hard_ml_gate_threshold removed - not needed with learned ml_weight
+                        logger.info(f"  [Restoration] Restored routing config from best iteration: attention_temp={restored_routing_config.get('attention_temp')}")
                     else:
                         logger.warning(f"  [Restoration] No routing config in best snapshot - using current config")
                     

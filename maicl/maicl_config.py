@@ -37,6 +37,8 @@ ML_LOW_CONFIDENCE_THRESHOLD = 0.30
 # Routing weight caps for ML mechanism
 MIN_ML_WEIGHT = 0.5
 MAX_ML_WEIGHT = 0.9
+# Initial learned weight for ML mechanism (0 = all LLM, 1 = all ML)
+INITIAL_ML_WEIGHT = 0.1
 # Hard gate: if ML confidence >= this, route fully to ML
 HARD_ML_GATE_THRESHOLD = 0.80
 

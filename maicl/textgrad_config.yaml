@@ -32,6 +32,15 @@ prompts:
       - Target: LLM-only R² > 0.7, MAE < 0.1 (for regression) or ACC > 0.7, F1 > 0.7 (for classification)
       - Don't sacrifice independent performance just to complement ML - both are important
 
+      📝 TEXTUAL/NARRATIVE MECHANISM STYLE (PREFERRED):
+      - Write your mechanism as a clear, step-by-step narrative that describes the causal process
+      - Use natural language to explain: "If feature X is high and feature Y is low, then..."
+      - Describe intermediate concepts in words: "ribosome stability increases when both magnesium and potassium are present"
+      - Use simple formulas embedded in text rather than complex nested mathematical expressions
+      - Think of it as explaining the process to a colleague, not writing code
+      - Example style: "The yield depends on temperature effectiveness (optimal around 0.75), which modulates the combined effect of magnesium and potassium on ribosome stability. When both are high, stability is near maximum. NTPs drive transcription rate with saturation. High DNA concentration inhibits the process. The final yield is the product of these factors."
+      - This textual approach helps you reason more naturally and learn better patterns
+
       ⚠️ CRITICAL: If previous iterations were REJECTED, you MUST make SIGNIFICANT structural changes:
       - Change at least 2-3 coefficients by meaningful amounts (not just 0.1-0.2 adjustments)
       - Add or modify at least one interaction term or nonlinear transformation
@@ -172,15 +181,20 @@ prompts:
 
       REVISED MECHANISM:
 
-      [Clear description of the causal process, including intermediate variables if used]
+      [Write a clear, narrative description of the causal process - 3-6 sentences]
+      [Explain step-by-step how features interact and lead to the prediction]
+      [Use natural language to describe intermediate concepts and their relationships]
+      [Example: "Temperature effectiveness follows a Gaussian curve centered at 0.75. Ribosome stability requires both magnesium and potassium, with saturation kinetics. NTPs drive transcription with diminishing returns. High DNA concentration inhibits the process. The final yield combines these factors multiplicatively."]
 
-      Formula: ŷ = [executable expression with ACTUAL feature names]
+      [OPTIONAL: Include a simple formula if helpful, but prioritize the textual description]
+      Formula: ŷ = [simple executable expression - can be basic, the text description is more important]
       {formula_instruction}
       
-      NOTE: You can use intermediate variables in your formula. For example:
-      - intermediate1 = feature1 * feature2 / (0.2 + feature1 * feature2)
-      - intermediate2 = exp(-((feature3 - 0.7)^2) / (2*0.15^2))
-      - ŷ = clip(base_coefficient * intermediate1 * intermediate2 * ..., min, max)
+      NOTE: The textual description is PRIMARY. The formula is secondary and can be simple.
+      - Focus on making the narrative clear and accurate
+      - Use simple formulas that match your narrative description
+      - Example: If you describe "temperature effectiveness as a Gaussian", use: exp(-((T - 0.75)^2) / (2*0.2^2))
+      - Example: If you describe "saturation when both Mg and K are high", use: (Mg * K) / (0.1 + Mg * K)
 
       CRITICAL REQUIREMENTS FOR YOUR FORMULA:
       

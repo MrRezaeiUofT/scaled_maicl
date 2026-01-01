@@ -28,33 +28,35 @@ prompts:
       MECHANISM (this describes a causal process):
       {mechanism}
 
-      Your task: INTERPRET and EXECUTE this mechanism for the given input.
+      Your task: REASON THROUGH the mechanism's textual description to make a prediction.
 
       CRITICAL APPROACH:
 
-      1. UNDERSTAND the mechanism:
+      1. READ and UNDERSTAND the textual description:
 
-         - What causal process does it describe?
-
+         - Focus on the MECHANISM DESCRIPTION section (the narrative story)
+         - What causal process does it describe in words?
          - Which features play which roles (substrate, catalyst, inhibitor)?
+         - What are the key interactions described in the text?
 
-         - What are the key interactions?
+      2. REASON through the narrative step-by-step:
 
-      2. APPLY to input values:
+         - Follow the textual description's logic: "When X is high and Y is low, then..."
+         - Apply the intermediate concepts described in the text
+         - Use the textual reasoning, not just a formula
+         - If a formula is provided, use it as a guide, but prioritize the textual logic
 
-         - Substitute actual feature values into the mechanism
+      3. CALCULATE the prediction:
 
-         - Follow the causal logic step-by-step
+         - Work through the intermediate steps described in the text
+         - Apply the transformations and interactions as described
+         - Show your reasoning based on the textual mechanism
 
-         - Show your mechanistic reasoning
+      4. SANITY CHECK:
 
-      3. SANITY CHECK:
-
-         - Does the prediction make mechanistic sense?
-
+         - Does the prediction make mechanistic sense based on the description?
          - Are feature values in reasonable ranges?
-
-         - Does the causal chain hold?{few_shot_section}
+         - Does the causal chain from the text hold?{few_shot_section}
 
       Input features:
 
@@ -66,25 +68,25 @@ prompts:
 
       EXECUTION EXAMPLE:
 
-      Mechanism: "NAD provides energy via saturation kinetics. tRNA enhances via synergy."
+      Mechanism Description: "NAD provides energy via saturation kinetics - as NAD increases, the energy contribution increases but saturates at high levels. tRNA enhances the process synergistically - when tRNA is present, it multiplies the effectiveness of the NAD-driven energy."
 
-      Formula: ŷ = 0.6 * nad/(0.3+nad) * (1+0.5*trna)
+      Formula (optional guide): ŷ = 0.6 * nad/(0.3+nad) * (1+0.5*trna)
 
       Input: {{"nad": 0.7, "trna": 0.4}}
 
-      Reasoning:
+      Reasoning (following the textual description):
 
-      - NAD saturation term: 0.6 * 0.7/(0.3+0.7) = 0.6 * 0.7 = 0.42
+      - Step 1: NAD provides energy with saturation. At nad=0.7, we're in the saturation regime (above 0.3), so energy contribution is high but not maximum. The saturation term gives: 0.7/(0.3+0.7) = 0.7, scaled by 0.6 = 0.42
 
-      - tRNA enhancement: 1 + 0.5*0.4 = 1.2
+      - Step 2: tRNA enhances synergistically. With trna=0.4, the enhancement factor is 1 + 0.5*0.4 = 1.2, meaning 20% boost
 
-      - Combined: 0.42 * 1.2 = 0.504
+      - Step 3: Combined effect: The NAD energy (0.42) is enhanced by tRNA (1.2x) = 0.42 * 1.2 = 0.504
 
-      - Interpretation: Moderate NAD (70% saturation) with moderate tRNA gives ~50% yield
+      - Interpretation: Moderate NAD (70% of saturation) with moderate tRNA enhancement gives ~50% yield
 
       YOUR EXECUTION:
 
-      First show reasoning (1-2 sentences), then JSON result.
+      Follow the textual description step-by-step. First show your reasoning based on the narrative (1-2 sentences), then JSON result.
 
     batch_mechanisms: |
       You are applying SCIENTIFIC MECHANISMS to make predictions.
@@ -92,33 +94,35 @@ prompts:
       MECHANISMS (M={num_mechanisms}) - These describe causal processes:
       {mechanisms_block}
 
-      Your task: INTERPRET and EXECUTE each mechanism for the given inputs.
+      Your task: REASON THROUGH each mechanism's textual description to make predictions.
 
       CRITICAL APPROACH:
 
-      1. UNDERSTAND each mechanism:
+      1. READ and UNDERSTAND each mechanism's textual description:
 
-         - What causal process does it describe?
-
+         - Focus on the MECHANISM DESCRIPTION section (the narrative story)
+         - What causal process does it describe in words?
          - Which features play which roles (substrate, catalyst, inhibitor)?
+         - What are the key interactions described in the text?
 
-         - What are the key interactions?
+      2. REASON through each narrative step-by-step:
 
-      2. APPLY to input values:
+         - Follow the textual description's logic for each mechanism
+         - Apply the intermediate concepts described in the text
+         - Use the textual reasoning, not just formulas
+         - If formulas are provided, use them as guides, but prioritize textual logic
 
-         - Substitute actual feature values into each mechanism
+      3. CALCULATE predictions:
 
-         - Follow the causal logic step-by-step
+         - Work through the intermediate steps described in each text
+         - Apply transformations and interactions as described
+         - Show reasoning based on the textual mechanisms
 
-         - Show your mechanistic reasoning
+      4. SANITY CHECK:
 
-      3. SANITY CHECK:
-
-         - Do the predictions make mechanistic sense?
-
+         - Do the predictions make mechanistic sense based on the descriptions?
          - Are feature values in reasonable ranges?
-
-         - Does the causal chain hold?{few_shot_section}
+         - Does the causal chain from the text hold?{few_shot_section}
 
       Inputs (N={num_inputs}):
       {inputs_payload}
@@ -127,25 +131,26 @@ prompts:
 
       EXECUTION EXAMPLE:
 
-      Mechanism: "NAD provides energy via saturation kinetics. tRNA enhances via synergy."
+      Mechanism Description: "NAD provides energy via saturation kinetics - as NAD increases, the energy contribution increases but saturates at high levels. tRNA enhances the process synergistically - when tRNA is present, it multiplies the effectiveness of the NAD-driven energy."
 
-      Formula: ŷ = 0.6 * nad/(0.3+nad) * (1+0.5*trna)
+      Formula (optional guide): ŷ = 0.6 * nad/(0.3+nad) * (1+0.5*trna)
 
       Input: {{"nad": 0.7, "trna": 0.4}}
 
-      Reasoning:
+      Reasoning (following the textual description):
 
-      - NAD saturation term: 0.6 * 0.7/(0.3+0.7) = 0.6 * 0.7 = 0.42
+      - Step 1: NAD provides energy with saturation. At nad=0.7, we're in the saturation regime (above 0.3), so energy contribution is high but not maximum. The saturation term gives: 0.7/(0.3+0.7) = 0.7, scaled by 0.6 = 0.42
 
-      - tRNA enhancement: 1 + 0.5*0.4 = 1.2
+      - Step 2: tRNA enhances synergistically. With trna=0.4, the enhancement factor is 1 + 0.5*0.4 = 1.2, meaning 20% boost
 
-      - Combined: 0.42 * 1.2 = 0.504
+      - Step 3: Combined effect: The NAD energy (0.42) is enhanced by tRNA (1.2x) = 0.42 * 1.2 = 0.504
 
-      - Interpretation: Moderate NAD (70% saturation) with moderate tRNA gives ~50% yield
+      - Interpretation: Moderate NAD (70% of saturation) with moderate tRNA enhancement gives ~50% yield
 
       YOUR EXECUTION:
 
-      For each input, apply EACH mechanism independently to get M predictions.
+      For each input, reason through EACH mechanism's textual description independently to get M predictions.
+      Follow the narrative logic described in each mechanism, not just formulas.
 
       Return JSON with key "results" as a 2D array of size N x M.
       Each entry is an object with keys "y_hat" and "confidence".
@@ -194,25 +199,25 @@ prompts:
 
       EXECUTION EXAMPLE:
 
-      Mechanism: "NAD provides energy via saturation kinetics. tRNA enhances via synergy."
+      Mechanism Description: "NAD provides energy via saturation kinetics - as NAD increases, the energy contribution increases but saturates at high levels. tRNA enhances the process synergistically - when tRNA is present, it multiplies the effectiveness of the NAD-driven energy."
 
-      Formula: ŷ = 0.6 * nad/(0.3+nad) * (1+0.5*trna)
+      Formula (optional guide): ŷ = 0.6 * nad/(0.3+nad) * (1+0.5*trna)
 
       Input: {{"nad": 0.7, "trna": 0.4}}
 
-      Reasoning:
+      Reasoning (following the textual description):
 
-      - NAD saturation term: 0.6 * 0.7/(0.3+0.7) = 0.6 * 0.7 = 0.42
+      - Step 1: NAD provides energy with saturation. At nad=0.7, we're in the saturation regime (above 0.3), so energy contribution is high but not maximum. The saturation term gives: 0.7/(0.3+0.7) = 0.7, scaled by 0.6 = 0.42
 
-      - tRNA enhancement: 1 + 0.5*0.4 = 1.2
+      - Step 2: tRNA enhances synergistically. With trna=0.4, the enhancement factor is 1 + 0.5*0.4 = 1.2, meaning 20% boost
 
-      - Combined: 0.42 * 1.2 = 0.504
+      - Step 3: Combined effect: The NAD energy (0.42) is enhanced by tRNA (1.2x) = 0.42 * 1.2 = 0.504
 
-      - Interpretation: Moderate NAD (70% saturation) with moderate tRNA gives ~50% yield
+      - Interpretation: Moderate NAD (70% of saturation) with moderate tRNA enhancement gives ~50% yield
 
       YOUR EXECUTION:
 
-      Apply the mechanism to EACH input independently.
+      Follow the textual description step-by-step for EACH input independently. Reason through the narrative logic, not just formulas.
 
       First show reasoning (1-2 sentences per input), then JSON result.
 
@@ -389,10 +394,14 @@ prompts:
       Produce mechanisms that are BOTH high-performing and highly interpretable, without unnecessary verbosity.
       
       HARD REQUIREMENTS (do not skip):
-      1. The mechanism must be descriptive and textual (not just math).
-      2. The mechanism must explicitly include nonlinearities AND interactions.
-      3. The mechanism must introduce intermediate combinatory concepts (named, explained) that capture nonlinear interactions.
-      4. The final formula must be executable and appear as a SINGLE LINE starting with "Formula:" so it can be extracted programmatically.
+      1. The mechanism must be PRIMARILY TEXTUAL AND NARRATIVE (not just math).
+      2. Write it as a clear, step-by-step story of the causal process (3-6 sentences minimum).
+      3. Use natural language to describe how features interact: "When X is high and Y is low, then..."
+      4. Describe intermediate concepts in words: "ribosome stability", "transcription rate", "temperature effectiveness"
+      5. The mechanism must explicitly include nonlinearities AND interactions (described in text).
+      6. The mechanism must introduce intermediate combinatory concepts (named, explained in text).
+      7. OPTIONAL: Include a simple formula starting with "Formula:" - but the text description is PRIMARY.
+      8. Think of it as explaining the process to a colleague, not writing complex code.
 
       STRUCTURED THINKING REQUIREMENT (concise, not verbose):
       - You MUST present the mechanism as a small sequence of conceptual steps, using clear section headers.
