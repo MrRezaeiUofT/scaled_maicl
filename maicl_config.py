@@ -115,7 +115,7 @@ TEXTGRAD_FEATURE_ERROR_THRESHOLD = 1.3  # Threshold for feature-specific errors 
 TEXTGRAD_FEATURE_ERROR_THRESHOLD_STRICT = 1.4  # Stricter threshold for feature-specific errors (lowered from 1.8)
 
 # TextGrad iteration history
-TEXTGRAD_MAX_ITERATION_HISTORY = 3  # Maximum number of previous iterations to show in context
+TEXTGRAD_MAX_ITERATION_HISTORY = 10  # Maximum number of previous iterations to show in context
 
 
 def set_output_dir(run_folder_name: str):

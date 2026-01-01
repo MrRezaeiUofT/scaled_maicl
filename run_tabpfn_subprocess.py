@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""
+Subprocess wrapper for TabPFN to isolate crashes.
+This script runs TabPFN in a separate process so segfaults don't crash the main script.
+"""
+
+import sys
+import json
+import numpy as np
+import pandas as pd
+from pathlib import Path
+
+def run_tabpfn(X_train_path, y_train_path, X_test_path, output_path, task_type="regression"):
+    """Run TabPFN and save results to JSON file."""
+    try:
+        # Set random seeds for reproducibility (TabPFN may still have some non-determinism)
+        RANDOM_STATE = 42
+        np.random.seed(RANDOM_STATE)
+        try:
+            import torch
+            torch.manual_seed(RANDOM_STATE)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(RANDOM_STATE)
+                torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+        except:
+            pass
+        
+        # Load data
+        X_train = pd.read_csv(X_train_path)
+        y_train = np.load(y_train_path)
+        X_test = pd.read_csv(X_test_path)
+        
+        # Import TabPFN
+        if task_type == "regression":
+            from tabpfn import TabPFNRegressor
+            from tabpfn.constants import ModelVersion
+            regressor = TabPFNRegressor.create_default_for_version(ModelVersion.V2)
+        else:
+            from tabpfn import TabPFNClassifier
+            from tabpfn.constants import ModelVersion
+            regressor = TabPFNClassifier.create_default_for_version(ModelVersion.V2)
+        
+        # Clear PyTorch cache again after import
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+        except:
+            pass
+        
+        # Initialize and train TabPFN
+        # NOTE: TabPFN may still produce slightly different results due to:
+        # 1. Non-deterministic operations in PyTorch (even with seeds)
+        # 2. Different execution contexts (subprocess vs main process)
+        # 3. GPU state differences
+        regressor.fit(X_train, y_train)
+        
+        # Predict
+        y_pred = regressor.predict(X_test)
+        
+        # Save results
+        results = {
+            'success': True,
+            'predictions': y_pred.tolist(),
+            'error': None
+        }
+        
+        with open(output_path, 'w') as f:
+            json.dump(results, f)
+        
+        return 0
+        
+    except Exception as e:
+        # Save error information
+        results = {
+            'success': False,
+            'predictions': None,
+            'error': str(e),
+            'error_type': type(e).__name__
+        }
+        
+        try:
+            with open(output_path, 'w') as f:
+                json.dump(results, f)
+        except:
+            pass
+        
+        return 1
+
+if __name__ == '__main__':
+    if len(sys.argv) < 5:
+        print("Usage: run_tabpfn_subprocess.py <X_train.csv> <y_train.npy> <X_test.csv> <output.json> [task_type]", file=sys.stderr)
+        sys.exit(1)
+    
+    X_train_path, y_train_path, X_test_path, output_path = sys.argv[1:5]
+    task_type = sys.argv[5] if len(sys.argv) > 5 else "regression"
+    exit_code = run_tabpfn(X_train_path, y_train_path, X_test_path, output_path, task_type)
+    sys.exit(exit_code)
+

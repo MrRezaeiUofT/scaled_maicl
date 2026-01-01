@@ -77,6 +77,31 @@ from maicl_lib_v2 import (
     SCALE_MAX,
 )
 
+# Optional baseline imports
+try:
+    from tabpfn import TabPFNRegressor
+    _HAS_TABPFN = True
+except:
+    _HAS_TABPFN = False
+
+try:
+    from interpret.glassbox import ExplainableBoostingRegressor
+    _HAS_EBM = True
+except:
+    _HAS_EBM = False
+
+try:
+    import shap
+    _HAS_SHAP = True
+except:
+    _HAS_SHAP = False
+
+try:
+    from xgboost import XGBRegressor, XGBClassifier
+    _HAS_XGB = True
+except:
+    _HAS_XGB = False
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -151,6 +176,253 @@ def save_scatter_plot(y_true, y_pred, title, filename, output_dir):
     plt.savefig(save_path, dpi=150)
     plt.close()
     logger.info(f"Saved scatter plot to {save_path}")
+
+
+def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="regression", 
+                                 feature_cols=None, y_scaler=None, no_scaling=False):
+    """Compute additional baseline models: TabPFN, EBM, and SHAP-based model
+    
+    Returns:
+        Dict with baseline metrics for each model
+    """
+    baselines = {}
+    
+    # TabPFN baseline (runs in subprocess to avoid segmentation faults)
+    if _HAS_TABPFN and task_type == "regression":
+        try:
+            logger.info("Computing TabPFN baseline...")
+            logger.info("  ℹ️  Note: TabPFN runs in isolated subprocess to avoid crashes")
+            
+            import subprocess
+            import tempfile
+            from pathlib import Path
+            import sys
+            import pandas as pd
+            
+            # Create temporary directory for data files
+            temp_dir = Path(tempfile.mkdtemp(prefix="tabpfn_baseline_"))
+            
+            # Save data to files
+            X_train_df = pd.DataFrame(X_train, columns=feature_cols if feature_cols else [f"feature_{i}" for i in range(X_train.shape[1])])
+            X_test_df = pd.DataFrame(X_test, columns=feature_cols if feature_cols else [f"feature_{i}" for i in range(X_test.shape[1])])
+            
+            X_train_path = temp_dir / "X_train.csv"
+            y_train_path = temp_dir / "y_train.npy"
+            X_test_path = temp_dir / "X_test.csv"
+            output_path = temp_dir / "predictions.json"
+            
+            X_train_df.to_csv(X_train_path, index=False)
+            np.save(y_train_path, y_train)
+            X_test_df.to_csv(X_test_path, index=False)
+            
+            # Find subprocess script
+            script_path = Path(__file__).parent / "run_tabpfn_subprocess.py"
+            if not script_path.exists():
+                raise RuntimeError(f"TabPFN subprocess script not found at {script_path}")
+            
+            # Run TabPFN in subprocess
+            result = subprocess.run(
+                [sys.executable, str(script_path), str(X_train_path), str(y_train_path), 
+                 str(X_test_path), str(output_path), task_type],
+                capture_output=True,
+                text=True,
+                timeout=600  # 10 minute timeout
+            )
+            
+            if result.returncode != 0:
+                error_msg = result.stderr[:500] if result.stderr else "Unknown error"
+                raise RuntimeError(f"TabPFN subprocess failed: {error_msg}")
+            
+            if not output_path.exists():
+                raise RuntimeError("TabPFN subprocess completed but no output file found")
+            
+            # Load predictions
+            with open(output_path, 'r') as f:
+                pred_result = json.load(f)
+            
+            if not pred_result.get('success', False):
+                error_msg = pred_result.get('error', 'Unknown error')
+                raise RuntimeError(f"TabPFN failed: {error_msg}")
+            
+            y_pred = np.array(pred_result['predictions'], dtype=float)
+            
+            # Clean up temporary files
+            try:
+                import shutil
+                shutil.rmtree(temp_dir)
+            except:
+                pass
+            
+            # Clip if scaled
+            if not no_scaling and y_scaler is not None:
+                y_pred = np.clip(y_pred, SCALE_MIN, SCALE_MAX)
+            
+            r2 = r2_score(y_test, y_pred)
+            mae = mean_absolute_error(y_test, y_pred)
+            mse = mean_squared_error(y_test, y_pred)
+            
+            baselines['tabpfn'] = {
+                'r2': float(r2),
+                'mae': float(mae),
+                'mse': float(mse),
+                'predictions': y_pred.tolist()
+            }
+            logger.info(f"  TabPFN: R2={r2:.4f}, MAE={mae:.4f}, MSE={mse:.4f}")
+        except Exception as e:
+            import traceback
+            logger.warning(f"Failed to compute TabPFN baseline: {e}")
+            logger.debug(f"TabPFN error details: {traceback.format_exc()}")
+            # Check if it's a model download issue
+            if "huggingface" in str(e).lower() or "model" in str(e).lower():
+                logger.warning("  TabPFN model weights may not be downloaded. Visit https://huggingface.co/Prior-Labs/tabpfn_2_5 to accept license and run 'hf auth login'")
+    
+    # EBM baseline
+    if _HAS_EBM:
+        try:
+            logger.info("Computing EBM baseline...")
+            # Suppress verbose EBM logs
+            import logging
+            interpret_logger = logging.getLogger('interpret')
+            original_level = interpret_logger.level
+            interpret_logger.setLevel(logging.WARNING)
+            
+            try:
+                if task_type == "regression":
+                    model = ExplainableBoostingRegressor(random_state=RANDOM_STATE, n_jobs=1)
+                else:
+                    from interpret.glassbox import ExplainableBoostingClassifier
+                    model = ExplainableBoostingClassifier(random_state=RANDOM_STATE, n_jobs=1)
+                
+                model.fit(X_train, y_train)
+            finally:
+                # Restore original logging level
+                interpret_logger.setLevel(original_level)
+            y_pred = model.predict(X_test)
+            
+            # Clip if scaled
+            if not no_scaling and y_scaler is not None:
+                y_pred = np.clip(y_pred, SCALE_MIN, SCALE_MAX)
+            
+            if task_type == "regression":
+                r2 = r2_score(y_test, y_pred)
+                mae = mean_absolute_error(y_test, y_pred)
+                mse = mean_squared_error(y_test, y_pred)
+                baselines['ebm'] = {
+                    'r2': float(r2),
+                    'mae': float(mae),
+                    'mse': float(mse),
+                    'predictions': y_pred.tolist()
+                }
+                logger.info(f"  EBM: R2={r2:.4f}, MAE={mae:.4f}, MSE={mse:.4f}")
+            else:
+                from sklearn.metrics import accuracy_score, f1_score
+                acc = accuracy_score(y_test, y_pred)
+                f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+                baselines['ebm'] = {
+                    'accuracy': float(acc),
+                    'f1': float(f1),
+                    'predictions': y_pred.tolist()
+                }
+                logger.info(f"  EBM: ACC={acc:.4f}, F1={f1:.4f}")
+        except Exception as e:
+            logger.warning(f"Failed to compute EBM baseline: {e}")
+    
+    # SHAP-based baseline (using XGBoost with SHAP feature selection)
+    if _HAS_SHAP and _HAS_XGB:
+        try:
+            logger.info("Computing SHAP-based baseline...")
+            from xgboost import XGBRegressor, XGBClassifier
+            
+            if task_type == "regression":
+                base_model = XGBRegressor(n_estimators=100, max_depth=4, random_state=RANDOM_STATE, n_jobs=1)
+            else:
+                base_model = XGBClassifier(n_estimators=100, max_depth=4, random_state=RANDOM_STATE, n_jobs=1, eval_metric='logloss')
+            
+            base_model.fit(X_train, y_train)
+            
+            # Use SHAP to select top features
+            try:
+                explainer = shap.TreeExplainer(base_model)
+                shap_values = explainer.shap_values(X_train[:min(100, len(X_train))])  # Sample for speed
+                
+                if isinstance(shap_values, list):
+                    shap_values = np.array(shap_values)
+                if len(shap_values.shape) > 2:
+                    shap_values = np.abs(shap_values).mean(axis=0)
+                else:
+                    shap_values = np.abs(shap_values)
+                
+                # Get feature importance from SHAP
+                feature_importance = np.abs(shap_values).mean(axis=0) if len(shap_values.shape) > 1 else np.abs(shap_values)
+                top_features_idx = np.argsort(feature_importance)[-min(10, len(feature_importance)):]
+                
+                # Retrain on top features
+                X_train_selected = X_train[:, top_features_idx]
+                X_test_selected = X_test[:, top_features_idx]
+                
+                if task_type == "regression":
+                    model = XGBRegressor(n_estimators=100, max_depth=4, random_state=RANDOM_STATE, n_jobs=1)
+                else:
+                    model = XGBClassifier(n_estimators=100, max_depth=4, random_state=RANDOM_STATE, n_jobs=1, eval_metric='logloss')
+                
+                model.fit(X_train_selected, y_train)
+                y_pred = model.predict(X_test_selected)
+                
+                # Clip if scaled
+                if not no_scaling and y_scaler is not None:
+                    y_pred = np.clip(y_pred, SCALE_MIN, SCALE_MAX)
+                
+                if task_type == "regression":
+                    r2 = r2_score(y_test, y_pred)
+                    mae = mean_absolute_error(y_test, y_pred)
+                    mse = mean_squared_error(y_test, y_pred)
+                    baselines['shap'] = {
+                        'r2': float(r2),
+                        'mae': float(mae),
+                        'mse': float(mse),
+                        'predictions': y_pred.tolist()
+                    }
+                    logger.info(f"  SHAP: R2={r2:.4f}, MAE={mae:.4f}, MSE={mse:.4f}")
+                else:
+                    from sklearn.metrics import accuracy_score, f1_score
+                    acc = accuracy_score(y_test, y_pred)
+                    f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+                    baselines['shap'] = {
+                        'accuracy': float(acc),
+                        'f1': float(f1),
+                        'predictions': y_pred.tolist()
+                    }
+                    logger.info(f"  SHAP: ACC={acc:.4f}, F1={f1:.4f}")
+            except Exception as e:
+                logger.warning(f"SHAP feature selection failed, using full model: {e}")
+                # Fallback: use full model without SHAP selection
+                y_pred = base_model.predict(X_test)
+                if not no_scaling and y_scaler is not None:
+                    y_pred = np.clip(y_pred, SCALE_MIN, SCALE_MAX)
+                
+                if task_type == "regression":
+                    r2 = r2_score(y_test, y_pred)
+                    mae = mean_absolute_error(y_test, y_pred)
+                    mse = mean_squared_error(y_test, y_pred)
+                    baselines['shap'] = {
+                        'r2': float(r2),
+                        'mae': float(mae),
+                        'mse': float(mse),
+                        'predictions': y_pred.tolist()
+                    }
+                else:
+                    from sklearn.metrics import accuracy_score, f1_score
+                    acc = accuracy_score(y_test, y_pred)
+                    f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+                    baselines['shap'] = {
+                        'accuracy': float(acc),
+                        'f1': float(f1),
+                        'predictions': y_pred.tolist()
+                    }
+        except Exception as e:
+            logger.warning(f"Failed to compute SHAP baseline: {e}")
+    
+    return baselines
 
 
 def save_residual_plot(y_true, y_pred, title, filename, output_dir):
@@ -1067,6 +1339,10 @@ def load_deepchem_regression_dataset(dataset_name: str, max_samples: int):
 
 
 def main():
+    # Explicitly reference global json module to prevent UnboundLocalError
+    # (Python may treat json as local if it sees json.load() calls later in the function)
+    global json
+    
     parser = argparse.ArgumentParser(description="MA-ICL regression on biotech/experimental datasets with top-K residuals")
     parser.add_argument("--dataset", type=str, required=True,
                         help="Dataset name. Options:\n"
@@ -1097,7 +1373,10 @@ def main():
                         help="List all available protein expression plate files and exit")
     parser.add_argument("--model_name", default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash"),
                         help="Gemini model name, e.g., gemini-2.0-flash, gemini-2.5-pro")
-    parser.add_argument("--ml_mech", default="linear", help="Regression ML mechanism: linear|xgboost|kernelridge|tabicl")
+    parser.add_argument("--ml_mech", default="linear", help="Regression ML mechanism: linear|xgboost|kernelridge|tabicl|ebm|tabpfn. "
+                        "Note: TabPFN may cause segmentation faults when used as ML mechanism. "
+                        "Consider using TabPFN only as a baseline (it runs in isolated subprocess) "
+                        "or use --ml_mech linear/xgboost for more stable ML mechanism.")
     parser.add_argument("--tabicl_bins", type=int, default=20,
                         help="Number of bins for TabICL regression quantization (default: 20). "
                              "Only used when --ml_mech=tabicl. Higher values = finer granularity but more classes.")
@@ -1434,7 +1713,7 @@ def main():
     ml_preds = None
     
     # Define model_name for logging purposes (even when ML is disabled)
-    mech_map = {"linear": "LinearRegression", "xgboost": "XGBoost", "kernelridge": "KernelRidge", "tabicl": "TabICL"}
+    mech_map = {"linear": "LinearRegression", "xgboost": "XGBoost", "kernelridge": "KernelRidge", "tabicl": "TabICL", "ebm": "EBM", "tabpfn": "TabPFN"}
     model_name = mech_map.get(args.ml_mech.lower(), "KernelRidge")
     
     if args.use_ml:
@@ -1598,7 +1877,70 @@ def main():
         ml_baseline_metrics: Dict[str, Any] = {}
         try:
             model = pretrained_ml.model
-            y_pred = model.predict(X_test_s).astype(float)
+            # TabPFN uses subprocess isolation - model is None, use batch prediction helper
+            if model_name == "TabPFN":
+                # TabPFN requires batch prediction via subprocess
+                import subprocess
+                import tempfile
+                from pathlib import Path
+                import sys
+                import pandas as pd
+                
+                # Create temporary files for prediction
+                temp_dir = Path(tempfile.mkdtemp(prefix="tabpfn_ml_baseline_"))
+                X_test_df = pd.DataFrame(X_test_s, columns=feature_cols)
+                X_test_path = temp_dir / "X_test.csv"
+                output_path = temp_dir / "pred_result.json"
+                
+                X_test_df.to_csv(X_test_path, index=False)
+                
+                # Find subprocess script
+                script_path = Path(__file__).parent / "run_tabpfn_ml_mechanism.py"
+                if not script_path.exists():
+                    raise RuntimeError(f"TabPFN subprocess script not found at {script_path}")
+                
+                # Get training data paths from pretrained_ml
+                if not hasattr(pretrained_ml, '_tabpfn_training_data_path') or pretrained_ml._tabpfn_training_data_path is None:
+                    raise RuntimeError("TabPFN not properly initialized with subprocess isolation")
+                
+                # Run prediction in subprocess
+                result = subprocess.run(
+                    [sys.executable, str(script_path), "predict",
+                     pretrained_ml._tabpfn_training_data_path['X_train_path'],
+                     pretrained_ml._tabpfn_training_data_path['y_train_path'],
+                     str(X_test_path),
+                     pretrained_ml.task_type,
+                     str(output_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=600  # 10 minute timeout
+                )
+                
+                if result.returncode != 0:
+                    error_msg = result.stderr[:500] if result.stderr else "Unknown error"
+                    raise RuntimeError(f"TabPFN batch prediction subprocess failed: {error_msg}")
+                
+                if not output_path.exists():
+                    raise RuntimeError("TabPFN batch prediction subprocess completed but no output file found")
+                
+                # Load prediction result
+                with open(output_path, 'r') as f:
+                    pred_result = json.load(f)
+                
+                if not pred_result.get('success', False):
+                    error_msg = pred_result.get('error', 'Unknown error')
+                    raise RuntimeError(f"TabPFN batch prediction failed: {error_msg}")
+                
+                y_pred = np.array(pred_result['predictions'], dtype=float)
+                
+                # Clean up temporary files
+                try:
+                    import shutil
+                    shutil.rmtree(temp_dir)
+                except:
+                    pass
+            else:
+                y_pred = model.predict(X_test_s).astype(float)
             
             # Clip predictions to [0,1] if targets are scaled (regression with scaling)
             if not args.no_scaling and y_scaler_target is not None:
@@ -1690,7 +2032,51 @@ def main():
                 "predictions": y_pred.tolist()
             }
             # Also check training set performance for overfitting diagnosis
-            y_pred_train = model.predict(X_train_s).astype(float)
+            if model_name == "TabPFN":
+                # TabPFN batch prediction for training set
+                import subprocess
+                import tempfile
+                from pathlib import Path
+                import sys
+                import pandas as pd
+                
+                temp_dir = Path(tempfile.mkdtemp(prefix="tabpfn_ml_baseline_train_"))
+                X_train_df = pd.DataFrame(X_train_s, columns=feature_cols)
+                X_train_path = temp_dir / "X_train_pred.csv"
+                output_path = temp_dir / "pred_result_train.json"
+                
+                X_train_df.to_csv(X_train_path, index=False)
+                
+                script_path = Path(__file__).parent / "run_tabpfn_ml_mechanism.py"
+                result = subprocess.run(
+                    [sys.executable, str(script_path), "predict",
+                     pretrained_ml._tabpfn_training_data_path['X_train_path'],
+                     pretrained_ml._tabpfn_training_data_path['y_train_path'],
+                     str(X_train_path),
+                     pretrained_ml.task_type,
+                     str(output_path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=600
+                )
+                
+                if result.returncode == 0 and output_path.exists():
+                    with open(output_path, 'r') as f:
+                        pred_result = json.load(f)
+                    if pred_result.get('success', False):
+                        y_pred_train = np.array(pred_result['predictions'], dtype=float)
+                    else:
+                        raise RuntimeError(f"TabPFN training set prediction failed: {pred_result.get('error', 'Unknown error')}")
+                else:
+                    raise RuntimeError("TabPFN training set prediction subprocess failed")
+                
+                try:
+                    import shutil
+                    shutil.rmtree(temp_dir)
+                except:
+                    pass
+            else:
+                y_pred_train = model.predict(X_train_s).astype(float)
             if not args.no_scaling and y_scaler_target is not None:
                 y_pred_train = np.clip(y_pred_train, SCALE_MIN, SCALE_MAX)
             r2_train = r2_score(y_train_s, y_pred_train)
@@ -1715,6 +2101,22 @@ def main():
         # LLM-only mode: no ML residuals or baseline metrics
         ml_baseline_metrics = {}
         logger.info(f"LLM-only mode: Training on {len(X_topk)} samples (no ML baseline)")
+    
+    # Compute additional baselines (TabPFN, EBM, SHAP)
+    logger.info("=" * 80)
+    logger.info("COMPUTING ADDITIONAL BASELINES")
+    logger.info("=" * 80)
+    if not _HAS_TABPFN:
+        logger.warning("⚠ TabPFN not available - skipping TabPFN baseline")
+        logger.warning("  Install with: pip install tabpfn")
+        logger.warning("  Note: TabPFN requires GPU for datasets >1000 samples")
+    additional_baselines = compute_additional_baselines(
+        X_train_s, y_train_s, X_test_s, y_test_s,
+        task_type="regression",
+        feature_cols=feature_cols,
+        y_scaler=y_scaler_target,
+        no_scaling=args.no_scaling
+    )
 
     maicl = TrainableMAICL(
         llm, feature_cols, scaler,
@@ -2007,7 +2409,8 @@ def main():
             class_names=None,
             output_dir=output_dir,
             llm_only_metrics=llm_only_metrics,
-            llm_only_pre_metrics=llm_only_pre_metrics
+            llm_only_pre_metrics=llm_only_pre_metrics,
+            additional_baselines=additional_baselines
         )
     except Exception as e:
         logger.warning(f"Failed to generate visualizations: {e}")
@@ -2031,6 +2434,7 @@ def main():
         "n_test": len(X_test_s),
         "n_topk_trained": len(X_topk),
         "ml_baseline": ml_baseline_metrics,
+        "additional_baselines": additional_baselines,
         "pre_training": {
             "r2": pre_r2,
             "mae": pre_mae,
@@ -2097,6 +2501,27 @@ def main():
     logger.info("")
     logger.info("Performance Comparison:")
     logger.info(f"  ML Baseline:        R2={ml_r2:.4f}, MAE={ml_mae:.4f}, MSE={ml_mse:.4f}")
+    
+    # Additional baselines
+    if additional_baselines:
+        if 'tabpfn' in additional_baselines:
+            tabpfn_r2 = additional_baselines['tabpfn'].get('r2', 0.0)
+            tabpfn_mae = additional_baselines['tabpfn'].get('mae', 0.0)
+            tabpfn_mse = additional_baselines['tabpfn'].get('mse', 0.0)
+            logger.info(f"  TabPFN Baseline:    R2={tabpfn_r2:.4f}, MAE={tabpfn_mae:.4f}, MSE={tabpfn_mse:.4f}")
+        elif not _HAS_TABPFN:
+            logger.info(f"  TabPFN Baseline:    [SKIPPED - not installed]")
+        if 'ebm' in additional_baselines:
+            ebm_r2 = additional_baselines['ebm'].get('r2', 0.0)
+            ebm_mae = additional_baselines['ebm'].get('mae', 0.0)
+            ebm_mse = additional_baselines['ebm'].get('mse', 0.0)
+            logger.info(f"  EBM Baseline:      R2={ebm_r2:.4f}, MAE={ebm_mae:.4f}, MSE={ebm_mse:.4f}")
+        if 'shap' in additional_baselines:
+            shap_r2 = additional_baselines['shap'].get('r2', 0.0)
+            shap_mae = additional_baselines['shap'].get('mae', 0.0)
+            shap_mse = additional_baselines['shap'].get('mse', 0.0)
+            logger.info(f"  SHAP Baseline:     R2={shap_r2:.4f}, MAE={shap_mae:.4f}, MSE={shap_mse:.4f}")
+    
     logger.info(f"  Pre-training:       R2={pre_r2:.4f}, MAE={pre_mae:.4f}, MSE={pre_mse:.4f}")
     if llm_only_pre_metrics:
         llm_only_pre_r2 = float(llm_only_pre_metrics.get('r2', -1.0))

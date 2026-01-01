@@ -109,7 +109,8 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
                                 task_type: str = "classification",
                                 output_path: Optional[str] = None,
                                 llm_only_pre: Optional[Dict[str, Any]] = None,
-                                llm_only_post: Optional[Dict[str, Any]] = None):
+                                llm_only_post: Optional[Dict[str, Any]] = None,
+                                additional_baselines: Optional[Dict[str, Dict[str, Any]]] = None):
     """Plot performance comparison between ML baseline, pre-training MA-ICL, post-training MA-ICL, and LLM-only mechanisms
     
     Args:
@@ -140,9 +141,25 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
         # Determine which models to include
         has_llm_pre = llm_only_pre is not None
         has_llm_post = llm_only_post is not None
+        has_additional = additional_baselines is not None and len(additional_baselines) > 0
         
-        models = ['ML Baseline', 'MA-ICL\n(Pre-train)']
-        colors = ['#3498db', '#e74c3c']
+        models = ['ML Baseline']
+        colors = ['#3498db']
+        
+        # Add additional baselines (TabPFN, EBM, SHAP)
+        if has_additional:
+            if 'tabpfn' in additional_baselines:
+                models.append('TabPFN')
+                colors.append('#16a085')  # Teal
+            if 'ebm' in additional_baselines:
+                models.append('EBM')
+                colors.append('#e67e22')  # Orange
+            if 'shap' in additional_baselines:
+                models.append('SHAP')
+                colors.append('#8e44ad')  # Purple
+        
+        models.append('MA-ICL\n(Pre-train)')
+        colors.append('#e74c3c')
         
         if has_llm_pre:
             models.append('LLM-only\n(Pre-train)')
@@ -164,6 +181,16 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
             
             # Get values, handling missing data
             values = [ml_baseline.get(metric, 0)]
+            
+            # Add additional baselines
+            if has_additional:
+                if 'tabpfn' in additional_baselines:
+                    values.append(additional_baselines['tabpfn'].get(metric, 0))
+                if 'ebm' in additional_baselines:
+                    values.append(additional_baselines['ebm'].get(metric, 0))
+                if 'shap' in additional_baselines:
+                    values.append(additional_baselines['shap'].get(metric, 0))
+            
             values.append(pre_maicl.get(metric, 0))
             
             if has_llm_pre:
@@ -194,8 +221,18 @@ def plot_performance_comparison(ml_baseline: Dict[str, Any],
             ax.tick_params(axis='x', labelsize=9)
             plt.setp(ax.xaxis.get_majorticklabels(), rotation=15, ha='right')
         
-        fig.suptitle('Performance Comparison: ML Baseline vs MA-ICL vs LLM-only', 
-                     fontsize=16, fontweight='bold', y=1.02)
+        # Update title to include additional baselines if present
+        title_parts = ['ML Baseline']
+        if has_additional:
+            if 'tabpfn' in additional_baselines:
+                title_parts.append('TabPFN')
+            if 'ebm' in additional_baselines:
+                title_parts.append('EBM')
+            if 'shap' in additional_baselines:
+                title_parts.append('SHAP')
+        title_parts.extend(['MA-ICL', 'LLM-only'])
+        title = f'Performance Comparison: {" vs ".join(title_parts)}'
+        fig.suptitle(title, fontsize=16, fontweight='bold', y=1.02)
         plt.tight_layout()
         
         if output_path:
@@ -266,7 +303,8 @@ def create_result_visualizations(y_test: np.ndarray,
                                  class_names: Optional[List[str]] = None,
                                  output_dir: Optional[str] = None,
                                  llm_only_metrics: Optional[Dict[str, Any]] = None,
-                                 llm_only_pre_metrics: Optional[Dict[str, Any]] = None):
+                                 llm_only_pre_metrics: Optional[Dict[str, Any]] = None,
+                                 additional_baselines: Optional[Dict[str, Dict[str, Any]]] = None):
     """Create all result visualizations (confusion matrices + performance comparison + scatter plots)
     
     Args:
@@ -291,7 +329,8 @@ def create_result_visualizations(y_test: np.ndarray,
     plot_performance_comparison(ml_baseline_metrics, pre_metrics, post_metrics, 
                                 task_type=task_type, output_path=perf_plot_path,
                                 llm_only_pre=llm_only_pre_metrics,
-                                llm_only_post=llm_only_metrics)
+                                llm_only_post=llm_only_metrics,
+                                additional_baselines=additional_baselines)
     
     # Scatter plots for regression
     if task_type == "regression":
