@@ -1418,6 +1418,10 @@ def main() -> None:
 
     mechanisms_file = os.path.join(out_dir, f"mechanisms_iter_{best_iter}.txt")
     mechs = parse_mechanisms_file(mechanisms_file)
+    maicl_config.logger.info(f"  Parsed {len(mechs)} mechanism(s) from {mechanisms_file}")
+    for i, (mech_type, mech_text) in enumerate(mechs):
+        maicl_config.logger.info(f"    Mechanism {i+1}: type={mech_type}, length={len(mech_text)} chars")
+    
     if not mechs:
         # If best_iter is 0 and file doesn't exist, try to use iteration 1 as fallback
         if best_iter == 0:
@@ -1442,22 +1446,31 @@ def main() -> None:
     best_mech_val_metrics = None
     best_mech_rdkit_validation_report = None
 
-    for mech_type, mech_text in mechs:
+    for mech_idx, (mech_type, mech_text) in enumerate(mechs):
+        maicl_config.logger.info(f"  Evaluating mechanism {mech_idx+1}/{len(mechs)}: type={mech_type}, text_length={len(mech_text)}")
+        
         if mech_type.lower() not in ("llm", "known"):
+            maicl_config.logger.info(f"    Skipping: type '{mech_type}' not in ('llm', 'known')")
             continue
         
         # Extract formula
         formula = extract_formula_from_llm_mechanism(mech_text) or ""
         formula = _sanitize_formula_single_line(formula)
         
-        if not formula or _find_unsupported_descriptor_mentions(formula):
+        if not formula:
+            maicl_config.logger.warning(f"    Skipping: no formula extracted from mechanism text (first 200 chars: {mech_text[:200]})")
+            continue
+        
+        unsupported = _find_unsupported_descriptor_mentions(formula)
+        if unsupported:
+            maicl_config.logger.warning(f"    Skipping: unsupported descriptor mentions: {unsupported}")
             continue
         
         # ESOL-specific: Validate signs before evaluation (skip mechanisms with wrong signs)
         if str(args.dataset).lower() in ("esol", "delaney"):
             is_valid_signs, sign_error = _validate_esol_signs(formula, args.dataset)
             if not is_valid_signs:
-                maicl_config.logger.debug(f"  Skipping mechanism with sign violations: {sign_error}")
+                maicl_config.logger.warning(f"    Skipping mechanism with sign violations: {sign_error}")
                 continue
         
         # Extract expected effects from RDKitValidation block
@@ -1487,7 +1500,10 @@ def main() -> None:
         )
         
         if not evaluation.is_valid:
+            maicl_config.logger.warning(f"    Skipping: formula evaluation failed (is_valid=False). Formula: {formula[:100]}...")
             continue
+        
+        maicl_config.logger.info(f"    ✓ Mechanism passed all checks: R2={evaluation.r2:.4f}, MAE={evaluation.mae:.4f}, composite={evaluation.composite_score:.4f}")
         
         # Selection: prefer higher composite score; break ties via match_rate, then MAE
         val_mae = evaluation.mae if evaluation.mae is not None else float("inf")
@@ -1530,6 +1546,8 @@ def main() -> None:
             best_eval = evaluation
 
     if best_mech is None:
+        maicl_config.logger.error(f"  ✗ No usable mechanism selected after evaluating {len(mechs)} mechanism(s)")
+        maicl_config.logger.error(f"  All mechanisms were filtered out during validation checks.")
         raise SystemExit(
             f"MA-ICL trained, but no usable LLM mechanism could be selected from {mechanisms_file}"
         )

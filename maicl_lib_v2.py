@@ -1102,6 +1102,32 @@ class VariationalMechanismGenerator:
         # Describe features without exploding token usage on high-dimensional encodings (ECFP, gene-expression, etc.)
         n_features = int(getattr(X_sample, "shape", [0, 0])[1]) if hasattr(X_sample, "shape") and len(X_sample.shape) > 1 else 0
         feature_cols = self.feature_cols or [f"x{i}" for i in range(n_features)]
+        # Check if we have categorical features in X_original (e.g., SU dataset)
+        has_categorical_strings = False
+        categorical_feature_info = ""
+        if X_original_src is not None and len(X_original_src) > 0:
+            sample = X_original_src[0]
+            if isinstance(sample, dict):
+                # Check for categorical features that are strings (e.g., chemical, concentration_label)
+                categorical_features = [k for k in sample.keys() 
+                                      if k in feature_cols and isinstance(sample.get(k), str)
+                                      and k not in ['SMILES', 'SEQ', 'SUBSTRATES']]
+                if categorical_features:
+                    has_categorical_strings = True
+                    # Get unique values for each categorical feature
+                    unique_vals = {}
+                    for cat_feat in categorical_features[:3]:  # Limit to first 3 to avoid token explosion
+                        vals = set()
+                        for s in X_original_src[:min(50, len(X_original_src))]:  # Sample up to 50
+                            if isinstance(s, dict) and cat_feat in s:
+                                vals.add(str(s[cat_feat]))
+                        unique_vals[cat_feat] = sorted(list(vals))[:10]  # Limit to 10 unique values
+                    if unique_vals:
+                        cat_info_parts = []
+                        for cat_feat, vals in unique_vals.items():
+                            cat_info_parts.append(f"{cat_feat} (values: {', '.join(vals)}{'...' if len(vals) == 10 else ''})")
+                        categorical_feature_info = f"\n\nCRITICAL: This dataset has categorical features that are label-encoded: {', '.join(cat_info_parts)}. The feature names (e.g., 'chemical', 'concentration_label') contain NUMERIC encoded values (0, 1, 2, ...) for use in mathematical formulas. For conditional logic, you can also use the original string values via the '_name' suffix (e.g., 'chemical_name' contains the original string like \"DMSO\", \"PFOS\"). Use the numeric encoded values (e.g., 'chemical') for arithmetic operations in formulas."
+        
         if is_deepchem and has_smiles:
             features_desc = "SMILES strings (molecular structures) - ML model uses ECFP fingerprints internally"
             deepchem_note = "\n\nCRITICAL: This is a DeepChem molecular dataset. The LLM mechanism MUST work with SMILES strings and molecular properties (molecular_weight, num_rings, num_hydroxyl_groups, etc.), NOT ECFP bit features (ecfp_bit_0, ecfp_bit_1, etc.)."
@@ -1113,7 +1139,7 @@ class VariationalMechanismGenerator:
                 features_desc = f"{shown}{more}"
             else:
                 features_desc = "features"
-            deepchem_note = ""
+            deepchem_note = categorical_feature_info if has_categorical_strings else ""
 
         def _truncate(v: Any, max_len: int = 140) -> str:
             try:
@@ -1293,19 +1319,24 @@ class VariationalMechanismGenerator:
                     
                     for rank, idx in enumerate(top_5_idx, 1):
                         if idx < len(X_train) and idx < len(y_train):
-                            # Use SMILES string if available, otherwise fall back to feature names
+                            # Use X_original if available (includes RDKit features for enzyme datasets, SMILES for DeepChem)
                             if X_original is not None and idx < len(X_original):
                                 original_feat = X_original[idx]
                                 if isinstance(original_feat, dict):
-                                    # Extract SMILES or other original features
+                                    # For DeepChem: show SMILES
                                     if 'SMILES' in original_feat:
                                         feat_display = f"SMILES={original_feat['SMILES']}"
-                                    elif 'SUBSTRATES' in original_feat:
-                                        feat_display = f"SUBSTRATES={original_feat['SUBSTRATES']}"
                                     else:
-                                        # Use first few key-value pairs
-                                        key_vals = list(original_feat.items())[:MAX_FEATURES_IN_COMPONENT_LIST]
-                                        feat_display = ', '.join([f"{k}={v}" for k, v in key_vals])
+                                        # For enzyme datasets: show numerical features including RDKit
+                                        # Filter out text fields and show numerical features
+                                        num_feats = {k: v for k, v in original_feat.items() 
+                                                   if k not in ['SEQ', 'SUBSTRATES', 'SMILES'] and isinstance(v, (int, float))}
+                                        # Prioritize showing RDKit features along with regular features
+                                        rdkit_feats = {k: v for k, v in num_feats.items() if k.startswith('rdkit_')}
+                                        other_feats = {k: v for k, v in num_feats.items() if not k.startswith('rdkit_')}
+                                        # Combine: show some regular features + RDKit features
+                                        all_feats = dict(list(other_feats.items())[:MAX_FEATURES_IN_COMPONENT_LIST-3] + list(rdkit_feats.items())[:3])
+                                        feat_display = ', '.join([f"{k}={v:.2f}" for k, v in all_feats.items()])
                                 else:
                                     feat_display = f"original_feat={str(original_feat)[:MAX_FEATURE_DISPLAY_LENGTH]}"
                             else:
@@ -1742,7 +1773,22 @@ class TrainableMAICL:
         # Get scale range (for target/output range) to pass to TextGrad.
         # IMPORTANT: when use_scaling=False, do NOT inject any scaling range into prompts.
         if use_scaling:
-            scale_min, scale_max = self._scaled_range_from(y_scaler) if y_scaler is not None else (SCALE_MIN, SCALE_MAX)
+            # Helper function to get scaled range (can't use static method during __init__)
+            def _get_scaled_range(scaler):
+                if scaler is not None:
+                    # Check for feature_range (without underscore) first - used by MinMaxScaler010
+                    if hasattr(scaler, "feature_range"):
+                        feature_range = scaler.feature_range
+                        if hasattr(feature_range, '__iter__') and not isinstance(feature_range, str):
+                            return tuple(float(x) for x in feature_range)
+                        else:
+                            return (float(feature_range), float(feature_range))
+                    # Check for feature_range_ (with underscore) - used by sklearn MinMaxScaler
+                    elif hasattr(scaler, "feature_range_"):
+                        return tuple(float(x) for x in scaler.feature_range_)
+                return (SCALE_MIN, SCALE_MAX)  # fallback
+            
+            scale_min, scale_max = _get_scaled_range(y_scaler) if y_scaler is not None else (SCALE_MIN, SCALE_MAX)
         else:
             scale_min, scale_max = None, None
         self.textgrad = TextGrad(
@@ -1790,6 +1836,22 @@ class TrainableMAICL:
         logger.info(f"  Initialized MA-ICL with {len(self.mechanisms)} mechanisms:")
         logger.info(f"    • {len([t for t in self.mechanism_types if t == 'llm'])} LLM mechanisms")
         logger.info(f"    • {len([t for t in self.mechanism_types if t == 'ml'])} ML mechanism(s)")
+    
+    @staticmethod
+    def _scaled_range_from_static(scaler):
+        """Get the actual scaling range from scaler or use defaults (static method)"""
+        if scaler is not None:
+            # Check for feature_range (without underscore) first - used by MinMaxScaler010
+            if hasattr(scaler, "feature_range"):
+                feature_range = scaler.feature_range
+                if hasattr(feature_range, '__iter__') and not isinstance(feature_range, str):
+                    return tuple(float(x) for x in feature_range)
+                else:
+                    return (float(feature_range), float(feature_range))
+            # Check for feature_range_ (with underscore) - used by sklearn MinMaxScaler
+            elif hasattr(scaler, "feature_range_"):
+                return tuple(float(x) for x in scaler.feature_range_)
+        return (SCALE_MIN, SCALE_MAX)  # fallback
     
     def train_ml_mechanism(self, X_train: np.ndarray, y_train: np.ndarray, y_scaler: Any = None):
         """Train the ML mechanism"""
@@ -3398,14 +3460,32 @@ class TrainableMAICL:
                                      self.X_train_original is not None and len(self.X_train_original) > 0 and
                                      isinstance(self.X_train_original[0], dict) and 'SMILES' in self.X_train_original[0])
                         
+                        # Check if we have X_train_original with feature dictionaries (for enzyme datasets with RDKit features)
+                        use_original_features = (hasattr(self, 'X_train_original') and 
+                                                self.X_train_original is not None and len(self.X_train_original) > 0 and
+                                                isinstance(self.X_train_original[0], dict))
+                        
                         feature_names = self.feature_cols if self.feature_cols else [f"x{j}" for j in range(X_train.shape[1])]
                         logger.info(f"  [Residual Samples] Showing top {min(MAX_WORST_RESIDUAL_SAMPLES, len(worst_idx))} worst ML residuals (what LLM sees):")
                         for rank, idx in enumerate(worst_idx[:MAX_WORST_RESIDUAL_SAMPLES], 1):
-                            # Use SMILES strings for DeepChem datasets, otherwise use feature values
-                            if use_smiles and idx < len(self.X_train_original):
+                            # Use X_train_original if available (includes RDKit features for enzyme datasets, SMILES for DeepChem)
+                            if use_original_features and idx < len(self.X_train_original):
                                 original_feat = self.X_train_original[idx]
-                                if isinstance(original_feat, dict) and 'SMILES' in original_feat:
-                                    key_feats = f"SMILES={original_feat['SMILES']}"
+                                if isinstance(original_feat, dict):
+                                    if use_smiles and 'SMILES' in original_feat:
+                                        # DeepChem: show SMILES
+                                        key_feats = f"SMILES={original_feat['SMILES']}"
+                                    else:
+                                        # Enzyme datasets: show all features including RDKit
+                                        # Filter out text fields (SEQ, SUBSTRATES) and show numerical features
+                                        num_feats = {k: v for k, v in original_feat.items() 
+                                                   if k not in ['SEQ', 'SUBSTRATES', 'SMILES'] and isinstance(v, (int, float))}
+                                        # Show top features (prioritize RDKit features if present)
+                                        rdkit_feats = {k: v for k, v in num_feats.items() if k.startswith('rdkit_')}
+                                        other_feats = {k: v for k, v in num_feats.items() if not k.startswith('rdkit_')}
+                                        # Combine: show some regular features + RDKit features
+                                        all_feats = dict(list(other_feats.items())[:MAX_FEATURES_IN_EXAMPLE-3] + list(rdkit_feats.items())[:3])
+                                        key_feats = ', '.join([f"{k}={v:.2f}" for k, v in all_feats.items()])
                                 else:
                                     # Fallback to feature values
                                     feat_vals = {feature_names[j]: float(X_train[idx, j]) for j in range(min(len(feature_names), X_train.shape[1]))}
@@ -3463,14 +3543,32 @@ class TrainableMAICL:
                                          self.X_train_original is not None and len(self.X_train_original) > 0 and
                                          isinstance(self.X_train_original[0], dict) and 'SMILES' in self.X_train_original[0])
                             
+                            # Check if we have X_train_original with feature dictionaries (for enzyme datasets with RDKit features)
+                            use_original_features = (hasattr(self, 'X_train_original') and 
+                                                    self.X_train_original is not None and len(self.X_train_original) > 0 and
+                                                    isinstance(self.X_train_original[0], dict))
+                            
                             feature_names = self.feature_cols if self.feature_cols else [f"x{j}" for j in range(X_train.shape[1])]
                             logger.info(f"  [Training Samples] Showing {len(sample_indices)} training samples (ML disabled, no residuals available):")
                             for rank, idx in enumerate(sample_indices, 1):
-                                # Use SMILES strings for DeepChem datasets, otherwise use feature values
-                                if use_smiles and idx < len(self.X_train_original):
+                                # Use X_train_original if available (includes RDKit features for enzyme datasets, SMILES for DeepChem)
+                                if use_original_features and idx < len(self.X_train_original):
                                     original_feat = self.X_train_original[idx]
-                                    if isinstance(original_feat, dict) and 'SMILES' in original_feat:
-                                        key_feats = f"SMILES={original_feat['SMILES']}"
+                                    if isinstance(original_feat, dict):
+                                        if use_smiles and 'SMILES' in original_feat:
+                                            # DeepChem: show SMILES
+                                            key_feats = f"SMILES={original_feat['SMILES']}"
+                                        else:
+                                            # Enzyme datasets: show all features including RDKit
+                                            # Filter out text fields (SEQ, SUBSTRATES) and show numerical features
+                                            num_feats = {k: v for k, v in original_feat.items() 
+                                                       if k not in ['SEQ', 'SUBSTRATES', 'SMILES'] and isinstance(v, (int, float))}
+                                            # Show top features (prioritize RDKit features if present)
+                                            rdkit_feats = {k: v for k, v in num_feats.items() if k.startswith('rdkit_')}
+                                            other_feats = {k: v for k, v in num_feats.items() if not k.startswith('rdkit_')}
+                                            # Combine: show some regular features + RDKit features
+                                            all_feats = dict(list(other_feats.items())[:MAX_FEATURES_IN_EXAMPLE-3] + list(rdkit_feats.items())[:3])
+                                            key_feats = ', '.join([f"{k}={v:.2f}" for k, v in all_feats.items()])
                                     else:
                                         # Fallback to feature values
                                         feat_vals = {feature_names[j]: float(X_train[idx, j]) for j in range(min(len(feature_names), X_train.shape[1]))}
@@ -3658,21 +3756,47 @@ class TrainableMAICL:
                     mae_improved_vs_current = (new_mae is not None and current_mae is not None and new_mae < current_mae)
                     
                     # Accept if metrics improve significantly (primary criterion)
-                    metric_improvement_threshold_r2 = 0.005  # Require at least 0.005 improvement in R2
-                    metric_improvement_threshold_mae = 0.005  # Require at least 0.005 improvement in MAE
+                    # Make threshold more lenient to allow exploration and learning
+                    # Lower threshold from 0.005 to 0.001 to allow smaller improvements
+                    try:
+                        from maicl_config import get_metric_improvement_threshold
+                        metric_improvement_threshold_r2 = get_metric_improvement_threshold('regression', 'r2', level='primary')
+                        metric_improvement_threshold_mae = get_metric_improvement_threshold('regression', 'mae', level='primary')
+                        # Override with more lenient threshold for exploration
+                        metric_improvement_threshold_r2 = min(metric_improvement_threshold_r2, 0.001)  # More lenient: max 0.001
+                        metric_improvement_threshold_mae = min(metric_improvement_threshold_mae, 0.001)  # More lenient: max 0.001
+                    except:
+                        metric_improvement_threshold_r2 = 0.001  # More lenient: 0.001 instead of 0.005
+                        metric_improvement_threshold_mae = 0.001  # More lenient: 0.001 instead of 0.005
                     
                     r2_improvement_vs_best_val = (new_r2 - best_r2) if (new_r2 is not None and best_r2 is not None) else 0.0
                     mae_improvement_vs_best_val = (best_mae - new_mae) if (best_mae is not None and new_mae is not None) else 0.0
                     
-                    # Accept ONLY if metrics improve vs best-seen
-                    if r2_improvement_vs_best_val >= metric_improvement_threshold_r2 or mae_improvement_vs_best_val >= metric_improvement_threshold_mae:
+                    # Also allow small degradations for exploration (up to 0.01 degradation)
+                    # This helps the LLM learn from mistakes and explore different mechanisms
+                    max_r2_degradation = 0.01  # Allow up to 0.01 degradation for exploration
+                    max_mae_degradation = 0.01  # Allow up to 0.01 degradation for exploration
+                    
+                    # Accept if metrics improve vs best-seen OR if degradation is small (exploration)
+                    r2_degradation = -r2_improvement_vs_best_val if r2_improvement_vs_best_val < 0 else 0.0
+                    mae_degradation = -mae_improvement_vs_best_val if mae_improvement_vs_best_val < 0 else 0.0
+                    
+                    # Primary: accept if metrics improve
+                    # Secondary: accept if degradation is small (allows exploration)
+                    if (r2_improvement_vs_best_val >= metric_improvement_threshold_r2 or mae_improvement_vs_best_val >= metric_improvement_threshold_mae) or \
+                       (r2_degradation <= max_r2_degradation and mae_degradation <= max_mae_degradation and 
+                        (r2_improvement_vs_best_val > -0.02 or mae_improvement_vs_best_val > -0.02)):  # Allow small exploration
                         accept = True
                         if r2_improvement_vs_best_val >= metric_improvement_threshold_r2 and mae_improvement_vs_best_val >= metric_improvement_threshold_mae:
                             reason = f"Metrics improved vs best (R2: {best_r2:.4f} → {new_r2:.4f} (+{r2_improvement_vs_best_val:.4f}), MAE: {best_mae:.4f} → {new_mae:.4f} (-{mae_improvement_vs_best_val:.4f}))"
                         elif r2_improvement_vs_best_val >= metric_improvement_threshold_r2:
                             reason = f"R2 improved vs best (R2: {best_r2:.4f} → {new_r2:.4f} (+{r2_improvement_vs_best_val:.4f}))"
-                        else:
+                        elif mae_improvement_vs_best_val >= metric_improvement_threshold_mae:
                             reason = f"MAE improved vs best (MAE: {best_mae:.4f} → {new_mae:.4f} (-{mae_improvement_vs_best_val:.4f}))"
+                        elif r2_degradation <= max_r2_degradation and mae_degradation <= max_mae_degradation:
+                            reason = f"Accepted for exploration (small degradation: R2 {best_r2:.4f} → {new_r2:.4f} ({r2_improvement_vs_best_val:+.4f}), MAE {best_mae:.4f} → {new_mae:.4f} ({mae_improvement_vs_best_val:+.4f}))"
+                        else:
+                            reason = f"Accepted (R2: {best_r2:.4f} → {new_r2:.4f} ({r2_improvement_vs_best_val:+.4f}), MAE: {best_mae:.4f} → {new_mae:.4f} ({mae_improvement_vs_best_val:+.4f}))"
                     else:
                         accept = False
                         reason = f"Rejected: no metric improvement vs best (R2: {best_r2:.4f} → {new_r2:.4f} ({r2_improvement_vs_best_val:+.4f}), MAE: {best_mae:.4f} → {new_mae:.4f} ({mae_improvement_vs_best_val:+.4f}))"

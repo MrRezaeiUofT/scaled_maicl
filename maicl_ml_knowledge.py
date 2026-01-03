@@ -733,6 +733,10 @@ def analyze_ml_failure_patterns(ml_mechanism,
     try:
         model = ml_mechanism.model
         
+        # Check if model is None (can happen even if is_trained is True)
+        if model is None:
+            return analysis
+        
         # Get predictions and compute errors
         if task_type == "classification":
             y_pred = model.predict(X).astype(int)

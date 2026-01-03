@@ -173,7 +173,7 @@ class MLModelMechanism:
                     allow_auto_download=True, verbose=False
                 )
             except Exception as e:
-                raise RuntimeError("Baticl initialization failed. Try using --ml_mech logreg or --ml_mech xgboost instead.") from e
+                raise RuntimeError("Baticl initialization failed.") from e
         elif self.model_name == "EBM":
             if not _HAS_EBM:
                 raise RuntimeError("EBM (Explainable Boosting Machine) not installed. Install with: pip install interpret")
@@ -308,7 +308,7 @@ class MLModelMechanism:
                     except subprocess.TimeoutExpired:
                         raise RuntimeError("TabPFN training subprocess timed out (>10 minutes)")
                     except Exception as e:
-                        raise RuntimeError(f"TabPFN training via subprocess failed: {e}. Try using --ml_mech linear or --ml_mech xgboost instead.") from e
+                        raise RuntimeError(f"TabPFN training via subprocess failed: {e}") from e
                 else:
                     self.model.fit(X_train, y_train)
             finally:
@@ -320,7 +320,6 @@ class MLModelMechanism:
                 raise RuntimeError(
                     f"{self.model_name} training failed. This may be due to a segmentation fault "
                     f"(which cannot be caught in Python) or other system-level issues. "
-                    f"Try using --ml_mech linear or --ml_mech xgboost instead. "
                     f"Original error: {e}"
                 ) from e
             raise
@@ -336,7 +335,7 @@ class MLModelMechanism:
                 self._class_order = sorted(unique_train.tolist())
                 self._class_to_idx = {c: i for i, c in enumerate(self._class_order)}
                 logger.info(f"  [ClassMap] Built class mapping for TabPFN (subprocess): {len(self._class_order)} classes")
-            elif self.model_name != "TabICL" and not hasattr(self.model, "predict_proba"):
+            elif self.model_name not in ["TabICL"] and not hasattr(self.model, "predict_proba"):
                 try:
                     from sklearn.calibration import CalibratedClassifierCV
                     n_classes = len(np.unique(y_train))
@@ -623,7 +622,9 @@ class MLModelMechanism:
             "TabICL": "ML Mechanism (TabICL): Tabular in-context learning baseline using transformer architecture",
             "Baticl": "ML Mechanism (Baticl): Tabular in-context learning baseline using transformer architecture",
             "KNN": "ML Mechanism (KNN): K-nearest neighbors classifier using distance-based similarity",
-            "KernelRidge": "ML Mechanism (KernelRidge): Kernel-based ridge regression with RBF kernel"
+            "KernelRidge": "ML Mechanism (KernelRidge): Kernel-based ridge regression with RBF kernel",
+            "EBM": "ML Mechanism (EBM): Explainable Boosting Machine with additive feature interactions",
+            "TabPFN": "ML Mechanism (TabPFN): Prior-data Fitted Networks for tabular data"
         }
         
         base_desc = base_descriptions.get(self.model_name, f"ML Mechanism ({self.model_name}): Data-driven baseline")

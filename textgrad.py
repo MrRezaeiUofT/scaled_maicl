@@ -361,13 +361,30 @@ FEATURES MOST CORRELATED WITH ML ERRORS (focus on these):
             use_smiles = (is_deepchem and X_train_original is not None and len(X_train_original) > 0 and
                          isinstance(X_train_original[0], dict) and 'SMILES' in X_train_original[0])
             
+            # Check if we have X_train_original with feature dictionaries (for enzyme datasets with RDKit features)
+            use_original_features = (X_train_original is not None and len(X_train_original) > 0 and
+                                    isinstance(X_train_original[0], dict))
+            
             feature_names = self.feature_cols if self.feature_cols else [f"x{j}" for j in range(X_train.shape[1])]
             for idx in worst_idx:
-                # Use SMILES strings for DeepChem datasets, otherwise use feature values
-                if use_smiles and idx < len(X_train_original):
+                # Use X_train_original if available (includes RDKit features for enzyme datasets, SMILES for DeepChem)
+                if use_original_features and idx < len(X_train_original):
                     original_feat = X_train_original[idx]
-                    if isinstance(original_feat, dict) and 'SMILES' in original_feat:
-                        key_feats = [f"SMILES={original_feat['SMILES']}"]
+                    if isinstance(original_feat, dict):
+                        if use_smiles and 'SMILES' in original_feat:
+                            # DeepChem: show SMILES
+                            key_feats = [f"SMILES={original_feat['SMILES']}"]
+                        else:
+                            # Enzyme datasets: show all features including RDKit
+                            # Filter out text fields (SEQ, SUBSTRATES) and show numerical features
+                            num_feats = {k: v for k, v in original_feat.items() 
+                                       if k not in ['SEQ', 'SUBSTRATES', 'SMILES'] and isinstance(v, (int, float))}
+                            # Show top features (prioritize RDKit features if present)
+                            rdkit_feats = {k: v for k, v in num_feats.items() if k.startswith('rdkit_')}
+                            other_feats = {k: v for k, v in num_feats.items() if not k.startswith('rdkit_')}
+                            # Combine: show some regular features + RDKit features
+                            all_feats = dict(list(other_feats.items())[:MAX_FEATURES_IN_EXAMPLE-3] + list(rdkit_feats.items())[:3])
+                            key_feats = [f"{k}={v:.2f}" for k, v in all_feats.items()]
                     else:
                         # Fallback to feature values
                         feat_vals = {feature_names[j]: float(X_train[idx, j]) 

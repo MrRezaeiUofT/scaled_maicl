@@ -366,16 +366,28 @@ def load_openml_classification(dataset_name: str, max_samples: int):
 
 
 def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="classification", 
-                                 feature_cols=None, y_scaler=None, no_scaling=False):
-    """Compute additional baseline models: TabPFN, EBM, and SHAP-based model
+                                 feature_cols=None, y_scaler=None, no_scaling=False,
+                                 baseline_models=None):
+    """Compute additional baseline models: TabPFN, EBM, SHAP-based model
+    
+    Args:
+        baseline_models: List of baseline model names to compute. If None, compute all available.
+                        Options: 'tabpfn', 'ebm', 'shap'
     
     Returns:
         Dict with baseline metrics for each model
     """
     baselines = {}
     
+    # Default: compute all baselines if not specified
+    if baseline_models is None:
+        baseline_models = ['tabpfn', 'ebm', 'shap']
+    else:
+        # Normalize to lowercase
+        baseline_models = [m.lower() for m in baseline_models]
+    
     # TabPFN baseline (runs in subprocess to avoid segmentation faults)
-    if _HAS_TABPFN and task_type == "classification":
+    if 'tabpfn' in baseline_models and _HAS_TABPFN and task_type == "classification":
         try:
             logger.info("Computing TabPFN baseline...")
             logger.info("  ℹ️  Note: TabPFN runs in isolated subprocess to avoid crashes")
@@ -460,7 +472,7 @@ def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="cl
                 logger.warning("  TabPFN model weights may not be downloaded. Visit https://huggingface.co/Prior-Labs/tabpfn_2_5 to accept license and run 'hf auth login'")
     
     # EBM baseline
-    if _HAS_EBM:
+    if 'ebm' in baseline_models and _HAS_EBM:
         try:
             logger.info("Computing EBM baseline...")
             # Suppress verbose EBM logs
@@ -508,7 +520,7 @@ def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="cl
             logger.warning(f"Failed to compute EBM baseline: {e}")
     
     # SHAP-based baseline (using XGBoost with SHAP feature selection)
-    if _HAS_SHAP and _HAS_XGB:
+    if 'shap' in baseline_models and _HAS_SHAP and _HAS_XGB:
         try:
             logger.info("Computing SHAP-based baseline...")
             if task_type == "regression":
@@ -1221,9 +1233,364 @@ def load_deepchem_classification_dataset(dataset_name: str, max_samples: int):
             raise RuntimeError(f"DeepChem dataset '{dataset_name}' not available: {e}")
 
 
+def run_fold_pipeline_classification(
+    X_train, X_val, X_test, y_train, y_val, y_test,
+    X_original_train, X_original_val, X_original_test,
+    feature_cols, class_names, feature_encoders,
+    args, llm, ds_name, ds_label, fold_output_dir, fold_num
+):
+    """
+    Run the complete training and evaluation pipeline for a single fold.
+    Returns a dictionary with all metrics and results.
+    
+    This function contains the core training/evaluation logic extracted from main().
+    It's called once per fold during cross-validation.
+    """
+    import json
+    # Import here to avoid circular dependencies
+    from sklearn.metrics import accuracy_score, f1_score
+    from collections import Counter
+    
+    logger.info(f"Running fold {fold_num} pipeline...")
+    logger.info(f"  Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
+    
+    # Set output directory for this fold (temporarily override global OUTPUT_DIR)
+    original_output_dir = OUTPUT_DIR
+    set_output_dir(fold_output_dir)
+    
+    try:
+        # Conditionally scale features based on --no_scaling flag
+        if not args.no_scaling:
+            scaler = MinMaxScaler010()
+            X_train_s = scaler.fit_transform(X_train)
+            X_val_s = scaler.transform(X_val)
+            X_test_s = scaler.transform(X_test)
+            validate_scaled_data(X_train_s, feature_cols, scaler=scaler)
+            logger.info(f"Features scaled to [{SCALE_MIN}, {SCALE_MAX}] range")
+        else:
+            scaler = None
+            X_train_s, X_val_s, X_test_s = X_train, X_val, X_test
+        
+        mech_map = {"logreg": "LogisticRegression", "xgboost": "XGBoost", "tabicl": "TabICL", "ebm": "EBM", "tabpfn": "TabPFN"}
+        model_name = mech_map.get(args.ml_mech.lower(), "LogisticRegression")
+        
+        pretrained_ml = MLModelMechanism(model_name, task_type="classification")
+        pretrained_ml.train(X_train_s, y_train, feature_cols, y_scaler=None)
+        pretrained_ml._maicl_feature_cols = feature_cols
+        pretrained_ml._maicl_feature_encoders = feature_encoders
+        pretrained_ml._maicl_scaler = scaler
+        
+        sorted_idx, residuals, ml_preds, ml_proba = compute_ml_residuals(
+            pretrained_ml, X_train_s, y_train, feature_cols, class_names, task_type="classification"
+        )
+        
+        def _select_topk_residual_balanced_classification(X_tr_s, y_tr_s, residual_vec, k, class_names_list=None, ml_predictions=None):
+            """Select top-K residuals with balanced class coverage for classification."""
+            if k <= 0 or k >= len(y_tr_s):
+                return X_tr_s, y_tr_s, np.arange(len(y_tr_s))
+            unique_classes = np.unique(y_tr_s)
+            if len(unique_classes) < 2:
+                if len(unique_classes) == 1:
+                    idxs = np.argsort(residual_vec)[::-1][:min(k, len(y_tr_s))]
+                    return X_tr_s[idxs], y_tr_s[idxs], idxs
+                return X_tr_s, y_tr_s, np.arange(len(y_tr_s))
+            
+            idxs = []
+            class_counts = {c: np.sum(y_tr_s == c) for c in unique_classes}
+            total_samples = len(y_tr_s)
+            n_classes = len(unique_classes)
+            min_per_class = 1 if k >= n_classes else 0
+            proportions = {c: count / total_samples for c, count in class_counts.items()}
+            allocated = {c: max(min_per_class, int(round(k * proportions[c]))) for c in unique_classes}
+            
+            total_alloc = sum(allocated.values())
+            while total_alloc > k:
+                cmax = max(allocated, key=lambda c: allocated[c])
+                if allocated[cmax] > min_per_class:
+                    allocated[cmax] -= 1
+                    total_alloc -= 1
+                else:
+                    break
+            while total_alloc < k and total_alloc < total_samples:
+                cmin = min(allocated, key=lambda c: allocated[c])
+                allocated[cmin] += 1
+                total_alloc += 1
+            
+            for c in unique_classes:
+                class_idx = np.where(y_tr_s == c)[0]
+                if len(class_idx) == 0:
+                    continue
+                take = min(allocated[c], len(class_idx))
+                top_in_class = class_idx[np.argsort(residual_vec[class_idx])[::-1][:take]]
+                idxs.extend(top_in_class.tolist())
+            idxs = np.array(sorted(set(idxs)))
+            return X_tr_s[idxs], y_tr_s[idxs], idxs
+        
+        # Select top-K samples
+        if args.top_k == -1:
+            X_topk, y_topk, top_indices = X_train_s, y_train, np.arange(len(X_train_s))
+            X_original_topk = X_original_train
+        else:
+            if args.topk_strategy == "residual_balanced":
+                X_topk, y_topk, top_indices = _select_topk_residual_balanced_classification(
+                    X_train_s, y_train, residuals, args.top_k, class_names_list=class_names, ml_predictions=ml_preds
+                )
+            else:
+                X_topk, y_topk, top_indices = get_top_k_residual_samples(
+                    sorted_idx, residuals, X_train_s, y_train, args.top_k,
+                    ml_predictions=ml_preds, task_type="classification"
+                )
+            if len(top_indices) == 0:
+                X_topk, y_topk, top_indices = X_train_s, y_train, np.arange(len(X_train_s))
+                X_original_topk = X_original_train
+            else:
+                X_original_topk = [X_original_train[i] for i in top_indices]
+        
+        # Compute residuals on top-K subset
+        if args.top_k != -1:
+            sorted_idx, residuals_topk, ml_preds, ml_proba = compute_ml_residuals(
+                pretrained_ml, X_topk, y_topk, feature_cols, class_names, task_type="classification"
+            )
+        else:
+            residuals_topk = residuals
+        
+        # Compute ML baseline on test set
+        ml_baseline_metrics = {}
+        try:
+            is_multiclass = class_names is not None and len(class_names) > 2
+            model = pretrained_ml.model
+            if model_name == "TabPFN":
+                import subprocess, tempfile, sys, json, pandas as pd
+                from pathlib import Path
+                temp_dir = Path(tempfile.mkdtemp(prefix="tabpfn_ml_baseline_test_"))
+                X_test_df = pd.DataFrame(X_test_s, columns=feature_cols)
+                X_test_path = temp_dir / "X_test.csv"
+                output_path = temp_dir / "pred_result_test.json"
+                X_test_df.to_csv(X_test_path, index=False)
+                script_path = Path(__file__).parent / "run_tabpfn_ml_mechanism.py"
+                result = subprocess.run(
+                    [sys.executable, str(script_path), "predict",
+                     pretrained_ml._tabpfn_training_data_path['X_train_path'],
+                     pretrained_ml._tabpfn_training_data_path['y_train_path'],
+                     str(X_test_path), pretrained_ml.task_type, str(output_path)],
+                    capture_output=True, text=True, timeout=600
+                )
+                if result.returncode == 0 and output_path.exists():
+                    with open(output_path, 'r') as f:
+                        pred_result = json.load(f)
+                    if pred_result.get('success', False):
+                        y_pred_cls = np.array(pred_result['predictions'], dtype=int)
+                    else:
+                        raise RuntimeError(f"TabPFN failed: {pred_result.get('error', 'Unknown error')}")
+                else:
+                    raise RuntimeError("TabPFN subprocess failed")
+                try:
+                    import shutil
+                    shutil.rmtree(temp_dir)
+                except:
+                    pass
+            elif model_name == "TabICL":
+                import pandas as pd
+                X_test_df = pd.DataFrame(X_test_s, columns=feature_cols)
+                y_pred_cls = model.predict(X_test_df).astype(int)
+            else:
+                if is_multiclass:
+                    y_pred_cls = model.predict(X_test_s).astype(int)
+                else:
+                    y_pred_cls = None
+            
+            if is_multiclass:
+                acc = accuracy_score(y_test, y_pred_cls)
+                f1 = f1_score(y_test, y_pred_cls, average='weighted', zero_division=0)
+                ml_baseline_metrics = {"accuracy": acc, "f1": f1, "predictions": y_pred_cls.tolist()}
+            else:
+                if model_name in ["TabPFN", "TabICL"]:
+                    if hasattr(model, "predict_proba") and model_name != "TabPFN":
+                        y_prob = model.predict_proba(X_test_df)[:, 1]
+                    else:
+                        y_pred_binary = y_pred_cls.astype(float)
+                        y_prob = np.where(y_pred_binary == 1, 0.7, 0.3)
+                else:
+                    if hasattr(model, "predict_proba"):
+                        y_prob = model.predict_proba(X_test_s)[:, 1]
+                    else:
+                        y_prob = model.predict(X_test_s).astype(float)
+                y_prob = np.clip(y_prob, 0.0, 1.0)
+                y_pred_05 = (y_prob >= 0.5).astype(int)
+                acc_05 = accuracy_score(y_test, y_pred_05)
+                f1_05 = f1_score(y_test, y_pred_05, zero_division=0)
+                thr_opt = find_optimal_threshold(y_test, y_prob, metric='f1')
+                y_pred_opt = (y_prob >= thr_opt).astype(int)
+                acc_opt = accuracy_score(y_test, y_pred_opt)
+                f1_opt = f1_score(y_test, y_pred_opt, zero_division=0)
+                ml_baseline_metrics = {
+                    "accuracy": acc_opt, "f1": f1_opt, "threshold_opt": float(thr_opt),
+                    "acc@0.5": acc_05, "f1@0.5": f1_05, "predictions": y_pred_opt.tolist()
+                }
+        except Exception as e:
+            logger.warning(f"Failed to compute ML baseline metrics: {e}")
+        
+        # Create and train MA-ICL
+        maicl = TrainableMAICL(
+            llm, feature_cols, scaler,
+            use_ml_mechanism=bool(args.use_ml),
+            dataset_name=ds_name,
+            y_scaler=None,
+            pretrained_ml_mechanism=pretrained_ml,
+            data_insights=None,
+            task_type="classification",
+            class_names=class_names,
+            classification_loss_metric=args.classification_loss,
+            num_mechanisms_unknown=args.num_mechanisms_unknown,
+            use_scaling=not args.no_scaling
+        )
+        if ml_baseline_metrics:
+            try:
+                maicl.set_ml_baseline_performance(ml_baseline_metrics)
+            except Exception:
+                pass
+        
+        # Pre-training evaluation
+        pre = maicl.evaluate(
+            X_test_s, y_test, X_train_s, y_train,
+            return_details=True, relax_routing=bool(args.relax_eval),
+            X_original=X_original_test, X_pool_original=X_original_train,
+        )
+        pre_acc = float(pre.get('accuracy', 0.0))
+        pre_f1 = float(pre.get('f1', 0.0))
+        pre_loss = float(pre.get('loss', 1.0))
+        
+        # Train MA-ICL
+        maicl.train(
+            X_topk, y_topk, X_val_s, y_val,
+            iterations=args.iterations,
+            ml_residuals=residuals_topk,
+            accept_eval_max=None,
+            X_test=X_test_s, y_test=y_test,
+            acceptance_set=args.acceptance_set,
+            X_train_original=X_original_topk,
+            X_val_original=X_original_val,
+            X_test_original=X_original_test,
+            output_dir=fold_output_dir,
+        )
+        
+        # Post-training evaluation
+        post = maicl.evaluate(
+            X_test_s, y_test, X_train_s, y_train,
+            return_details=True, relax_routing=True,
+            preserve_mechanism_performance=True,
+            X_original=X_original_test, X_pool_original=X_original_train,
+        )
+        post_acc = float(post.get('accuracy', 0.0))
+        post_f1 = float(post.get('f1', 0.0))
+        post_loss = float(post.get('loss', 1.0))
+        
+        # LLM-only evaluation
+        llm_only_metrics = None
+        try:
+            llm_only_metrics = maicl.evaluate_llm_only(
+                X_test_s, y_test, X_train_s, y_train,
+                return_details=True,
+                X_original=X_original_test, X_pool_original=X_original_train,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to evaluate LLM-only: {e}")
+        
+        # Save fold results
+        fold_result = {
+            'fold_num': fold_num,
+            'n_train': len(X_train_s),
+            'n_val': len(X_val_s),
+            'n_test': len(X_test_s),
+            'ml_baseline_accuracy': ml_baseline_metrics.get('accuracy', 0.0),
+            'ml_baseline_f1': ml_baseline_metrics.get('f1', 0.0),
+            'pre_accuracy': pre_acc,
+            'pre_f1': pre_f1,
+            'pre_loss': pre_loss,
+            'post_accuracy': post_acc,
+            'post_f1': post_f1,
+            'post_loss': post_loss,
+        }
+        
+        if llm_only_metrics:
+            fold_result['llm_only_pre_accuracy'] = float(llm_only_metrics.get('accuracy', 0.0))
+            fold_result['llm_only_pre_f1'] = float(llm_only_metrics.get('f1', 0.0))
+            fold_result['llm_only_post_accuracy'] = float(llm_only_metrics.get('accuracy', 0.0))
+            fold_result['llm_only_post_f1'] = float(llm_only_metrics.get('f1', 0.0))
+        
+        # Save fold-specific results file
+        fold_results_file = os.path.join(fold_output_dir, "fold_results.json")
+        with open(fold_results_file, 'w') as f:
+            json.dump(fold_result, f, indent=2)
+        
+        logger.info(f"Fold {fold_num} complete: ACC={post_acc:.4f}, F1={post_f1:.4f}")
+        
+        return fold_result
+        
+    finally:
+        # Restore original output directory
+        set_output_dir(original_output_dir)
+
+
+def save_cv_summary_classification(cv_results, output_dir, args):
+    """
+    Aggregate cross-validation results and save summary statistics.
+    """
+    import json
+    import numpy as np
+    
+    # Aggregate metrics across folds
+    metrics_to_aggregate = [
+        'ml_baseline_accuracy', 'ml_baseline_f1',
+        'pre_accuracy', 'pre_f1', 'pre_loss',
+        'post_accuracy', 'post_f1', 'post_loss',
+        'llm_only_pre_accuracy', 'llm_only_pre_f1',
+        'llm_only_post_accuracy', 'llm_only_post_f1'
+    ]
+    
+    summary = {
+        'n_folds': len(cv_results),
+        'cv_folds': args.cv_folds,
+        'fold_results': cv_results,
+        'summary_statistics': {}
+    }
+    
+    # Compute mean and std for each metric
+    for metric in metrics_to_aggregate:
+        values = [r.get(metric, None) for r in cv_results if r.get(metric) is not None]
+        if values:
+            summary['summary_statistics'][metric] = {
+                'mean': float(np.mean(values)),
+                'std': float(np.std(values)),
+                'min': float(np.min(values)),
+                'max': float(np.max(values)),
+                'values': [float(v) for v in values]
+            }
+    
+    # Save summary
+    summary_file = os.path.join(output_dir, "cv_summary.json")
+    with open(summary_file, 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    # Print summary
+    logger.info("\n" + "=" * 80)
+    logger.info("CROSS-VALIDATION SUMMARY")
+    logger.info("=" * 80)
+    logger.info(f"Number of folds: {len(cv_results)}")
+    logger.info("\nSummary Statistics:")
+    for metric, stats in summary['summary_statistics'].items():
+        logger.info(f"  {metric}: {stats['mean']:.4f} ± {stats['std']:.4f} (min={stats['min']:.4f}, max={stats['max']:.4f})")
+    logger.info(f"\nFull summary saved to: {summary_file}")
+    logger.info(f"Individual fold results saved in: {output_dir}/fold_*/")
+
+
 def main():
+    # Explicitly reference global json module to prevent UnboundLocalError
+    # (Python may treat json as local if it sees json.load() calls later in the function)
+    import json
+    
     parser = argparse.ArgumentParser(description="MA-ICL classification runner with top-K residuals")
-    parser.add_argument("--dataset", default="car", 
+    parser.add_argument("--dataset", default="zoo", 
                         help="Classification dataset name. Options:\n"
                              "  OpenML: car (4), iris (3), wine (3), zoo (7), glass (6), vehicle (4), soybean (19), lymphography (4), ecoli (8), adult (2), credit (2), vote (2), mushroom (2)\n"
                              "  OpenML (many classes): letter (26), mfeat (10), pendigits (10), optdigits (10), avila (12), amazon (50), plant-margin (100), plant-shape (100), plant-texture (100)\n"
@@ -1266,12 +1633,16 @@ def main():
         default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash"),
         help="LLM model name. Examples: Gemini: gemini-2.0-flash, gemini-2.0-pro. OpenAI: gpt-4o-mini, gpt-4o, gpt-4.1-mini."
     )
-    parser.add_argument("--ml_mech", default="linear", help="ML mechanism: logreg|xgboost|tabicl|ebm|tabpfn. "
+    parser.add_argument("--ml_mech", default="ebm", help="ML mechanism: logreg|xgboost|tabicl|ebm|tabpfn. "
                         "Note: TabPFN may cause segmentation faults when used as ML mechanism. "
                         "Consider using TabPFN only as a baseline (it runs in isolated subprocess) "
                         "or use --ml_mech logreg/xgboost for more stable ML mechanism.")
+    parser.add_argument("--baseline_models", type=str, nargs='+', default=None,
+                        help="Select which baseline models to compute. Options: tabpfn, ebm, shap. "
+                             "If not specified, all available baselines will be computed. "
+                             "Example: --baseline_models tabpfn ebm")
     parser.add_argument("--use_ml", type=int, default=1, choices=[0,1], help="Include ML mechanism in ensemble")
-    parser.add_argument("--max_samples", type=int, default=200)
+    parser.add_argument("--max_samples", type=int, default=300)
     parser.add_argument("--top_k", type=int, default=100, help="-1 to use full dataset")
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--acceptance_set", type=str, default="test",
@@ -1294,6 +1665,10 @@ def main():
                              "This controls how many LLM-based mechanisms are created to complement the ML mechanism.")
     parser.add_argument("--no_scaling", action="store_true",
                         help="If set, disables all feature scaling. Data will be used in its original range.")
+    parser.add_argument("--cv_folds", type=int, default=0,
+                        help="Number of cross-validation folds (default: 0 = disabled). "
+                             "When > 0, performs k-fold cross-validation and saves results for each fold. "
+                             "Example: --cv_folds 5 for 5-fold CV.")
     args = parser.parse_args()
 
     # Note: Classification loss metric is now configurable via --classification_loss argument
@@ -1329,11 +1704,24 @@ def main():
         run_name_parts.append(f"maxsamp{args.max_samples}")
     if args.evaluate_individual_mechanisms:
         run_name_parts.append("evalindiv")
+    if args.cv_folds > 0:
+        run_name_parts.append(f"cv{args.cv_folds}")
     
     # Join all parts with underscores
     run_name = "_".join(run_name_parts)
     output_dir = set_output_dir(run_name)
     logger.info(f"Output directory: {output_dir}")
+    
+    # Set up file logging to save terminal output
+    log_file = os.path.join(output_dir, "run.log")
+    file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)  # Log everything to file
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    # Add file handler to root logger (will capture all logging)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(file_handler)
+    logger.info(f"Logging to file: {log_file}")
 
     llm = _get_llm(args.model_name)
 
@@ -1395,7 +1783,82 @@ def main():
         )
         ds_label = f"OpenML {args.dataset}"
 
-    from sklearn.model_selection import train_test_split
+    from sklearn.model_selection import train_test_split, StratifiedKFold, KFold
+    
+    # Check if cross-validation is enabled
+    cv_folds = args.cv_folds if args.cv_folds > 0 else 0
+    
+    if cv_folds > 0:
+        logger.info("=" * 80)
+        logger.info(f"CROSS-VALIDATION MODE: {cv_folds}-fold CV")
+        logger.info("=" * 80)
+        
+        # Prepare for cross-validation
+        # Use StratifiedKFold for classification to maintain class distribution
+        class_counts = Counter(y_encoded)
+        if min(class_counts.values()) >= cv_folds:
+            skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_STATE)
+            splits = list(skf.split(X_encoded, y_encoded))
+        else:
+            logger.warning(f"Not enough samples per class for stratified CV. Using regular KFold.")
+            kf = KFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_STATE)
+            splits = list(kf.split(X_encoded))
+        
+        # Store results for all folds
+        cv_results = []
+        
+        # Run each fold
+        for fold_idx, (train_val_idx, test_idx) in enumerate(splits):
+            logger.info("=" * 80)
+            logger.info(f"FOLD {fold_idx + 1}/{cv_folds}")
+            logger.info("=" * 80)
+            
+            # Create fold-specific output directory
+            fold_output_dir = os.path.join(output_dir, f"fold_{fold_idx + 1}")
+            os.makedirs(fold_output_dir, exist_ok=True)
+            
+            # Split data for this fold
+            X_train_val = X_encoded[train_val_idx]
+            y_train_val = y_encoded[train_val_idx]
+            X_original_train_val = [X_original[i] for i in train_val_idx]
+            X_test = X_encoded[test_idx]
+            y_test = y_encoded[test_idx]
+            X_original_test = [X_original[i] for i in test_idx]
+            
+            # Further split train_val into train and validation
+            idx_train_val = np.arange(len(X_train_val))
+            class_counts_tr = Counter(y_train_val)
+            stratify_tr = y_train_val if min(class_counts_tr.values()) >= 2 else None
+            can_stratify = (len(idx_train_val) > 0 and 
+                           len(np.unique(y_train_val)) > 1 and 
+                           min(class_counts_tr.values()) >= 2)
+            stratify_tr = y_train_val if can_stratify else None
+            idx_tr, idx_va = train_test_split(idx_train_val, test_size=float(args.val_size), random_state=RANDOM_STATE, stratify=stratify_tr)
+            
+            X_train = X_train_val[idx_tr]
+            X_val = X_train_val[idx_va]
+            y_train = y_train_val[idx_tr]
+            y_val = y_train_val[idx_va]
+            X_original_train = [X_original_train_val[i] for i in idx_tr]
+            X_original_val = [X_original_train_val[i] for i in idx_va]
+            
+            # Run the pipeline for this fold (will be implemented below)
+            fold_result = run_fold_pipeline_classification(
+                X_train, X_val, X_test, y_train, y_val, y_test,
+                X_original_train, X_original_val, X_original_test,
+                feature_cols, class_names, feature_encoders,
+                args, llm, ds_name, ds_label, fold_output_dir, fold_idx + 1
+            )
+            cv_results.append(fold_result)
+        
+        # Aggregate and save CV summary
+        save_cv_summary_classification(cv_results, output_dir, args)
+        logger.info("=" * 80)
+        logger.info("CROSS-VALIDATION COMPLETE")
+        logger.info("=" * 80)
+        return
+    
+    # Standard single run (no CV)
     class_counts = Counter(y_encoded)
     stratify = y_encoded if min(class_counts.values()) >= 2 else None
     idx = np.arange(len(X_encoded))
@@ -1814,7 +2277,8 @@ def main():
         task_type="classification",
         feature_cols=feature_cols,
         y_scaler=None,
-        no_scaling=args.no_scaling
+        no_scaling=args.no_scaling,
+        baseline_models=args.baseline_models
     )
 
     maicl = TrainableMAICL(

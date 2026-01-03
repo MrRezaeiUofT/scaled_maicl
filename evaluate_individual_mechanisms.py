@@ -36,6 +36,10 @@ def parse_mechanisms_file(filepath: str) -> List[Tuple[str, str]]:
         
         [KNOWN] mechanism text 3
     
+    Also handles cases where multiple [TYPE] markers appear in the same section:
+        [KNOWN] [KNOWN] context text
+        [LLM] mechanism text
+    
     Args:
         filepath: Path to the mechanisms file
         
@@ -50,19 +54,41 @@ def parse_mechanisms_file(filepath: str) -> List[Tuple[str, str]]:
     with open(filepath, 'r', encoding='utf-8') as f:
         content = f.read()
     
-    # Split by double newlines (mechanism separator)
-    sections = content.split('\n\n')
+    # First, try to find all [TYPE] markers in the entire file
+    # This handles cases where multiple markers appear in one section
+    type_pattern = r'\[(\w+)\]\s*'
+    matches = list(re.finditer(type_pattern, content))
     
-    for section in sections:
-        section = section.strip()
-        if not section:
-            continue
+    if not matches:
+        # Fallback: split by double newlines (original behavior)
+        sections = content.split('\n\n')
+        for section in sections:
+            section = section.strip()
+            if not section:
+                continue
+            
+            match = re.match(r'\[(\w+)\]\s*(.*)', section, re.DOTALL)
+            if match:
+                mech_type = match.group(1).lower()
+                mech_text = match.group(2).strip()
+                mechanisms.append((mech_type, mech_text))
+        return mechanisms
+    
+    # Extract mechanisms based on [TYPE] markers
+    for i, match in enumerate(matches):
+        mech_type = match.group(1).lower()
+        start_pos = match.end()
         
-        # Match pattern: [TYPE] text
-        match = re.match(r'\[(\w+)\]\s*(.*)', section, re.DOTALL)
-        if match:
-            mech_type = match.group(1).lower()
-            mech_text = match.group(2).strip()
+        # Find the end of this mechanism (next [TYPE] marker or end of file)
+        if i + 1 < len(matches):
+            end_pos = matches[i + 1].start()
+        else:
+            end_pos = len(content)
+        
+        mech_text = content[start_pos:end_pos].strip()
+        
+        # Skip if text is empty or just whitespace
+        if mech_text:
             mechanisms.append((mech_type, mech_text))
     
     return mechanisms
@@ -229,6 +255,17 @@ def evaluate_llm_formula(
     # Check if this is a DeepChem dataset (formula uses molecular properties)
     is_deepchem = 'molecular_weight(SMILES)' in formula or 'num_rings(SMILES)' in formula or 'num_hydroxyl_groups(SMILES)' in formula
     
+    # Detect if we have categorical features in X_original (e.g., SU dataset with chemical, concentration_label)
+    has_categorical_features = False
+    categorical_feature_names = []
+    if X_original is not None and len(X_original) > 0 and isinstance(X_original[0], dict):
+        # Check for common categorical feature names that should use original string values
+        sample_dict = X_original[0]
+        categorical_feature_names = [k for k in sample_dict.keys() 
+                                     if k in feature_cols and isinstance(sample_dict[k], str) 
+                                     and k not in ['SMILES', 'SEQ', 'SUBSTRATES']]  # Exclude special fields
+        has_categorical_features = len(categorical_feature_names) > 0
+    
     for i in range(len(X)):
         # For DeepChem datasets, use SMILES from X_original
         if is_deepchem and X_original is not None and i < len(X_original):
@@ -247,8 +284,21 @@ def evaluate_llm_formula(
             x_dict = mol_props.copy()
             # Also add SMILES as a variable (for formulas that reference it)
             x_dict['SMILES'] = smiles
+        elif has_categorical_features and X_original is not None and i < len(X_original):
+            # For datasets with categorical features (e.g., SU dataset), use encoded numeric values
+            # for feature_cols (so formulas work), but also provide original string values
+            x_dict = {}
+            orig_dict = X_original[i] if isinstance(X_original[i], dict) else {}
+            
+            for j, feat_name in enumerate(feature_cols):
+                # Always use encoded numeric value for feature_cols (so formulas like 0.667*chemical work)
+                x_dict[feat_name] = float(X[i, j]) if j < X.shape[1] else 0.0
+                
+                # Also provide original string value with _name suffix for conditional logic
+                if feat_name in categorical_feature_names and feat_name in orig_dict:
+                    x_dict[f"{feat_name}_name"] = orig_dict[feat_name]
         else:
-            # For non-DeepChem datasets, use vectorized features
+            # For non-DeepChem datasets without categoricals, use vectorized features
             x_dict = {feature_cols[j]: float(X[i, j]) for j in range(len(feature_cols))}
         
         # Evaluate formula
@@ -311,14 +361,21 @@ def _execute_formula(formula: str, x_dict: Dict[str, float]) -> Optional[float]:
         # Create safe evaluation environment
         safe_dict = {}
         for key, val in x_dict.items():
-            # Skip non-numeric values (like SMILES string itself)
+            # Sanitize key name (remove special chars, replace with underscore)
+            safe_key = re.sub(r'[^a-zA-Z0-9_]', '_', str(key))
+            
             if isinstance(val, (int, float)):
-                # Sanitize key name (remove special chars, replace with underscore)
-                safe_key = re.sub(r'[^a-zA-Z0-9_]', '_', str(key))
+                # Numeric values: add as float
                 safe_dict[safe_key] = float(val)
                 # Also add original key if different
                 if safe_key != key:
                     safe_dict[key] = float(val)
+            elif isinstance(val, str):
+                # String values (categorical features with _name suffix): add as string for comparisons
+                # These are provided for conditional logic (e.g., if chemical_name == "DMSO")
+                safe_dict[safe_key] = val
+                if safe_key != key:
+                    safe_dict[key] = val
         
         # Add math functions to safe environment
         safe_dict.update({

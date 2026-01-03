@@ -10,6 +10,7 @@ MA-ICL Regression Runner (Biotech/Biological Datasets)
 
 Available Datasets:
 - Experimental: gfp_yield, protein_expression, protein_expression_all, dataset_102
+- InaData (SU/EC): pfas_su, ec_fertility, ec_climbing
 
 Usage examples:
   
@@ -30,6 +31,8 @@ from typing import Dict, Any
 import logging
 from pathlib import Path
 import json
+import re
+import csv
 
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
@@ -102,8 +105,20 @@ try:
 except:
     _HAS_XGB = False
 
+# RDKit for molecular feature extraction
+try:
+    from rdkit import Chem
+    from rdkit.Chem import Descriptors
+    import hashlib
+    _HAS_RDKIT = True
+except ImportError:
+    _HAS_RDKIT = False
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+if not _HAS_RDKIT:
+    logger.warning("RDKit not available. RDKit molecular features will be skipped. Install with: pip install rdkit or conda install -c conda-forge rdkit")
 
 MODEL_NAME = os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash")
 RANDOM_STATE = 42
@@ -179,16 +194,28 @@ def save_scatter_plot(y_true, y_pred, title, filename, output_dir):
 
 
 def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="regression", 
-                                 feature_cols=None, y_scaler=None, no_scaling=False):
-    """Compute additional baseline models: TabPFN, EBM, and SHAP-based model
+                                 feature_cols=None, y_scaler=None, no_scaling=False,
+                                 baseline_models=None):
+    """Compute additional baseline models: TabPFN, EBM, SHAP-based model
+    
+    Args:
+        baseline_models: List of baseline model names to compute. If None, compute all available.
+                        Options: 'tabpfn', 'ebm', 'shap'
     
     Returns:
         Dict with baseline metrics for each model
     """
     baselines = {}
     
+    # Default: compute all baselines if not specified
+    if baseline_models is None:
+        baseline_models = ['tabpfn', 'ebm', 'shap']
+    else:
+        # Normalize to lowercase
+        baseline_models = [m.lower() for m in baseline_models]
+    
     # TabPFN baseline (runs in subprocess to avoid segmentation faults)
-    if _HAS_TABPFN and task_type == "regression":
+    if 'tabpfn' in baseline_models and _HAS_TABPFN and task_type == "regression":
         try:
             logger.info("Computing TabPFN baseline...")
             logger.info("  ℹ️  Note: TabPFN runs in isolated subprocess to avoid crashes")
@@ -277,7 +304,7 @@ def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="re
                 logger.warning("  TabPFN model weights may not be downloaded. Visit https://huggingface.co/Prior-Labs/tabpfn_2_5 to accept license and run 'hf auth login'")
     
     # EBM baseline
-    if _HAS_EBM:
+    if 'ebm' in baseline_models and _HAS_EBM:
         try:
             logger.info("Computing EBM baseline...")
             # Suppress verbose EBM logs
@@ -328,7 +355,7 @@ def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="re
             logger.warning(f"Failed to compute EBM baseline: {e}")
     
     # SHAP-based baseline (using XGBoost with SHAP feature selection)
-    if _HAS_SHAP and _HAS_XGB:
+    if 'shap' in baseline_models and _HAS_SHAP and _HAS_XGB:
         try:
             logger.info("Computing SHAP-based baseline...")
             from xgboost import XGBRegressor, XGBClassifier
@@ -728,6 +755,466 @@ def load_dataset_102(max_samples: int):
     return X_encoded, y_values, X_original, feature_cols, feature_encoders, "Dataset 102"
 
 
+def _try_parse_float(x):
+    """Best-effort conversion to float; returns None if not possible."""
+    try:
+        if x is None:
+            return None
+        if isinstance(x, (int, float, np.integer, np.floating)):
+            v = float(x)
+            if np.isnan(v):
+                return None
+            return v
+        s = str(x).strip()
+        if not s:
+            return None
+        # Handle things like "7.0", "N/A (1 dead)", "1 dead in food", etc.
+        # Only accept pure numeric tokens.
+        s2 = s.replace(",", "")
+        if re.fullmatch(r"[-+]?\d+(\.\d+)?", s2):
+            v = float(s2)
+            if np.isnan(v):
+                return None
+            return v
+        return None
+    except Exception:
+        return None
+
+
+def _extract_dah_series_from_row(row_dict: Dict[str, Any], prefix: str):
+    """
+    Extract a (days, values) series from a row dict where columns look like:
+      "Pupation DAH 5", "Eclosure DAH 12", etc.
+    Returns (days_sorted, values_sorted) with numeric values only.
+    """
+    days = []
+    vals = []
+    for k, v in row_dict.items():
+        if not isinstance(k, str):
+            continue
+        if prefix not in k:
+            continue
+        # Column examples: "Pupation DAH 5", "Eclosure DAH 12"
+        m = re.search(r"DAH\s*(\d+)", k)
+        if not m:
+            continue
+        day = int(m.group(1))
+        fv = _try_parse_float(v)
+        if fv is None:
+            continue
+        days.append(day)
+        vals.append(fv)
+    if not days:
+        return [], []
+    order = np.argsort(days)
+    days_sorted = [int(days[i]) for i in order]
+    vals_sorted = [float(vals[i]) for i in order]
+    return days_sorted, vals_sorted
+
+
+def _time_to_fraction(days, cum_values, frac: float = 0.5):
+    """
+    Given cumulative counts, return the earliest day where cum >= frac * final.
+    Uses linear interpolation between adjacent DAH points when needed.
+    Returns float day, or None if cannot compute.
+    """
+    if not days or not cum_values or len(days) != len(cum_values):
+        return None
+    final = cum_values[-1]
+    if final is None or final <= 0:
+        return None
+    target = frac * final
+    for i, y in enumerate(cum_values):
+        if y >= target:
+            if i == 0:
+                return float(days[0])
+            x0, y0 = days[i - 1], cum_values[i - 1]
+            x1, y1 = days[i], cum_values[i]
+            if y1 == y0:
+                return float(x1)
+            # interpolate day when reaching target
+            t = (target - y0) / (y1 - y0)
+            return float(x0 + t * (x1 - x0))
+    return float(days[-1])
+
+
+def load_inadata_pfas_su_dataset(max_samples: int, target: str = "eclosure_total"):
+    """
+    Load InaData SU PFAS developmental assay from CSV.
+
+    Source: InaData/PFAS Dev Assay Data SU.csv
+    Design: InaData/PFAS Dev Assay Exp Design SU.docx
+
+    The CSV contains multiple blocks with repeated headers.
+    We parse all blocks and compute per-(chemical, concentration, replicate) summary metrics.
+
+    Targets (target arg):
+      - pupation_total: final cumulative pupation count
+      - pupation_t50: day when cumulative pupation reaches 50% of final (timing)
+      - eclosure_total: final cumulative eclosure total (Sex == Total)
+      - eclosure_t50: day when cumulative eclosure reaches 50% of final (timing; Sex == Total)
+      - female_ratio_final: female / total at final day (requires Female+Total rows)
+    """
+    if not _HAS_PANDAS:
+        raise RuntimeError("pandas not installed. pip install pandas")
+
+    base_dir = Path(__file__).resolve().parent / "InaData"
+    csv_path = base_dir / "PFAS Dev Assay Data SU.csv"
+    if not csv_path.exists():
+        raise FileNotFoundError(f"InaData SU CSV not found: {csv_path}")
+
+    # Read raw CSV rows (keeps repeated header blocks)
+    with open(csv_path, "r", newline="", encoding="utf-8", errors="replace") as f:
+        reader = csv.reader(f)
+        rows = [r for r in reader]
+
+    def _trim_and_make_unique(cols):
+        # Trim trailing empty columns (common due to ",,,")
+        cols = [("" if c is None else str(c).strip()) for c in cols]
+        last = -1
+        for i in range(len(cols) - 1, -1, -1):
+            if cols[i] != "":
+                last = i
+                break
+        if last >= 0:
+            cols = cols[: last + 1]
+        else:
+            cols = []
+
+        # Ensure uniqueness (pandas concat requires unique column Index)
+        seen = {}
+        out = []
+        for i, c in enumerate(cols):
+            name = c if c != "" else f"unnamed_{i}"
+            if name in seen:
+                seen[name] += 1
+                name = f"{name}.{seen[name]}"
+            else:
+                seen[name] = 0
+            out.append(name)
+        return out
+
+    # Identify header rows for blocks: starts with "Chemical" and includes "Replicate n"
+    header_idxs = []
+    for i, r in enumerate(rows):
+        if not r:
+            continue
+        if len(r) >= 3 and str(r[0]).strip() == "Chemical" and any(str(c).strip() == "Replicate n" for c in r):
+            header_idxs.append(i)
+    if not header_idxs:
+        raise ValueError("Could not find any data blocks in SU CSV (no 'Chemical, ... , Replicate n' header rows).")
+
+    # Parse each block into a DataFrame
+    block_dfs = []
+    for hi, hidx in enumerate(header_idxs):
+        header = _trim_and_make_unique(rows[hidx])
+        if not header:
+            continue
+        # Data rows until next blank row or next header
+        data = []
+        j = hidx + 1
+        while j < len(rows):
+            r = rows[j]
+            # stop at next header
+            if j in header_idxs:
+                break
+            # stop at empty row
+            if not r or all((str(x).strip() == "" for x in r)):
+                break
+            data.append(r)
+            j += 1
+
+        if not data:
+            continue
+
+        # Normalize row lengths to header length
+        norm = []
+        for r in data:
+            rr = list(r)
+            # Trim to header length, or pad if shorter
+            if len(rr) > len(header):
+                rr = rr[: len(header)]
+            elif len(rr) < len(header):
+                rr = rr + [""] * (len(header) - len(rr))
+            norm.append(rr)
+
+        df = pd.DataFrame(norm, columns=header)
+        # Strip whitespace for key columns
+        for col in ["Chemical", "Concentration", "Replicate n", "Sex"]:
+            if col in df.columns:
+                df[col] = df[col].astype(str).str.strip()
+        # Try numeric conversion for Replicate n
+        if "Replicate n" in df.columns:
+            df["Replicate n"] = pd.to_numeric(df["Replicate n"], errors="coerce")
+        block_dfs.append(df)
+
+    if not block_dfs:
+        raise ValueError("SU CSV parsed but produced no non-empty blocks.")
+
+    su_all = pd.concat(block_dfs, ignore_index=True)
+
+    # Separate pupation and eclosure blocks by presence of "Sex" column and DAH prefixes
+    # Pupation blocks: columns contain "Pupation DAH"
+    # Eclosure blocks: columns contain "Eclosure DAH"
+    pup_mask = [any(isinstance(c, str) and "Pupation DAH" in c for c in su_all.columns)]
+    # We'll just detect by column names on the combined DF, then per-row extraction decides actual availability.
+
+    # Build per-sample aggregated table keyed by chemical/concentration/replicate
+    group_cols = [c for c in ["Chemical", "Concentration", "Replicate n"] if c in su_all.columns]
+    if len(group_cols) < 3:
+        raise ValueError(f"SU CSV missing required key columns. Found columns: {list(su_all.columns)}")
+
+    # For eclosure, we want Total/Female rows grouped; for pupation, no Sex.
+    records = []
+    for (chem, conc, rep), g in su_all.groupby(group_cols, dropna=False):
+        # Pupation row(s): pick any row that has Pupation DAH values
+        pup_rows = []
+        ecl_total_rows = []
+        ecl_female_rows = []
+
+        for _, row in g.iterrows():
+            rowd = row.to_dict()
+            # Pupation series
+            d_p, v_p = _extract_dah_series_from_row(rowd, "Pupation DAH")
+            if d_p:
+                pup_rows.append((d_p, v_p, rowd))
+            # Eclosure series
+            d_e, v_e = _extract_dah_series_from_row(rowd, "Eclosure DAH")
+            if d_e:
+                sex = str(rowd.get("Sex", "")).strip()
+                if sex.lower() == "total":
+                    ecl_total_rows.append((d_e, v_e, rowd))
+                elif sex.lower() == "female":
+                    ecl_female_rows.append((d_e, v_e, rowd))
+
+        # Helper to pick the "best" row: longest series, then highest final
+        def pick_best(rows_list):
+            if not rows_list:
+                return None
+            def keyfn(t):
+                d, v, _ = t
+                return (len(d), v[-1] if v else -1)
+            return sorted(rows_list, key=keyfn, reverse=True)[0]
+
+        pup_best = pick_best(pup_rows)
+        ecl_total_best = pick_best(ecl_total_rows)
+        ecl_female_best = pick_best(ecl_female_rows)
+
+        pup_total = None
+        pup_t50 = None
+        if pup_best:
+            d, v, _ = pup_best
+            pup_total = float(v[-1])
+            pup_t50 = _time_to_fraction(d, v, frac=0.5)
+
+        ecl_total = None
+        ecl_t50 = None
+        if ecl_total_best:
+            d, v, _ = ecl_total_best
+            ecl_total = float(v[-1])
+            ecl_t50 = _time_to_fraction(d, v, frac=0.5)
+
+        female_ratio_final = None
+        if ecl_total_best and ecl_female_best:
+            dT, vT, _ = ecl_total_best
+            dF, vF, _ = ecl_female_best
+            # Ratio at final day (use each series' final value)
+            if vT and vT[-1] and vT[-1] > 0:
+                female_ratio_final = float(vF[-1]) / float(vT[-1])
+
+        rec = {
+            "chemical": str(chem).strip(),
+            "concentration_label": str(conc).strip(),
+            "replicate": float(rep) if rep is not None and not (isinstance(rep, float) and np.isnan(rep)) else None,
+            "pupation_total": pup_total,
+            "pupation_t50": pup_t50,
+            "eclosure_total": ecl_total,
+            "eclosure_t50": ecl_t50,
+            "female_ratio_final": female_ratio_final,
+        }
+        records.append(rec)
+
+    df = pd.DataFrame(records)
+
+    # Drop rows without the chosen target
+    if target not in df.columns:
+        raise ValueError(f"Unknown SU target '{target}'. Available: {list(df.columns)}")
+    df = df.dropna(subset=[target]).reset_index(drop=True)
+    if len(df) == 0:
+        raise ValueError(f"SU dataset has 0 usable rows after filtering for target={target}")
+
+    # Encode categoricals
+    from sklearn.preprocessing import LabelEncoder
+    feature_encoders: Dict[str, Any] = {}
+    X_df = df[["chemical", "concentration_label", "replicate"]].copy()
+    for col in ["chemical", "concentration_label"]:
+        le = LabelEncoder()
+        X_df[col] = le.fit_transform(X_df[col].astype(str))
+        feature_encoders[col] = le
+    X_df["replicate"] = pd.to_numeric(X_df["replicate"], errors="coerce").fillna(0.0)
+
+    feature_cols = list(X_df.columns)
+    y_series = df[target].astype(float)
+
+    # Subsample if needed
+    X_df, y_series = _subsample_if_needed(X_df, y_series, max_samples)
+
+    X_encoded = X_df.values.astype(float)
+    y_values = y_series.values.astype(float)
+    X_original = df.iloc[: len(X_df)].to_dict(orient="records")
+
+    dataset_label = f"InaData SU PFAS Dev Assay (target={target})"
+    return X_encoded, y_values, X_original, feature_cols, feature_encoders, dataset_label
+
+
+def load_inadata_ec_fertility_dataset(max_samples: int, target: str = "total_eclosed"):
+    """
+    Load InaData EC calibration data (fertility scoring) from Excel.
+
+    Source: InaData/Chemical Screen Calibration Data_EC.xlsx (sheet: 'Fertility Scoring')
+
+    We compute robust summary targets per vial:
+      - total_females, total_males, total_pupae, total_eclosed (= females+males)
+    Default target is total_eclosed.
+    """
+    if not _HAS_PANDAS:
+        raise RuntimeError("pandas not installed. pip install pandas")
+
+    base_dir = Path(__file__).resolve().parent / "InaData"
+    xlsx_path = base_dir / "Chemical Screen Calibration Data_EC.xlsx"
+    if not xlsx_path.exists():
+        raise FileNotFoundError(f"InaData EC XLSX not found: {xlsx_path}")
+
+    df_raw = pd.read_excel(xlsx_path, sheet_name="Fertility Scoring")
+    if "Genotype" not in df_raw.columns:
+        raise ValueError(f"EC Fertility sheet missing 'Genotype' column. Columns: {list(df_raw.columns)}")
+
+    # Filter real vial rows
+    df = df_raw.copy()
+    df["Genotype"] = df["Genotype"].astype(str).str.strip()
+    df = df[(df["Genotype"].notna()) & (df["Genotype"] != "") & (df["Genotype"].str.lower() != "nan")]
+    df = df[~df["Genotype"].str.contains("totals", case=False, na=False)]
+    df = df.reset_index(drop=True)
+
+    # Identify numeric count columns by prefix (handle duplicated column names like '# Females.1')
+    female_cols = [c for c in df.columns if isinstance(c, str) and c.strip().lower().startswith("# females")]
+    male_cols = [c for c in df.columns if isinstance(c, str) and c.strip().lower().startswith("# males")]
+    pupae_cols = [c for c in df.columns if isinstance(c, str) and c.strip().lower().startswith("# pupae")]
+
+    # Some columns are garbled ("# f# Femalesemales "), include anything containing "females" that starts with '#'
+    female_cols += [c for c in df.columns if isinstance(c, str) and c.strip().startswith("#") and ("female" in c.lower()) and (c not in female_cols)]
+
+    def numeric_sum(cols):
+        if not cols:
+            return pd.Series([0.0] * len(df))
+        s = pd.Series([0.0] * len(df))
+        for c in cols:
+            s = s + pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+        return s
+
+    df["total_females"] = numeric_sum(female_cols)
+    df["total_males"] = numeric_sum(male_cols)
+    df["total_pupae"] = numeric_sum(pupae_cols)
+    df["total_eclosed"] = df["total_females"] + df["total_males"]
+
+    if target not in df.columns:
+        raise ValueError(f"Unknown EC fertility target '{target}'. Available: {[c for c in df.columns if c.startswith('total_')]} + raw columns")
+
+    # Features: genotype + vial number (if present)
+    X_df = pd.DataFrame()
+    X_df["genotype"] = df["Genotype"].astype(str)
+    if "Vial #" in df.columns:
+        X_df["vial"] = pd.to_numeric(df["Vial #"], errors="coerce").fillna(0.0)
+    else:
+        X_df["vial"] = 0.0
+
+    # Encode genotype into numeric
+    from sklearn.preprocessing import LabelEncoder
+    feature_encoders: Dict[str, Any] = {}
+    le = LabelEncoder()
+    X_df["genotype"] = le.fit_transform(X_df["genotype"].astype(str))
+    feature_encoders["genotype"] = le
+
+    feature_cols = list(X_df.columns)
+    y_series = pd.to_numeric(df[target], errors="coerce")
+
+    # Drop missing targets
+    valid = y_series.notna()
+    X_df = X_df[valid].reset_index(drop=True)
+    y_series = y_series[valid].reset_index(drop=True)
+    df_valid = df[valid].reset_index(drop=True)
+
+    X_df, y_series = _subsample_if_needed(X_df, y_series, max_samples)
+    X_encoded = X_df.values.astype(float)
+    y_values = y_series.values.astype(float)
+    X_original = df_valid.iloc[: len(X_df)][["Genotype", "Vial #", "total_females", "total_males", "total_pupae", "total_eclosed"]].to_dict(orient="records")
+    dataset_label = f"InaData EC Fertility (target={target})"
+    return X_encoded, y_values, X_original, feature_cols, feature_encoders, dataset_label
+
+
+def load_inadata_ec_climbing_dataset(max_samples: int, target: str = "avg_16s"):
+    """
+    Load InaData EC calibration data (climbing test) from Excel.
+
+    Source: InaData/Chemical Screen Calibration Data_EC.xlsx (sheet: 'Climbing Test')
+
+    Targets:
+      - female_16s: % Female (16 seconds)
+      - male_16s: % Male (16 seconds)
+      - avg_16s: average of male_16s and female_16s
+    """
+    if not _HAS_PANDAS:
+        raise RuntimeError("pandas not installed. pip install pandas")
+
+    base_dir = Path(__file__).resolve().parent / "InaData"
+    xlsx_path = base_dir / "Chemical Screen Calibration Data_EC.xlsx"
+    if not xlsx_path.exists():
+        raise FileNotFoundError(f"InaData EC XLSX not found: {xlsx_path}")
+
+    df = pd.read_excel(xlsx_path, sheet_name="Climbing Test")
+    # Use the right-side columns (Genotype.1 / Vial #.1 / % Male/Female (X seconds))
+    if "Genotype.1" not in df.columns:
+        raise ValueError(f"EC Climbing sheet missing 'Genotype.1'. Columns: {list(df.columns)}")
+    df = df.copy()
+    df["Genotype.1"] = df["Genotype.1"].astype(str).str.strip()
+    df = df[(df["Genotype.1"].notna()) & (df["Genotype.1"] != "") & (df["Genotype.1"].str.lower() != "nan")].reset_index(drop=True)
+
+    male_16 = pd.to_numeric(df.get("% Male (16 seconds)"), errors="coerce")
+    female_16 = pd.to_numeric(df.get("% Female (16 seconds)"), errors="coerce")
+
+    df["male_16s"] = male_16
+    df["female_16s"] = female_16
+    df["avg_16s"] = (male_16 + female_16) / 2.0
+
+    if target not in df.columns:
+        raise ValueError(f"Unknown EC climbing target '{target}'. Available: male_16s, female_16s, avg_16s")
+
+    # Features: genotype + vial
+    X_df = pd.DataFrame()
+    X_df["genotype"] = df["Genotype.1"].astype(str)
+    X_df["vial"] = pd.to_numeric(df.get("Vial #.1"), errors="coerce").fillna(0.0)
+
+    from sklearn.preprocessing import LabelEncoder
+    feature_encoders: Dict[str, Any] = {}
+    le = LabelEncoder()
+    X_df["genotype"] = le.fit_transform(X_df["genotype"].astype(str))
+    feature_encoders["genotype"] = le
+
+    y_series = pd.to_numeric(df[target], errors="coerce")
+    valid = y_series.notna()
+    X_df = X_df[valid].reset_index(drop=True)
+    y_series = y_series[valid].reset_index(drop=True)
+    df_valid = df[valid].reset_index(drop=True)
+
+    feature_cols = list(X_df.columns)
+    X_df, y_series = _subsample_if_needed(X_df, y_series, max_samples)
+    X_encoded = X_df.values.astype(float)
+    y_values = y_series.values.astype(float)
+    X_original = df_valid.iloc[: len(X_df)][["Genotype.1", "Vial #.1", "male_16s", "female_16s", "avg_16s"]].to_dict(orient="records")
+    dataset_label = f"InaData EC Climbing (target={target})"
+    return X_encoded, y_values, X_original, feature_cols, feature_encoders, dataset_label
+
+
 def _extract_sequence_features(seq: str) -> Dict[str, float]:
     """Extract numerical features from protein sequence"""
     if pd.isna(seq) or not seq:
@@ -779,6 +1266,179 @@ def _extract_smiles_features(smiles: str) -> Dict[str, float]:
     }
 
 
+def _compute_rdkit_features(smiles: str) -> Dict[str, float]:
+    """
+    Compute RDKit molecular features from SMILES string.
+    
+    Returns:
+        Dictionary with RDKit molecular descriptors
+    """
+    if not _HAS_RDKIT:
+        return {
+            'rdkit_molecular_weight': 0.0,
+            'rdkit_num_rings': 0.0,
+            'rdkit_num_hydroxyl_groups': 0.0,
+            'rdkit_num_halogen': 0.0,
+            'rdkit_num_nitrogen': 0.0,
+            'rdkit_num_oxygen': 0.0,
+            'rdkit_num_atoms': 0.0,
+            'rdkit_is_aromatic': 0.0,
+            'rdkit_num_hbd': 0.0
+        }
+    
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            return {
+                'rdkit_molecular_weight': 0.0,
+                'rdkit_num_rings': 0.0,
+                'rdkit_num_hydroxyl_groups': 0.0,
+                'rdkit_num_halogen': 0.0,
+                'rdkit_num_nitrogen': 0.0,
+                'rdkit_num_oxygen': 0.0,
+                'rdkit_num_atoms': 0.0,
+                'rdkit_is_aromatic': 0.0,
+                'rdkit_num_hbd': 0.0
+            }
+        
+        # Compute molecular weight
+        mw = Descriptors.MolWt(mol)
+        
+        # Count rings
+        num_rings = Descriptors.RingCount(mol)
+        
+        # Count atoms
+        num_atoms = mol.GetNumAtoms()
+        
+        # Count specific atom types
+        num_nitrogen = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == 'N')
+        num_oxygen = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() == 'O')
+        
+        # Count halogens (F, Cl, Br, I)
+        num_halogen = sum(1 for atom in mol.GetAtoms() if atom.GetSymbol() in ['F', 'Cl', 'Br', 'I'])
+        
+        # Count hydroxyl groups (-OH)
+        num_hydroxyl = 0
+        for atom in mol.GetAtoms():
+            if atom.GetSymbol() == 'O':
+                # Check if this oxygen is part of a hydroxyl group
+                neighbors = [n.GetSymbol() for n in atom.GetNeighbors()]
+                if 'H' in neighbors:
+                    num_hydroxyl += 1
+        
+        # Check aromaticity
+        is_aromatic = 1.0 if Descriptors.NumAromaticRings(mol) > 0 else 0.0
+        
+        # Count hydrogen bond donors (N-H, O-H)
+        num_hbd = Descriptors.NumHDonors(mol)
+        
+        return {
+            'rdkit_molecular_weight': float(mw),
+            'rdkit_num_rings': float(num_rings),
+            'rdkit_num_hydroxyl_groups': float(num_hydroxyl),
+            'rdkit_num_halogen': float(num_halogen),
+            'rdkit_num_nitrogen': float(num_nitrogen),
+            'rdkit_num_oxygen': float(num_oxygen),
+            'rdkit_num_atoms': float(num_atoms),
+            'rdkit_is_aromatic': is_aromatic,
+            'rdkit_num_hbd': float(num_hbd)
+        }
+    except Exception as e:
+        logger.debug(f"RDKit feature computation failed for SMILES '{smiles[:50]}...': {e}")
+        return {
+            'rdkit_molecular_weight': 0.0,
+            'rdkit_num_rings': 0.0,
+            'rdkit_num_hydroxyl_groups': 0.0,
+            'rdkit_num_halogen': 0.0,
+            'rdkit_num_nitrogen': 0.0,
+            'rdkit_num_oxygen': 0.0,
+            'rdkit_num_atoms': 0.0,
+            'rdkit_is_aromatic': 0.0,
+            'rdkit_num_hbd': 0.0
+        }
+
+
+def _get_rdkit_cache_path(dataset_name: str, smiles_list: list) -> Path:
+    """Generate cache file path based on dataset name and SMILES hash"""
+    cache_dir = Path(__file__).parent / ".rdkit_cache"
+    cache_dir.mkdir(exist_ok=True)
+    
+    # Create hash from dataset name and first/last SMILES for uniqueness
+    hash_input = f"{dataset_name}_{smiles_list[0] if smiles_list else ''}_{smiles_list[-1] if len(smiles_list) > 1 else ''}_{len(smiles_list)}"
+    cache_hash = hashlib.md5(hash_input.encode()).hexdigest()[:16]
+    cache_file = cache_dir / f"rdkit_features_{dataset_name}_{cache_hash}.json"
+    return cache_file
+
+
+def _compute_rdkit_features_batch(smiles_list: list, dataset_name: str = "unknown", use_cache: bool = True) -> list:
+    """
+    Compute RDKit features for a batch of SMILES strings with caching.
+    
+    Args:
+        smiles_list: List of SMILES strings
+        dataset_name: Name of dataset (for cache file naming)
+        use_cache: Whether to use cache (default: True)
+        
+    Returns:
+        List of dictionaries with RDKit features
+    """
+    if not _HAS_RDKIT:
+        logger.warning("RDKit not available - returning empty RDKit features")
+        return [{
+            'rdkit_molecular_weight': 0.0,
+            'rdkit_num_rings': 0.0,
+            'rdkit_num_hydroxyl_groups': 0.0,
+            'rdkit_num_halogen': 0.0,
+            'rdkit_num_nitrogen': 0.0,
+            'rdkit_num_oxygen': 0.0,
+            'rdkit_num_atoms': 0.0,
+            'rdkit_is_aromatic': 0.0,
+            'rdkit_num_hbd': 0.0
+        } for _ in smiles_list]
+    
+    cache_file = _get_rdkit_cache_path(dataset_name, smiles_list)
+    
+    # Try to load from cache
+    if use_cache and cache_file.exists():
+        try:
+            with open(cache_file, 'r') as f:
+                cached_data = json.load(f)
+                if 'features' in cached_data and len(cached_data['features']) == len(smiles_list):
+                    logger.info(f"Loaded RDKit features from cache: {cache_file}")
+                    return cached_data['features']
+                else:
+                    logger.info(f"Cache file exists but size mismatch - recomputing")
+        except Exception as e:
+            logger.warning(f"Failed to load RDKit cache: {e} - recomputing")
+    
+    # Compute features
+    logger.info(f"Computing RDKit features for {len(smiles_list)} SMILES strings...")
+    features_list = []
+    for i, smiles in enumerate(smiles_list):
+        if (i + 1) % 100 == 0:
+            logger.info(f"  Processed {i + 1}/{len(smiles_list)} SMILES...")
+        rdkit_features = _compute_rdkit_features(smiles)
+        features_list.append(rdkit_features)
+    
+    logger.info(f"Computed RDKit features for {len(smiles_list)} SMILES strings")
+    
+    # Save to cache
+    if use_cache:
+        try:
+            cache_data = {
+                'dataset_name': dataset_name,
+                'n_samples': len(smiles_list),
+                'features': features_list
+            }
+            with open(cache_file, 'w') as f:
+                json.dump(cache_data, f, indent=2)
+            logger.info(f"Cached RDKit features to: {cache_file}")
+        except Exception as e:
+            logger.warning(f"Failed to save RDKit cache: {e}")
+    
+    return features_list
+
+
 def load_enzyme_dataset(dataset_name: str, max_samples: int):
     """Load enzyme dataset from enzyme-datasets repository
     
@@ -801,7 +1461,38 @@ def load_enzyme_dataset(dataset_name: str, max_samples: int):
             # Try alternative path
             data_dir = "enzyme-datasets/data"
         
+        # Check if enzyme-datasets directory exists
+        if not os.path.exists(data_dir) and not os.path.exists("enzyme-datasets"):
+            error_msg = (
+                f"\n❌ Enzyme dataset directory not found!\n"
+                f"   Expected location: {os.path.join(os.path.dirname(__file__), 'enzyme-datasets')}\n"
+                f"   Or: enzyme-datasets/\n\n"
+                f"   To fix this, clone the enzyme-datasets repository:\n"
+                f"   git clone https://github.com/samgoldman97/enzyme-datasets.git\n"
+                f"   Or download it to the project directory.\n"
+            )
+            raise FileNotFoundError(error_msg)
+        
         loader = EnzymeDatasetLoader(data_dir)
+        
+        # List available datasets for better error messages
+        available_datasets = []
+        try:
+            datasets_list = loader.list_available_datasets()
+            if datasets_list:
+                available_datasets = [d.name if hasattr(d, 'name') else str(d) for d in datasets_list]
+        except Exception:
+            pass
+        
+        # Also check processed directory for CSV files
+        processed_dir = os.path.join(data_dir, "processed")
+        if os.path.exists(processed_dir):
+            import glob
+            csv_files = glob.glob(os.path.join(processed_dir, "*.csv"))
+            csv_names = [os.path.splitext(os.path.basename(f))[0] for f in csv_files]
+            if csv_names:
+                available_datasets.extend(csv_names)
+                available_datasets = list(set(available_datasets))  # Remove duplicates
         
         # Load dataset - try exact match first, then case-insensitive match
         df = loader.load_dataset(dataset_name)
@@ -834,7 +1525,18 @@ def load_enzyme_dataset(dataset_name: str, max_samples: int):
                         df = None
         
         if df is None:
-            raise FileNotFoundError(f"Could not load dataset: {dataset_name}")
+            error_msg = f"Could not load enzyme dataset: {dataset_name}\n"
+            if available_datasets:
+                error_msg += f"\nAvailable datasets:\n"
+                for ds in sorted(available_datasets):
+                    error_msg += f"  - {ds}\n"
+            else:
+                error_msg += (
+                    f"\nNo datasets found in: {data_dir}\n"
+                    f"Please ensure the enzyme-datasets repository is cloned and contains data files.\n"
+                    f"Clone with: git clone https://github.com/samgoldman97/enzyme-datasets.git\n"
+                )
+            raise FileNotFoundError(error_msg)
         
         # Only log if we didn't already log via case-insensitive match
         if not loaded_via_case_insensitive:
@@ -876,7 +1578,7 @@ def load_enzyme_dataset(dataset_name: str, max_samples: int):
         
         logger.info(f"Using '{target_col}' as target column")
         
-        # Extract features from sequences and SMILES
+        # Extract features from sequences and SMILES (for ML training - NO RDKit features)
         logger.info("Extracting features from sequences and SMILES...")
         feature_dicts = []
         for idx, row in df.iterrows():
@@ -885,7 +1587,7 @@ def load_enzyme_dataset(dataset_name: str, max_samples: int):
             combined = {**seq_features, **smiles_features}
             feature_dicts.append(combined)
         
-        # Create feature DataFrame
+        # Create feature DataFrame (for ML training - NO RDKit features)
         X_df = pd.DataFrame(feature_dicts)
         feature_cols = X_df.columns.tolist()
         
@@ -906,11 +1608,20 @@ def load_enzyme_dataset(dataset_name: str, max_samples: int):
         X_encoded = X_df.values.astype(float)
         y_values = y_series.values.astype(float)
         
-        # Create original feature dicts (for LLM context)
+        # Create original feature dicts (for LLM context) - WITH RDKit features
         X_original = []
         df_valid = df[valid_mask].reset_index(drop=True)
         # Match X_df with df_valid (they should have the same length after subsampling)
         df_valid_subset = df_valid.iloc[:len(X_df)].reset_index(drop=True)
+        
+        # Extract SMILES strings for RDKit feature computation (for LLM only)
+        substrates_list = [str(df_valid_subset.iloc[idx]['SUBSTRATES']) for idx in range(len(X_df)) if idx < len(df_valid_subset)]
+        logger.info(f"Computing RDKit features for enzyme dataset '{dataset_name}' ({len(substrates_list)} SMILES) - for LLM only...")
+        rdkit_features_list = _compute_rdkit_features_batch(
+            substrates_list,
+            dataset_name=dataset_name,
+            use_cache=True
+        )
         
         for idx in range(len(X_df)):
             if idx >= len(df_valid_subset):
@@ -919,7 +1630,13 @@ def load_enzyme_dataset(dataset_name: str, max_samples: int):
             feat_dict = X_df.iloc[idx].to_dict()
             feat_dict['SEQ'] = str(df_valid_subset.iloc[idx]['SEQ'])
             feat_dict['SUBSTRATES'] = str(df_valid_subset.iloc[idx]['SUBSTRATES'])
+            # Add RDKit features computed from SUBSTRATES (SMILES) - ONLY for LLM
+            if idx < len(rdkit_features_list):
+                feat_dict.update(rdkit_features_list[idx])
             X_original.append(feat_dict)
+        
+        n_rdkit_features = len(rdkit_features_list[0]) if rdkit_features_list else 0
+        logger.info(f"Added RDKit features to X_original only ({n_rdkit_features} RDKit descriptors per sample) - NOT in ML training data")
         
         feature_encoders: Dict[str, Any] = {}
         dataset_label = f"Enzyme Dataset: {dataset_name}"
@@ -1300,14 +2017,26 @@ def load_deepchem_regression_dataset(dataset_name: str, max_samples: int):
         
         logger.info(f"Target range: [{y_values.min():.4f}, {y_values.max():.4f}]")
         
-        # X_original: SMILES strings for LLM
+        # X_original: SMILES strings + RDKit features for LLM
         # DeepChem stores SMILES in dataset.ids
+        logger.info("Computing RDKit features for DeepChem dataset...")
+        rdkit_features_list = _compute_rdkit_features_batch(
+            [str(smiles) for smiles in all_ids],
+            dataset_name=dataset_name_lower,
+            use_cache=True
+        )
+        
         X_original = []
-        for smiles in all_ids:
+        for i, smiles in enumerate(all_ids):
             # SMILES string is the primary input for LLM
             # Include it as a feature dict that LLM can understand
             feat_dict = {'SMILES': str(smiles)}
+            # Add RDKit features
+            if i < len(rdkit_features_list):
+                feat_dict.update(rdkit_features_list[i])
             X_original.append(feat_dict)
+        
+        logger.info(f"Added RDKit features to X_original ({len(rdkit_features_list[0])} RDKit descriptors per sample)")
         
         feature_encoders: Dict[str, Any] = {}
         
@@ -1338,6 +2067,392 @@ def load_deepchem_regression_dataset(dataset_name: str, max_samples: int):
         raise RuntimeError(f"DeepChem dataset '{dataset_name}' not available: {e}")
 
 
+def _select_topk_residual_balanced(X_tr_s, y_tr_s, residual_vec, k, bins=10):
+    """Select top-K residuals with balanced y-quantile coverage (helper for CV)."""
+    if k <= 0 or k >= len(y_tr_s):
+        return X_tr_s, y_tr_s, np.arange(len(y_tr_s))
+    abs_res = np.abs(residual_vec)
+    q = np.quantile(y_tr_s, np.linspace(0.0, 1.0, bins + 1)[1:-1])
+    yb = np.digitize(y_tr_s, q, right=True)
+    idxs = []
+    unique_bins, counts = np.unique(yb, return_counts=True)
+    proportions = {b: c / len(y_tr_s) for b, c in zip(unique_bins, counts)}
+    allocated = {b: max(1, int(round(k * proportions[b]))) for b in unique_bins}
+    total_alloc = sum(allocated.values())
+    while total_alloc > k:
+        bmax = max(allocated, key=lambda b: allocated[b])
+        if allocated[bmax] > 1:
+            allocated[bmax] -= 1
+            total_alloc -= 1
+        else:
+            break
+    while total_alloc < k:
+        bmin = min(allocated, key=lambda b: allocated[b])
+        allocated[bmin] += 1
+        total_alloc += 1
+    for b in unique_bins:
+        bin_idx = np.where(yb == b)[0]
+        if len(bin_idx) == 0:
+            continue
+        take = min(allocated[b], len(bin_idx))
+        top_in_bin = bin_idx[np.argsort(abs_res[bin_idx])[::-1][:take]]
+        idxs.extend(top_in_bin.tolist())
+    idxs = np.array(sorted(set(idxs)))
+    return X_tr_s[idxs], y_tr_s[idxs], idxs
+
+def _select_topk_balanced_y_quantile(X_tr_s, y_tr_s, k, bins=10):
+    """Select top-K samples with balanced y-quantile coverage (helper for CV)."""
+    if k <= 0 or k >= len(y_tr_s):
+        return X_tr_s, y_tr_s, np.arange(len(y_tr_s))
+    q = np.quantile(y_tr_s, np.linspace(0.0, 1.0, bins + 1)[1:-1])
+    yb = np.digitize(y_tr_s, q, right=True)
+    idxs = []
+    unique_bins, counts = np.unique(yb, return_counts=True)
+    proportions = {b: c / len(y_tr_s) for b, c in zip(unique_bins, counts)}
+    allocated = {b: max(1, int(round(k * proportions[b]))) for b in unique_bins}
+    total_alloc = sum(allocated.values())
+    while total_alloc > k:
+        bmax = max(allocated, key=lambda b: allocated[b])
+        if allocated[bmax] > 1:
+            allocated[bmax] -= 1
+            total_alloc -= 1
+        else:
+            break
+    while total_alloc < k:
+        bmin = min(allocated, key=lambda b: allocated[b])
+        allocated[bmin] += 1
+        total_alloc += 1
+    rng = np.random.RandomState(RANDOM_STATE)
+    for b in unique_bins:
+        bin_idx = np.where(yb == b)[0]
+        if len(bin_idx) == 0:
+            continue
+        take = min(allocated[b], len(bin_idx))
+        selected = rng.choice(bin_idx, size=take, replace=False)
+        idxs.extend(selected.tolist())
+    idxs = np.array(sorted(set(idxs)))
+    return X_tr_s[idxs], y_tr_s[idxs], idxs
+
+def run_fold_pipeline_regression(
+    X_train, X_val, X_test, y_train, y_val, y_test,
+    X_original_train, X_original_val, X_original_test,
+    feature_cols, feature_encoders,
+    args, llm, ds_name, ds_label, fold_output_dir, fold_num
+):
+    """
+    Run the complete training and evaluation pipeline for a single fold (regression).
+    Returns a dictionary with all metrics and results.
+    """
+    import json
+    from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+    
+    logger.info(f"Running fold {fold_num} pipeline...")
+    logger.info(f"  Train: {len(X_train)}, Val: {len(X_val)}, Test: {len(X_test)}")
+    
+    # Set output directory for this fold
+    original_output_dir = OUTPUT_DIR
+    set_output_dir(fold_output_dir)
+    
+    try:
+        # Scale features and targets
+        if args.no_scaling:
+            scaler = None
+            X_train_s, X_val_s, X_test_s = X_train, X_val, X_test
+            y_scaler_target = None
+            y_train_s, y_val_s, y_test_s = y_train, y_val, y_test
+        else:
+            scaler = MinMaxScaler010()
+            X_train_s = scaler.fit_transform(X_train)
+            X_val_s = scaler.transform(X_val)
+            X_test_s = scaler.transform(X_test)
+            y_scaler_target = MinMaxScaler010()
+            y_train_s = y_scaler_target.fit_transform(y_train.reshape(-1, 1)).ravel()
+            y_val_s = y_scaler_target.transform(y_val.reshape(-1, 1)).ravel()
+            y_test_s = y_scaler_target.transform(y_test.reshape(-1, 1)).ravel()
+        
+        # Train ML model
+        pretrained_ml = None
+        residuals = None
+        sorted_idx = None
+        ml_preds = None
+        
+        mech_map = {"linear": "LinearRegression", "xgboost": "XGBoost", "kernelridge": "KernelRidge", "tabicl": "TabICL", "ebm": "EBM", "tabpfn": "TabPFN"}
+        model_name = mech_map.get(args.ml_mech.lower(), "KernelRidge")
+        
+        if args.use_ml:
+            pretrained_ml = MLModelMechanism(model_name, task_type="regression")
+            if model_name == "TabICL":
+                pretrained_ml._tabicl_regression_bins = args.tabicl_bins
+            pretrained_ml.train(X_train_s, y_train_s, feature_cols, y_scaler=None)
+            pretrained_ml._maicl_feature_cols = feature_cols
+            pretrained_ml._maicl_feature_encoders = feature_encoders
+            pretrained_ml._maicl_scaler = scaler
+            
+            sorted_idx, residuals, ml_preds, _ = compute_ml_residuals(
+                pretrained_ml, X_train_s, y_train_s, feature_cols, class_names=None, task_type="regression"
+            )
+        
+        # Select top-K samples
+        if args.top_k == -1:
+            X_topk, y_topk, top_indices = X_train_s, y_train_s, np.arange(len(X_train_s))
+            X_original_topk = X_original_train
+        else:
+            if args.use_ml:
+                if args.topk_strategy == "residual_balanced":
+                    X_topk, y_topk, top_indices = _select_topk_residual_balanced(
+                        X_train_s, y_train_s, residuals, args.top_k, bins=10
+                    )
+                else:
+                    X_topk, y_topk, top_indices = get_top_k_residual_samples(
+                        sorted_idx, residuals, X_train_s, y_train_s, args.top_k,
+                        ml_predictions=ml_preds, task_type="regression", selection_strategy="residual"
+                    )
+            else:
+                X_topk, y_topk, top_indices = _select_topk_balanced_y_quantile(
+                    X_train_s, y_train_s, args.top_k, bins=10
+                )
+            
+            if len(top_indices) == 0:
+                X_topk, y_topk, top_indices = X_train_s, y_train_s, np.arange(len(X_train_s))
+                X_original_topk = X_original_train
+            else:
+                X_original_topk = [X_original_train[i] for i in top_indices]
+        
+        # Compute residuals on top-K subset
+        if args.top_k != -1 and args.use_ml:
+            sorted_idx, residuals_topk, ml_preds, _ = compute_ml_residuals(
+                pretrained_ml, X_topk, y_topk, feature_cols, class_names=None, task_type="regression"
+            )
+        else:
+            residuals_topk = residuals if residuals is not None else None
+        
+        # Compute ML baseline on test set
+        ml_baseline_metrics = {}
+        if args.use_ml and pretrained_ml:
+            try:
+                # Get predictions (need to handle different model types)
+                if model_name == "TabPFN":
+                    import subprocess, tempfile, sys, json, pandas as pd
+                    from pathlib import Path
+                    temp_dir = Path(tempfile.mkdtemp(prefix="tabpfn_ml_baseline_test_"))
+                    X_test_df = pd.DataFrame(X_test_s, columns=feature_cols)
+                    X_test_path = temp_dir / "X_test.csv"
+                    output_path = temp_dir / "pred_result_test.json"
+                    X_test_df.to_csv(X_test_path, index=False)
+                    script_path = Path(__file__).parent / "run_tabpfn_ml_mechanism.py"
+                    result = subprocess.run(
+                        [sys.executable, str(script_path), "predict",
+                         pretrained_ml._tabpfn_training_data_path['X_train_path'],
+                         pretrained_ml._tabpfn_training_data_path['y_train_path'],
+                         str(X_test_path), pretrained_ml.task_type, str(output_path)],
+                        capture_output=True, text=True, timeout=600
+                    )
+                    if result.returncode == 0 and output_path.exists():
+                        with open(output_path, 'r') as f:
+                            pred_result = json.load(f)
+                        if pred_result.get('success', False):
+                            y_pred = np.array(pred_result['predictions'], dtype=float)
+                        else:
+                            raise RuntimeError(f"TabPFN failed: {pred_result.get('error', 'Unknown error')}")
+                    else:
+                        raise RuntimeError("TabPFN subprocess failed")
+                    try:
+                        import shutil
+                        shutil.rmtree(temp_dir)
+                    except:
+                        pass
+                elif model_name == "TabICL":
+                    import pandas as pd
+                    X_test_df = pd.DataFrame(X_test_s, columns=feature_cols)
+                    y_pred = pretrained_ml.model.predict(X_test_df)
+                else:
+                    y_pred = pretrained_ml.model.predict(X_test_s)
+                
+                # Unscale predictions if needed
+                if y_scaler_target:
+                    # MinMaxScaler010 doesn't have inverse_transform, so we implement it manually
+                    pred_reshaped = y_pred.reshape(-1, 1)
+                    if hasattr(y_scaler_target, 'inverse_transform'):
+                        y_pred_unscaled = y_scaler_target.inverse_transform(pred_reshaped).ravel()
+                    else:
+                        # Manual inverse transform for MinMaxScaler010
+                        # Formula: scaled = scale_ * (original - min_) + feature_range[0]
+                        # Inverse: original = (scaled - feature_range[0]) / scale_ + min_
+                        feature_range = getattr(y_scaler_target, 'feature_range', (0.0, 1.0))
+                        scale = y_scaler_target.scale_
+                        min_orig = y_scaler_target.min_
+                        # Handle division by zero (when scale is 0, feature is constant)
+                        scale_safe = np.where(scale != 0, scale, 1.0)
+                        y_pred_unscaled = ((pred_reshaped - feature_range[0]) / scale_safe + min_orig).ravel()
+                    y_test_unscaled = y_test  # y_test is already unscaled
+                else:
+                    y_pred_unscaled = y_pred
+                    y_test_unscaled = y_test
+                
+                r2 = r2_score(y_test_unscaled, y_pred_unscaled)
+                mae = mean_absolute_error(y_test_unscaled, y_pred_unscaled)
+                mse = mean_squared_error(y_test_unscaled, y_pred_unscaled)
+                ml_baseline_metrics = {
+                    "r2": float(r2), "mae": float(mae), "mse": float(mse),
+                    "predictions": y_pred_unscaled.tolist()
+                }
+            except Exception as e:
+                logger.warning(f"Failed to compute ML baseline metrics: {e}")
+        
+        # Create and train MA-ICL
+        maicl = TrainableMAICL(
+            llm, feature_cols, scaler,
+            use_ml_mechanism=bool(args.use_ml),
+            dataset_name=ds_name,
+            y_scaler=y_scaler_target,
+            pretrained_ml_mechanism=pretrained_ml,
+            data_insights=None,
+            task_type="regression",
+            class_names=None,
+            regression_loss_metric=args.regression_loss,
+            num_mechanisms_unknown=args.num_mechanisms_unknown,
+            use_scaling=not args.no_scaling
+        )
+        if ml_baseline_metrics:
+            try:
+                maicl.set_ml_baseline_performance(ml_baseline_metrics)
+            except Exception:
+                pass
+        
+        # Pre-training evaluation
+        pre = maicl.evaluate(
+            X_test_s, y_test_s, X_train_s, y_train_s,
+            return_details=True, relax_routing=bool(args.relax_eval),
+            X_original=X_original_test, X_pool_original=X_original_train,
+        )
+        pre_r2 = float(pre.get('r2', 0.0))
+        pre_mae = float(pre.get('mae', 0.0))
+        pre_loss = float(pre.get('loss', float('inf')))
+        
+        # Train MA-ICL
+        maicl.train(
+            X_topk, y_topk, X_val_s, y_val_s,
+            iterations=args.iterations,
+            ml_residuals=residuals_topk,
+            accept_eval_max=None,
+            X_test=X_test_s, y_test=y_test_s,
+            acceptance_set=args.acceptance_set,
+            X_train_original=X_original_topk,
+            X_val_original=X_original_val,
+            X_test_original=X_original_test,
+            output_dir=fold_output_dir,
+        )
+        
+        # Post-training evaluation
+        post = maicl.evaluate(
+            X_test_s, y_test_s, X_train_s, y_train_s,
+            return_details=True, relax_routing=True,
+            preserve_mechanism_performance=True,
+            X_original=X_original_test, X_pool_original=X_original_train,
+        )
+        post_r2 = float(post.get('r2', 0.0))
+        post_mae = float(post.get('mae', 0.0))
+        post_loss = float(post.get('loss', float('inf')))
+        
+        # LLM-only evaluation
+        llm_only_metrics = None
+        try:
+            llm_only_metrics = maicl.evaluate_llm_only(
+                X_test_s, y_test_s, X_train_s, y_train_s,
+                return_details=True,
+                X_original=X_original_test, X_pool_original=X_original_train,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to evaluate LLM-only: {e}")
+        
+        # Save fold results
+        fold_result = {
+            'fold_num': fold_num,
+            'n_train': len(X_train_s),
+            'n_val': len(X_val_s),
+            'n_test': len(X_test_s),
+            'ml_baseline_r2': ml_baseline_metrics.get('r2', 0.0),
+            'ml_baseline_mae': ml_baseline_metrics.get('mae', 0.0),
+            'pre_r2': pre_r2,
+            'pre_mae': pre_mae,
+            'pre_loss': pre_loss,
+            'post_r2': post_r2,
+            'post_mae': post_mae,
+            'post_loss': post_loss,
+        }
+        
+        if llm_only_metrics:
+            fold_result['llm_only_pre_r2'] = float(llm_only_metrics.get('r2', 0.0))
+            fold_result['llm_only_pre_mae'] = float(llm_only_metrics.get('mae', 0.0))
+            fold_result['llm_only_post_r2'] = float(llm_only_metrics.get('r2', 0.0))
+            fold_result['llm_only_post_mae'] = float(llm_only_metrics.get('mae', 0.0))
+        
+        # Save fold-specific results file
+        fold_results_file = os.path.join(fold_output_dir, "fold_results.json")
+        with open(fold_results_file, 'w') as f:
+            json.dump(fold_result, f, indent=2)
+        
+        logger.info(f"Fold {fold_num} complete: R2={post_r2:.4f}, MAE={post_mae:.4f}")
+        
+        return fold_result
+        
+    finally:
+        # Restore original output directory
+        set_output_dir(original_output_dir)
+
+
+def save_cv_summary_regression(cv_results, output_dir, args):
+    """
+    Aggregate cross-validation results and save summary statistics (regression).
+    """
+    import json
+    import numpy as np
+    
+    # Aggregate metrics across folds
+    metrics_to_aggregate = [
+        'ml_baseline_r2', 'ml_baseline_mae',
+        'pre_r2', 'pre_mae', 'pre_loss',
+        'post_r2', 'post_mae', 'post_loss',
+        'llm_only_pre_r2', 'llm_only_pre_mae',
+        'llm_only_post_r2', 'llm_only_post_mae'
+    ]
+    
+    summary = {
+        'n_folds': len(cv_results),
+        'cv_folds': args.cv_folds,
+        'fold_results': cv_results,
+        'summary_statistics': {}
+    }
+    
+    # Compute mean and std for each metric
+    for metric in metrics_to_aggregate:
+        values = [r.get(metric, None) for r in cv_results if r.get(metric) is not None]
+        if values:
+            summary['summary_statistics'][metric] = {
+                'mean': float(np.mean(values)),
+                'std': float(np.std(values)),
+                'min': float(np.min(values)),
+                'max': float(np.max(values)),
+                'values': [float(v) for v in values]
+            }
+    
+    # Save summary
+    summary_file = os.path.join(output_dir, "cv_summary.json")
+    with open(summary_file, 'w') as f:
+        json.dump(summary, f, indent=2)
+    
+    # Print summary
+    logger.info("\n" + "=" * 80)
+    logger.info("CROSS-VALIDATION SUMMARY")
+    logger.info("=" * 80)
+    logger.info(f"Number of folds: {len(cv_results)}")
+    logger.info("\nSummary Statistics:")
+    for metric, stats in summary['summary_statistics'].items():
+        logger.info(f"  {metric}: {stats['mean']:.4f} ± {stats['std']:.4f} (min={stats['min']:.4f}, max={stats['max']:.4f})")
+    logger.info(f"\nFull summary saved to: {summary_file}")
+    logger.info(f"Individual fold results saved in: {output_dir}/fold_*/")
+
+
 def main():
     # Explicitly reference global json module to prevent UnboundLocalError
     # (Python may treat json as local if it sees json.load() calls later in the function)
@@ -1347,6 +2462,10 @@ def main():
     parser.add_argument("--dataset", type=str, required=True,
                         help="Dataset name. Options:\n"
                              "  Built-in: gfp_yield, protein_expression, protein_expression_all, dataset_102\n"
+                             "  InaData (SU/EC):\n"
+                             "    - pfas_su (PFAS developmental assay; pupation/eclosure)\n"
+                             "    - ec_fertility (fertility/eclosion counts)\n"
+                             "    - ec_climbing (climbing % over time)\n"
                              "  TabArena (HuggingFace/sklearn regression):\n"
                              "    - diabetes (sklearn)\n"
                              "    - housing (sklearn, with HuggingFace fallback)\n"
@@ -1365,18 +2484,31 @@ def main():
                              "    - phosphatase_chiral\n"
                              "    - davis\n"
                              "    - davis_filtered")
+    parser.add_argument("--su_target", type=str, default="female_ratio_final",
+                        help="Target for --dataset pfas_su. Options include: pupation_total, pupation_t50, "
+                             "eclosure_total, eclosure_t50, female_ratio_final (default: eclosure_total).")
+    parser.add_argument("--ec_target", type=str, default=None,
+                        help="Target for --dataset ec_fertility or ec_climbing. "
+                             "Defaults: ec_fertility -> total_eclosed, ec_climbing -> avg_16s. "
+                             "Examples: --ec_target total_pupae (fertility) or --ec_target female_16s (climbing).")
     parser.add_argument("--plate_file", type=str, default=None,
                         help="Plate file name for protein_expression dataset (e.g., 'plate_AL_1_raw_yield_and_std.csv')")
-    parser.add_argument("--plate_index", type=int, default=None,
+    parser.add_argument("--plate_index", type=int, default=5,
                         help="Plate index (0-based) for protein_expression dataset. Use --list_plates to see available indices.")
     parser.add_argument("--list_plates", action="store_true",
                         help="List all available protein expression plate files and exit")
+    parser.add_argument("--list_enzyme_datasets", action="store_true",
+                        help="List all available enzyme datasets and exit")
     parser.add_argument("--model_name", default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash"),
                         help="Gemini model name, e.g., gemini-2.0-flash, gemini-2.5-pro")
     parser.add_argument("--ml_mech", default="linear", help="Regression ML mechanism: linear|xgboost|kernelridge|tabicl|ebm|tabpfn. "
                         "Note: TabPFN may cause segmentation faults when used as ML mechanism. "
                         "Consider using TabPFN only as a baseline (it runs in isolated subprocess) "
                         "or use --ml_mech linear/xgboost for more stable ML mechanism.")
+    parser.add_argument("--baseline_models", type=str, nargs='+', default=None,
+                        help="Select which baseline models to compute. Options: tabpfn, ebm, shap. "
+                             "If not specified, all available baselines will be computed. "
+                             "Example: --baseline_models tabpfn ebm")
     parser.add_argument("--tabicl_bins", type=int, default=20,
                         help="Number of bins for TabICL regression quantization (default: 20). "
                              "Only used when --ml_mech=tabicl. Higher values = finer granularity but more classes.")
@@ -1407,6 +2539,10 @@ def main():
                              "If > 0, retrieves k_shot examples from training set for each prediction.")
     parser.add_argument("--no_scaling", action="store_true",
                         help="Disable all scaling for both features and targets. Use raw/unscaled data throughout.")
+    parser.add_argument("--cv_folds", type=int, default=0,
+                        help="Number of cross-validation folds (default: 0 = disabled). "
+                             "When > 0, performs k-fold cross-validation and saves results for each fold. "
+                             "Example: --cv_folds 5 for 5-fold CV.")
     args = parser.parse_args()
 
     # Handle --list_plates option
@@ -1426,6 +2562,67 @@ def main():
             print(f"  python {os.path.basename(__file__)} --dataset protein_expression --plate_file {plates[0]}")
         else:
             print("No protein expression plates found.")
+        return
+    
+    # Handle --list_enzyme_datasets option
+    if args.list_enzyme_datasets:
+        try:
+            from enzyme_dataset_analysis import EnzymeDatasetLoader
+            data_dir = os.path.join(os.path.dirname(__file__), "enzyme-datasets", "data")
+            if not os.path.exists(data_dir):
+                data_dir = "enzyme-datasets/data"
+            
+            if not os.path.exists(data_dir) and not os.path.exists("enzyme-datasets"):
+                print("\n❌ Enzyme dataset directory not found!")
+                print(f"   Expected location: {os.path.join(os.path.dirname(__file__), 'enzyme-datasets')}")
+                print(f"   Or: enzyme-datasets/\n")
+                print("   To fix this, clone the enzyme-datasets repository:")
+                print("   git clone https://github.com/samgoldman97/enzyme-datasets.git")
+                print("   Or download it to the project directory.\n")
+                return
+            
+            loader = EnzymeDatasetLoader(data_dir)
+            datasets_list = loader.list_available_datasets()
+            
+            # Also check processed directory
+            processed_dir = os.path.join(data_dir, "processed")
+            csv_datasets = []
+            if os.path.exists(processed_dir):
+                import glob
+                csv_files = glob.glob(os.path.join(processed_dir, "*.csv"))
+                csv_datasets = [os.path.splitext(os.path.basename(f))[0] for f in csv_files]
+            
+            print("\nAvailable Enzyme Datasets:")
+            print("=" * 60)
+            
+            if datasets_list:
+                print("\nFrom dataset directories:")
+                for ds in datasets_list:
+                    ds_name = ds.name if hasattr(ds, 'name') else str(ds)
+                    print(f"  - {ds_name}")
+            
+            if csv_datasets:
+                print("\nFrom processed CSV files:")
+                for ds in sorted(set(csv_datasets)):
+                    print(f"  - {ds}")
+            
+            if not datasets_list and not csv_datasets:
+                print("  No datasets found.")
+                print(f"\n  Checked: {data_dir}")
+                if os.path.exists(processed_dir):
+                    print(f"  Checked: {processed_dir}")
+            
+            print("=" * 60)
+            total = len(datasets_list) + len(set(csv_datasets))
+            print(f"\nTotal: {total} dataset(s) available")
+            print("\nUsage example:")
+            if datasets_list or csv_datasets:
+                example_ds = datasets_list[0].name if datasets_list else csv_datasets[0]
+                print(f"  python {os.path.basename(__file__)} --dataset {example_ds} --top_k 300")
+        except Exception as e:
+            print(f"\nError listing enzyme datasets: {e}")
+            import traceback
+            traceback.print_exc()
         return
 
     # IMPORTANT: allow LLM mechanisms to contribute during regression (don't force-route only to ML)
@@ -1459,6 +2656,22 @@ def main():
         f"topkstrat{args.topk_strategy}",
     ]
     
+    # Add dataset-specific target arguments
+    if dataset_name_lower == "pfas_su":
+        # Add su_target for PFAS SU dataset
+        su_target_sanitized = str(args.su_target).strip().replace('-', '_').replace('.', '_')
+        run_name_parts.append(f"sutarget{su_target_sanitized}")
+    elif dataset_name_lower == "ec_fertility":
+        # Add ec_target for EC fertility dataset (use default if not specified)
+        ec_target = args.ec_target.strip() if isinstance(args.ec_target, str) and args.ec_target.strip() else "total_eclosed"
+        ec_target_sanitized = ec_target.replace('-', '_').replace('.', '_')
+        run_name_parts.append(f"ectarget{ec_target_sanitized}")
+    elif dataset_name_lower == "ec_climbing":
+        # Add ec_target for EC climbing dataset (use default if not specified)
+        ec_target = args.ec_target.strip() if isinstance(args.ec_target, str) and args.ec_target.strip() else "avg_16s"
+        ec_target_sanitized = ec_target.replace('-', '_').replace('.', '_')
+        run_name_parts.append(f"ectarget{ec_target_sanitized}")
+    
     # Add optional flags
     if args.relax_eval:
         run_name_parts.append("relax")
@@ -1472,11 +2685,24 @@ def main():
         run_name_parts.append(f"val{args.val_size:.2f}".replace('.', '_'))
     if args.ml_mech == "tabicl":  # Include tabicl_bins if using tabicl
         run_name_parts.append(f"bins{args.tabicl_bins}")
+    if args.cv_folds > 0:
+        run_name_parts.append(f"cv{args.cv_folds}")
     
     # Join all parts with underscores
     run_name = "_".join(run_name_parts)
     output_dir = set_output_dir(run_name)
     logger.info(f"Output directory: {output_dir}")
+    
+    # Set up file logging to save terminal output
+    log_file = os.path.join(output_dir, "run.log")
+    file_handler = logging.FileHandler(log_file, mode='w', encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)  # Log everything to file
+    file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(file_formatter)
+    # Add file handler to root logger (will capture all logging)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(file_handler)
+    logger.info(f"Logging to file: {log_file}")
 
     # Save experiment configuration for reproducibility
     experiment_config = {
@@ -1537,6 +2763,20 @@ def main():
         X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_protein_expression_all_plates_dataset(args.max_samples)
     elif dataset_name_lower == "dataset_102":
         X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_dataset_102(args.max_samples)
+    elif dataset_name_lower == "pfas_su":
+        X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_inadata_pfas_su_dataset(
+            args.max_samples, target=str(args.su_target).strip()
+        )
+    elif dataset_name_lower == "ec_fertility":
+        ec_target = args.ec_target.strip() if isinstance(args.ec_target, str) and args.ec_target.strip() else "total_eclosed"
+        X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_inadata_ec_fertility_dataset(
+            args.max_samples, target=ec_target
+        )
+    elif dataset_name_lower == "ec_climbing":
+        ec_target = args.ec_target.strip() if isinstance(args.ec_target, str) and args.ec_target.strip() else "avg_16s"
+        X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_inadata_ec_climbing_dataset(
+            args.max_samples, target=ec_target
+        )
     elif dataset_name_lower in ("esol", "delaney", "lipo", "lipophilicity"):
         # DeepChem molecular regression datasets
         X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_deepchem_regression_dataset(
@@ -1581,7 +2821,92 @@ def main():
         json.dump(experiment_config, f, indent=2)
     logger.info(f"Updated experiment configuration with dataset information")
     
-    from sklearn.model_selection import train_test_split
+    from sklearn.model_selection import train_test_split, KFold
+    from scipy.stats import binned_statistic
+    
+    # Check if cross-validation is enabled
+    cv_folds = args.cv_folds if args.cv_folds > 0 else 0
+    
+    if cv_folds > 0:
+        logger.info("=" * 80)
+        logger.info(f"CROSS-VALIDATION MODE: {cv_folds}-fold CV")
+        logger.info("=" * 80)
+        
+        # For regression, use KFold (can't use StratifiedKFold for continuous targets)
+        # Optionally use quantile-based stratification
+        try:
+            # Try quantile-based stratification for regression
+            n_bins = min(10, cv_folds)
+            quantiles = np.quantile(y_all, np.linspace(0.0, 1.0, n_bins + 1)[1:-1])
+            y_bins = np.digitize(y_all, quantiles, right=True)
+            kf = KFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_STATE)
+            splits = list(kf.split(X_all, y_bins))
+            logger.info("Using quantile-based stratification for CV folds")
+        except Exception:
+            # Fallback to regular KFold
+            kf = KFold(n_splits=cv_folds, shuffle=True, random_state=RANDOM_STATE)
+            splits = list(kf.split(X_all))
+            logger.info("Using regular KFold for CV (quantile stratification unavailable)")
+        
+        # Store results for all folds
+        cv_results = []
+        
+        # Run each fold
+        for fold_idx, (train_val_idx, test_idx) in enumerate(splits):
+            logger.info("=" * 80)
+            logger.info(f"FOLD {fold_idx + 1}/{cv_folds}")
+            logger.info("=" * 80)
+            
+            # Create fold-specific output directory
+            fold_output_dir = os.path.join(output_dir, f"fold_{fold_idx + 1}")
+            os.makedirs(fold_output_dir, exist_ok=True)
+            
+            # Split data for this fold
+            X_train_val = X_all[train_val_idx]
+            y_train_val = y_all[train_val_idx]
+            X_original_train_val = [X_original_all[i] for i in train_val_idx]
+            X_test = X_all[test_idx]
+            y_test = y_all[test_idx]
+            X_original_test = [X_original_all[i] for i in test_idx]
+            
+            # Further split train_val into train and validation
+            idx_train_val = np.arange(len(X_train_val))
+            try:
+                # Try quantile-based stratification for train/val split
+                n_bins = 10
+                quantiles_tr = np.quantile(y_train_val, np.linspace(0.0, 1.0, n_bins + 1)[1:-1])
+                y_bins_tr = np.digitize(y_train_val, quantiles_tr, right=True)
+                X_train, X_val, y_train, y_val, idx_tr, idx_va = train_test_split(
+                    X_train_val, y_train_val, idx_train_val, test_size=float(args.val_size),
+                    random_state=RANDOM_STATE, stratify=y_bins_tr
+                )
+            except Exception:
+                # Fallback to random split
+                X_train, X_val, y_train, y_val, idx_tr, idx_va = train_test_split(
+                    X_train_val, y_train_val, idx_train_val, test_size=float(args.val_size),
+                    random_state=RANDOM_STATE
+                )
+            
+            X_original_train = [X_original_train_val[i] for i in idx_tr]
+            X_original_val = [X_original_train_val[i] for i in idx_va]
+            
+            # Run the pipeline for this fold
+            fold_result = run_fold_pipeline_regression(
+                X_train, X_val, X_test, y_train, y_val, y_test,
+                X_original_train, X_original_val, X_original_test,
+                feature_cols, feature_encoders,
+                args, llm, dataset_name_lower, ds_label, fold_output_dir, fold_idx + 1
+            )
+            cv_results.append(fold_result)
+        
+        # Aggregate and save CV summary
+        save_cv_summary_regression(cv_results, output_dir, args)
+        logger.info("=" * 80)
+        logger.info("CROSS-VALIDATION COMPLETE")
+        logger.info("=" * 80)
+        return
+    
+    # Standard single run (no CV)
     # Regression-friendly stratification: bin y into quantiles and stratify to preserve target distribution
     split_method = "random"  # Track which split method was used
     try:
@@ -2115,7 +3440,8 @@ def main():
         task_type="regression",
         feature_cols=feature_cols,
         y_scaler=y_scaler_target,
-        no_scaling=args.no_scaling
+        no_scaling=args.no_scaling,
+        baseline_models=args.baseline_models
     )
 
     maicl = TrainableMAICL(
