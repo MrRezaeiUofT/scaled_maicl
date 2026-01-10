@@ -305,14 +305,26 @@ prompts:
         You are a mechanism encoder that discovers latent causal patterns in regression data.
         Given dataset statistics, feature names, and sample residual/error patterns, infer plausible underlying mechanisms.
         
+        CRITICAL: You are learning from TWO sources of information:
+        1. RESIDUAL PATTERNS: Which samples have errors and why (gap-filling perspective)
+        2. SAMPLE PATTERNS: Direct relationships between features and target values (pattern learning perspective)
+        
+        IMPORTANT: Don't just learn to fix errors - learn the TRUE UNDERLYING PATTERNS from the samples themselves.
+        - Study the actual feature-to-target relationships in the samples
+        - Identify patterns that explain why certain feature combinations lead to certain target values
+        - Learn prediction strategies based on sample patterns, not just error correction
+        
         Focus on mechanisms that can BOTH:
         - Improve predictive performance (capture nonlinearities, interactions, saturation, thresholds)
         - Improve interpretability (clear causal story + named intermediate concepts)
+        - Learn TRUE PATTERNS from samples (not just gap-filling)
         
         Think in terms of:
         - Nonlinear transforms: saturation (x/(K+x)), diminishing returns, inverse-U, log/exp, soft-thresholds
         - Interactions: synergy, inhibition, ratio effects, gating (A * f(B)), AND/OR-like combinations
         - Latent intermediate concepts (combinatory variables): "effective_dose", "binding_proxy", "capacity_limit", etc.
+        - Direct pattern learning: How do features relate to targets in the samples? What patterns emerge?
+        - Prediction strategies: Based on the samples, how would you predict the target? What rules work?
         - Complementarity: avoid simply restating what a linear model would do
 
     encoder_with_data: |
@@ -323,10 +335,37 @@ prompts:
       {task_description}
       
       CRITICAL OUTPUT REQUIREMENTS:
-      - Be concise and useful: 3-5 sentences.
-      - Mention 1-2 nonlinearities and 1-2 interactions that would likely fix residual patterns.
+      - Be descriptive and specific: 5-10 sentences explaining BOTH error patterns AND direct sample patterns you observe.
+      - DUAL PERSPECTIVE ANALYSIS:
+        * ERROR PATTERNS: Which samples have errors and why? What does the model miss?
+        * SAMPLE PATTERNS: What direct relationships do you see between features and targets in the samples?
+          - How do feature values relate to target values across different samples?
+          - What prediction rules would work based on the sample patterns?
+          - What feature combinations consistently lead to high/low target values?
+      - Mention 1-2 nonlinearities and 1-2 interactions that explain BOTH error patterns AND sample patterns.
+        * For nonlinearities: Be specific (e.g., "saturation effect where BMI/(0.5+BMI) captures diminishing returns", 
+          "quadratic relationship where age^2 shows acceleration of risk", "threshold effect where max(0, bp-0.3) captures hypertension")
+        * For interactions: Be specific (e.g., "age × BMI interaction where older individuals show amplified BMI effects", 
+          "sex × BMI where males have stronger BMI-progression relationship")
       - Name 1-3 latent intermediate concepts (combinatory variables) and what they represent.
+        * Example format: "Metabolic Risk Score (z1): combines age, BMI, and blood pressure nonlinearly to represent cumulative metabolic stress"
+        * Explain what each concept captures mechanistically
+        * Describe how these concepts help PREDICT based on sample patterns, not just fix errors
+      - Provide concrete examples from BOTH residual samples AND direct sample patterns:
+        * ERROR PATTERNS: Reference specific error patterns (e.g., "Samples with high BMI and older age show positive residuals, suggesting...")
+        * SAMPLE PATTERNS: Reference direct feature-target relationships (e.g., "Samples with high age and high BMI consistently have high target values, indicating...")
+        * PREDICTION STRATEGY: Describe how you would predict based on sample patterns (e.g., "When age > 0.5 and BMI > 0.6, target is typically > 0.7")
       - Avoid vague filler (no "specific patterns"/"distinctive relationships").
+      - Be actionable: Your insights will be used to design a mechanism formula, so be concrete about functional forms.
+      - LEARN TO PREDICT: Focus on learning the true underlying pattern from samples, not just fixing specific errors.
+
+      EXAMPLE OF GOOD OUTPUT:
+      "The residuals suggest the model struggles with a non-linear interaction between age and BMI, particularly when combined with sex. 
+      Specifically, younger males with higher BMI tend to be underpredicted (positive residual), while older females with lower BMI 
+      are overpredicted (negative residual). A latent variable 'Metabolic Risk Score' (z1), combining age, BMI, and blood pressure 
+      nonlinearly (e.g., age * BMI^2), would better capture disease progression. Additionally, a 'Hormonal Influence' term (z2), 
+      calculated as sex * BMI, captures how sex hormones modulate fat distribution effects. The model also misses a saturation effect 
+      at high BMI values, where BMI/(0.8+BMI) would better capture diminishing returns of obesity on progression."
 
       Latent mechanism z:
 
@@ -728,9 +767,14 @@ prompts:
           
           Use actual feature names: "Temperature (deg C)", "Potassium concentration (mM)", "Magnesium concentration (mM)", "NTPs concentration (mM)", "DNA concentration (nM)"
           
-          All values are scaled to [0, 1]. Adjust Km values accordingly (e.g., if Mg is scaled, Km_Mg should be ~0.08-0.12 for 8-12 mM).
+          CRITICAL SCALING REQUIREMENT:
+          - All feature values you see in examples (like Temperature=0.93, Potassium=0.60) are SCALED to [0, 1]
+          - ALL constants in your formula MUST also be in [0, 1] scaled range
+          - Example: If optimal temperature is 34°C and range is 22-37°C, use 0.8 (scaled) NOT 34 (unscaled)
+          - Example: If Km for Mg is 8-12 mM and range is 2.5-12.5 mM, use 0.55-0.76 (scaled) NOT 8-12 (unscaled)
+          - Base ALL constants on the SCALED sample values you see, not on raw physical units
           
-          Output a formula that captures these biochemical relationships with appropriate coefficients and saturation constants.
+          Output a formula that captures these biochemical relationships with appropriate SCALED coefficients and saturation constants.
       
       protein_expression:
         encoder: |
@@ -1596,7 +1640,7 @@ prompts:
           - If feature names are anonymous (att1..att47), treat them as biomarker-like measurements and describe OPERATIONAL signatures only.
           
           KEEP IT SHORT:
-          - MECHANISM DESCRIPTION: 2-3 sentences.
+          - MECHANISM DESCRIPTION: 5-10 sentences.
           - For each class: 2 short lines max (SIGNATURE + INTERPRETATION) + the equation.
       
       credit:

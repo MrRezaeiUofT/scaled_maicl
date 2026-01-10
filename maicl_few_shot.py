@@ -83,8 +83,8 @@ def retrieve_few_shot_examples(
             # Sort by residual magnitude (highest first)
             sorted_indices = np.argsort(abs_residuals)[::-1]
             
-            # Take top 50% from high-residual examples, rest randomly from remaining
-            high_residual_count = min(n_samples // 2, len(sorted_indices))
+            # Use all high-residual examples (no limit)
+            high_residual_count = min(n_samples, len(sorted_indices))
             high_residual_indices = sorted_indices[:high_residual_count]
             
             # Remaining samples: mix of medium-residual and random

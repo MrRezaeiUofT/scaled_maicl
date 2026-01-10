@@ -303,10 +303,14 @@ def _execute_mechanism_formula_programmatic(mechanism_text: str, x_dict: Dict[st
                 safe_dict[key] = float(val)
         
         # Replace feature names in formula with safe names
-        for orig_key, val in x_dict.items():
+        # Sort by length (longest first) to avoid partial matches (e.g., "Temperature" matching before "Temperature (deg C)")
+        sorted_keys = sorted(x_dict.keys(), key=lambda k: len(str(k)), reverse=True)
+        for orig_key in sorted_keys:
             safe_key = re.sub(r'[^a-zA-Z0-9_]', '_', str(orig_key))
-            # Replace both original and safe versions
-            formula = formula.replace(str(orig_key), safe_key)
+            # Replace exact matches only (sorting by length ensures longer names are replaced first)
+            # This prevents "Temperature" from being replaced before "Temperature (deg C)"
+            orig_key_str = str(orig_key)
+            formula = formula.replace(orig_key_str, safe_key)
         
         # Add math functions to safe environment
         import math
@@ -316,6 +320,11 @@ def _execute_mechanism_formula_programmatic(mechanism_text: str, x_dict: Dict[st
             'sin': math.sin, 'cos': math.cos, 'tan': math.tan,
             'pow': pow, '__builtins__': {}
         })
+        
+        # Add clip function for regression formulas (critical for scaled data)
+        def clip_func(x, min_val, max_val):
+            return max(min_val, min(max_val, float(x)))
+        safe_dict['clip'] = clip_func
         
         # Execute formula
         try:

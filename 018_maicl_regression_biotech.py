@@ -100,6 +100,13 @@ except:
     _HAS_SHAP = False
 
 try:
+    import llmlex
+    import openai
+    _HAS_LLMLEX = True
+except:
+    _HAS_LLMLEX = False
+
+try:
     from xgboost import XGBRegressor, XGBClassifier
     _HAS_XGB = True
 except:
@@ -196,11 +203,11 @@ def save_scatter_plot(y_true, y_pred, title, filename, output_dir):
 def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="regression", 
                                  feature_cols=None, y_scaler=None, no_scaling=False,
                                  baseline_models=None):
-    """Compute additional baseline models: TabPFN, EBM, SHAP-based model
+    """Compute additional baseline models: TabPFN, EBM, SHAP-based model, LLM-LEx
     
     Args:
         baseline_models: List of baseline model names to compute. If None, compute all available.
-                        Options: 'tabpfn', 'ebm', 'shap'
+                        Options: 'tabpfn', 'ebm', 'shap', 'llmlex'
     
     Returns:
         Dict with baseline metrics for each model
@@ -209,7 +216,7 @@ def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="re
     
     # Default: compute all baselines if not specified
     if baseline_models is None:
-        baseline_models = ['tabpfn', 'ebm', 'shap']
+        baseline_models = ['tabpfn', 'ebm', 'shap', 'llmlex']
     else:
         # Normalize to lowercase
         baseline_models = [m.lower() for m in baseline_models]
@@ -448,6 +455,134 @@ def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="re
                     }
         except Exception as e:
             logger.warning(f"Failed to compute SHAP baseline: {e}")
+    
+    # LLM-LEx symbolic regression baseline
+    if 'llmlex' in baseline_models and _HAS_LLMLEX and task_type == "regression":
+        try:
+            logger.info("Computing LLM-LEx symbolic regression baseline...")
+            from sklearn.decomposition import PCA
+            from sklearn.linear_model import LinearRegression
+            
+            # Load environment variables
+            _load_env()
+            
+            # Check for API key
+            api_key = os.getenv("OPENROUTER_API_KEY")
+            if not api_key:
+                raise RuntimeError("OPENROUTER_API_KEY not found in .env file")
+            
+            # Create OpenAI client (matches llmlex documentation pattern)
+            client = openai.OpenAI(
+                base_url="https://openrouter.ai/api/v1",
+                api_key=api_key
+            )
+            
+            # Reduce to 1D for symbolic regression using PCA
+            if X_train.shape[1] > 1:
+                logger.info("  Using PCA to reduce features to 1D for symbolic regression")
+                pca = PCA(n_components=1)
+                x_train_1d = pca.fit_transform(X_train).ravel()
+                x_test_1d = pca.transform(X_test).ravel()
+            else:
+                x_train_1d = X_train.ravel()
+                x_test_1d = X_test.ravel()
+            
+            # Generate base64 image (matches llmlex documentation pattern)
+            logger.info("  Generating visualization for llmlex...")
+            fig, ax = plt.subplots()
+            ax.scatter(x_train_1d, y_train)
+            base64_img = llmlex.images.generate_base64_image(fig, ax, x_train_1d, y_train)
+            plt.close(fig)
+            
+            # Try genetic algorithm first, fallback to single_call
+            best_result = None
+            best_expression = None
+            best_params = None
+            
+            try:
+                logger.info("  Running llmlex genetic algorithm...")
+                populations = llmlex.run_genetic(
+                    client, base64_img, x_train_1d, y_train,
+                    population_size=5,
+                    num_of_generations=3,
+                    model="openai/gpt-4o"
+                )
+                
+                if populations and len(populations) > 0:
+                    last_gen = populations[-1]
+                    if last_gen and len(last_gen) > 0:
+                        best_result = min(last_gen, key=lambda x: x.get('score', float('inf')))
+                        best_expression = best_result.get('ansatz', None)
+                        best_params = best_result.get('params', {})
+                        logger.info(f"  Best expression: {best_expression}")
+            except Exception as e:
+                logger.warning(f"  Genetic algorithm failed: {e}, trying single_call...")
+                best_result = None
+            
+            if best_result is None:
+                logger.info("  Running llmlex single_call...")
+                result = llmlex.single_call(client, base64_img, x_train_1d, y_train, model="openai/gpt-4o")
+                best_expression = result.get('ansatz', None)
+                best_params = result.get('params', {})
+                logger.info(f"  Expression: {best_expression}")
+            
+            # Try to evaluate the symbolic expression using sympy
+            y_pred = None
+            try:
+                try:
+                    import sympy as sp
+                    from sympy.parsing.sympy_parser import parse_expr
+                except ImportError:
+                    raise ImportError("sympy not installed")
+                
+                expr_str = str(best_expression)
+                # Replace parameter placeholders with actual values
+                if best_params:
+                    for param_name, param_value in best_params.items():
+                        expr_str = expr_str.replace(param_name, str(param_value))
+                
+                # Create symbol for x
+                x_sym = sp.Symbol('x')
+                # Try to parse the expression
+                try:
+                    expr = parse_expr(expr_str.replace('x', 'x_sym'), transformations='all')
+                except:
+                    expr = parse_expr(expr_str, transformations='all')
+                
+                # Evaluate on test set
+                y_pred = np.array([float(expr.subs(x_sym, x_val)) for x_val in x_test_1d])
+                logger.info("  Successfully evaluated symbolic expression")
+            except Exception as eval_error:
+                logger.warning(f"  Failed to evaluate symbolic expression: {eval_error}")
+                logger.warning("  Falling back to linear fit on 1D projection")
+                # Fallback: use linear regression on 1D projection
+                simple_model = LinearRegression()
+                simple_model.fit(x_train_1d.reshape(-1, 1), y_train)
+                y_pred = simple_model.predict(x_test_1d.reshape(-1, 1))
+            
+            # Clip if scaled
+            if not no_scaling and y_scaler is not None:
+                y_pred = np.clip(y_pred, SCALE_MIN, SCALE_MAX)
+            
+            r2 = r2_score(y_test, y_pred)
+            mae = mean_absolute_error(y_test, y_pred)
+            mse = mean_squared_error(y_test, y_pred)
+            
+            baselines['llmlex'] = {
+                'r2': float(r2),
+                'mae': float(mae),
+                'mse': float(mse),
+                'predictions': y_pred.tolist(),
+                'expression': str(best_expression) if best_expression else None,
+                'params': best_params if best_params else None
+            }
+            logger.info(f"  LLM-LEx: R2={r2:.4f}, MAE={mae:.4f}, MSE={mse:.4f}")
+        except Exception as e:
+            import traceback
+            logger.warning(f"Failed to compute LLM-LEx baseline: {e}")
+            logger.debug(f"LLM-LEx error details: {traceback.format_exc()}")
+            if "api" in str(e).lower() or "key" in str(e).lower():
+                logger.warning("  LLM-LEx requires OPENROUTER_API_KEY in .env file")
     
     return baselines
 
@@ -2133,6 +2268,342 @@ def _select_topk_balanced_y_quantile(X_tr_s, y_tr_s, k, bins=10):
     idxs = np.array(sorted(set(idxs)))
     return X_tr_s[idxs], y_tr_s[idxs], idxs
 
+
+def _select_topk_random(X_tr_s, y_tr_s, residual_vec, k):
+    """Select top-K samples randomly from residuals (no sorting)."""
+    if k <= 0 or k >= len(y_tr_s):
+        return X_tr_s, y_tr_s, np.arange(len(y_tr_s))
+    rng = np.random.RandomState(RANDOM_STATE)
+    idxs = rng.choice(len(y_tr_s), size=k, replace=False)
+    idxs = np.array(sorted(idxs))
+    return X_tr_s[idxs], y_tr_s[idxs], idxs
+
+
+def suggest_optimal_gfp_combinations(
+    maicl, X_train_original, feature_cols, scaler, y_scaler_target,
+    n_suggestions=20, n_candidates=1000, output_dir=None
+):
+    """
+    Suggest optimal feature combinations for GFP yield maximization.
+    
+    Uses the trained MAICL model to predict yields for candidate feature combinations
+    and returns top suggestions in original (unscaled) scale.
+    
+    Args:
+        maicl: Trained TrainableMAICL model
+        X_train_original: Original training data (list of dicts) for reference ranges
+        feature_cols: List of feature column names
+        scaler: Feature scaler (MinMaxScaler010) used during training
+        y_scaler_target: Target scaler (MinMaxScaler010) used during training
+        n_suggestions: Number of top suggestions to return (default: 20)
+        n_candidates: Number of candidate combinations to evaluate (default: 1000)
+        output_dir: Output directory to save suggestions (optional)
+    
+    Returns:
+        List of dicts with feature combinations and predicted yields in original scale
+    """
+    logger.info("=" * 80)
+    logger.info("GENERATING OPTIMAL GFP YIELD COMBINATIONS")
+    logger.info("=" * 80)
+    
+    try:
+        # Extract feature ranges from original training data
+        if not X_train_original or len(X_train_original) == 0:
+            logger.warning("No original training data available for range extraction")
+            return []
+        
+        # Build feature ranges from training data
+        feature_ranges = {}
+        for col in feature_cols:
+            values = [float(x[col]) for x in X_train_original if col in x and x[col] is not None]
+            if values:
+                feature_ranges[col] = {
+                    'min': float(np.min(values)),
+                    'max': float(np.max(values)),
+                    'mean': float(np.mean(values)),
+                    'std': float(np.std(values))
+                }
+            else:
+                logger.warning(f"Feature {col} not found in original data, skipping")
+        
+        if len(feature_ranges) != len(feature_cols):
+            logger.warning(f"Only found ranges for {len(feature_ranges)}/{len(feature_cols)} features")
+        
+        logger.info(f"Generating {n_candidates} candidate combinations...")
+        logger.info(f"Feature ranges extracted from {len(X_train_original)} training samples")
+        
+        # Generate candidate combinations
+        # Strategy: Sample from feature ranges, with some bias toward high-yield regions
+        candidates = []
+        rng = np.random.RandomState(RANDOM_STATE)
+        
+        for i in range(n_candidates):
+            candidate = {}
+            for col in feature_cols:
+                if col in feature_ranges:
+                    feat_range = feature_ranges[col]
+                    # Mix of random sampling and biased sampling (toward higher values for some features)
+                    if i < n_candidates // 2:
+                        # Random uniform sampling within observed range
+                        val = rng.uniform(feat_range['min'], feat_range['max'])
+                    else:
+                        # Biased sampling: mix of mean, high values, and random
+                        strategy = rng.choice(['mean', 'high', 'random'])
+                        if strategy == 'mean':
+                            val = feat_range['mean'] + rng.normal(0, feat_range['std'] * 0.5)
+                            val = np.clip(val, feat_range['min'], feat_range['max'])
+                        elif strategy == 'high':
+                            # Sample from upper half of range
+                            val = rng.uniform(
+                                feat_range['mean'], 
+                                feat_range['max']
+                            )
+                        else:
+                            val = rng.uniform(feat_range['min'], feat_range['max'])
+                    candidate[col] = float(val)
+                else:
+                    # Fallback: use mean if range not available
+                    candidate[col] = 0.0
+            
+            candidates.append(candidate)
+        
+        logger.info(f"Generated {len(candidates)} candidate combinations")
+        
+        # Convert candidates to scaled format for prediction
+        logger.info("Converting candidates to scaled format and predicting yields...")
+        X_candidates_scaled = []
+        X_candidates_original = []
+        
+        for candidate in candidates:
+            # Convert to array in feature_cols order
+            x_array = np.array([candidate[col] for col in feature_cols], dtype=float)
+            X_candidates_original.append(candidate.copy())
+            
+            # Scale features
+            if scaler is not None:
+                x_scaled = scaler.transform(x_array.reshape(1, -1))[0]
+            else:
+                x_scaled = x_array
+            X_candidates_scaled.append(x_scaled)
+        
+        X_candidates_scaled = np.array(X_candidates_scaled)
+        
+        # Check for duplicates with training data (optional but recommended)
+        # Build a set of training feature vectors for quick comparison
+        training_vectors = set()
+        if X_train_original:
+            for x_train in X_train_original:
+                vec = tuple([round(float(x_train.get(col, 0)), 6) for col in feature_cols])
+                training_vectors.add(vec)
+            logger.info(f"  Checking {len(candidates)} candidates against {len(training_vectors)} training samples for duplicates...")
+            duplicates_removed = 0
+            candidates_filtered = []
+            X_candidates_original_filtered = []
+            for i, candidate in enumerate(candidates):
+                vec = tuple([round(float(candidate.get(col, 0)), 6) for col in feature_cols])
+                if vec not in training_vectors:
+                    candidates_filtered.append(candidate)
+                    X_candidates_original_filtered.append(X_candidates_original[i])
+                else:
+                    duplicates_removed += 1
+            if duplicates_removed > 0:
+                logger.info(f"  Removed {duplicates_removed} duplicate candidates (matching training samples)")
+                candidates = candidates_filtered
+                X_candidates_original = X_candidates_original_filtered
+                # Rebuild scaled array
+                X_candidates_scaled = []
+                for candidate in candidates:
+                    x_array = np.array([candidate[col] for col in feature_cols], dtype=float)
+                    if scaler is not None:
+                        x_scaled = scaler.transform(x_array.reshape(1, -1))[0]
+                    else:
+                        x_scaled = x_array
+                    X_candidates_scaled.append(x_scaled)
+                X_candidates_scaled = np.array(X_candidates_scaled)
+                logger.info(f"  Evaluating {len(candidates)} unique NEW candidate combinations")
+        
+        # Prepare pool data ONCE (use random sample or full set if small)
+        # Use full training set if small enough, otherwise random sample
+        pool_size = min(200, len(X_train_original)) if X_train_original else 0
+        X_pool_scaled = None
+        X_pool_original = None
+        
+        if X_train_original and len(X_train_original) > 0:
+            if len(X_train_original) <= pool_size:
+                # Use full training set
+                pool_original = X_train_original
+                logger.info(f"  Using full training set ({len(pool_original)} samples) as pool for few-shot examples")
+            else:
+                # Random sample for diversity
+                pool_indices = rng.choice(len(X_train_original), size=pool_size, replace=False)
+                pool_original = [X_train_original[i] for i in pool_indices]
+                logger.info(f"  Using random sample of {len(pool_original)} training samples as pool for few-shot examples")
+            
+            X_pool_original = pool_original
+            if scaler is not None:
+                pool_arrays = [np.array([x[col] for col in feature_cols], dtype=float) for x in pool_original]
+                X_pool_scaled = np.array([scaler.transform(arr.reshape(1, -1))[0] for arr in pool_arrays])
+            else:
+                pool_arrays = [np.array([x[col] for col in feature_cols], dtype=float) for x in pool_original]
+                X_pool_scaled = np.array(pool_arrays)
+            y_pool_dummy = np.zeros(len(X_pool_scaled))
+        else:
+            logger.warning("  No training data available for pool - predictions may be less accurate")
+            X_pool_scaled = X_candidates_scaled[:min(10, len(X_candidates_scaled))] if len(X_candidates_scaled) > 0 else None
+            y_pool_dummy = np.zeros(len(X_pool_scaled)) if X_pool_scaled is not None else np.array([])
+        
+        # Predict yields using trained MAICL
+        logger.info("Predicting yields using trained MAICL model...")
+        predictions_scaled = []
+        
+        # Predict in batches to handle large candidate sets
+        batch_size = 100
+        n_batches = (len(X_candidates_scaled) + batch_size - 1) // batch_size
+        logger.info(f"  Processing {len(X_candidates_scaled)} candidates in {n_batches} batch(es) of size {batch_size}")
+        
+        for i in range(0, len(X_candidates_scaled), batch_size):
+            batch = X_candidates_scaled[i:i+batch_size]
+            batch_original = X_candidates_original[i:i+batch_size]
+            batch_num = i // batch_size + 1
+            
+            # Use MAICL predict method
+            try:
+                # Create dummy y for evaluation (not used for prediction)
+                y_dummy = np.zeros(len(batch))
+                
+                # Use evaluate method to get predictions
+                # Note: We need to pass X_original for LLM mechanisms
+                batch_original_list = batch_original
+                
+                eval_result = maicl.evaluate(
+                    batch, y_dummy, X_pool_scaled, y_pool_dummy,
+                    return_details=True, relax_routing=True,
+                    X_original=batch_original_list,
+                    X_pool_original=X_pool_original
+                )
+                
+                batch_preds = np.array(eval_result.get('predictions', []))
+                if len(batch_preds) != len(batch):
+                    logger.warning(f"  Batch {batch_num}/{n_batches}: Expected {len(batch)} predictions, got {len(batch_preds)}")
+                    # Try to get predictions from the result in a different way
+                    if 'y_pred' in eval_result:
+                        batch_preds = np.array(eval_result['y_pred'])
+                    elif hasattr(eval_result, 'predictions'):
+                        batch_preds = np.array(eval_result.predictions)
+                    else:
+                        logger.error(f"  Batch {batch_num}/{n_batches}: Could not extract predictions from eval_result")
+                        raise ValueError(f"Could not extract predictions for batch {batch_num}")
+                
+                # Log prediction range for first batch to debug
+                if i == 0 and len(batch_preds) > 0:
+                    logger.info(f"  First batch prediction range (scaled): [{batch_preds.min():.6f}, {batch_preds.max():.6f}], mean={batch_preds.mean():.6f}, std={batch_preds.std():.6f}")
+                
+                predictions_scaled.extend(batch_preds.tolist())
+            except Exception as e:
+                logger.error(f"  Batch {batch_num}/{n_batches} prediction failed: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                # Don't use fallback - raise error to ensure we catch issues
+                raise RuntimeError(f"Failed to predict batch {batch_num}: {e}") from e
+        
+        predictions_scaled = np.array(predictions_scaled)
+        
+        # Log prediction statistics before unscaling
+        if len(predictions_scaled) > 0:
+            unique_preds = len(np.unique(predictions_scaled))
+            logger.info(f"  Predictions (scaled): min={predictions_scaled.min():.6f}, max={predictions_scaled.max():.6f}, "
+                       f"mean={predictions_scaled.mean():.6f}, std={predictions_scaled.std():.6f}, unique={unique_preds}")
+            if unique_preds < 10:
+                logger.warning(f"  ⚠️  Only {unique_preds} unique predictions out of {len(predictions_scaled)} candidates - model may be predicting constant values")
+        
+        # Unscale predictions to original scale
+        if y_scaler_target is not None:
+            # Inverse transform predictions
+            preds_reshaped = predictions_scaled.reshape(-1, 1)
+            if hasattr(y_scaler_target, 'inverse_transform'):
+                predictions_original = y_scaler_target.inverse_transform(preds_reshaped).ravel()
+            else:
+                # Manual inverse transform for MinMaxScaler010
+                feature_range = getattr(y_scaler_target, 'feature_range', (0.0, 1.0))
+                scale = y_scaler_target.scale_
+                min_orig = y_scaler_target.min_
+                scale_safe = np.where(scale != 0, scale, 1.0)
+                predictions_original = ((preds_reshaped - feature_range[0]) / scale_safe + min_orig).ravel()
+        else:
+            predictions_original = predictions_scaled
+        
+        # Log prediction statistics after unscaling
+        if len(predictions_original) > 0:
+            unique_preds_orig = len(np.unique(predictions_original))
+            logger.info(f"  Predictions (original scale): min={predictions_original.min():.4f}, max={predictions_original.max():.4f}, "
+                       f"mean={predictions_original.mean():.4f}, std={predictions_original.std():.4f}, unique={unique_preds_orig}")
+        
+        # Sort by predicted yield (descending) and get top suggestions
+        sorted_indices = np.argsort(predictions_original)[::-1]
+        top_indices = sorted_indices[:n_suggestions]
+        
+        suggestions = []
+        for idx in top_indices:
+            suggestion = {
+                'rank': len(suggestions) + 1,
+                'predicted_yield': float(predictions_original[idx]),
+                'features': X_candidates_original[idx].copy()
+            }
+            suggestions.append(suggestion)
+        
+        logger.info(f"Top {len(suggestions)} suggestions generated")
+        pred_range = predictions_original[top_indices]
+        logger.info(f"Predicted yield range: {pred_range.min():.4f} - {pred_range.max():.4f}")
+        logger.info(f"  NOTE: These are NEW combinations generated by sampling feature ranges, NOT from original dataset")
+        logger.info(f"  NOTE: Predictions are made by the trained MAICL model (ensemble of ML + LLM mechanisms)")
+        
+        # Save suggestions to file
+        if output_dir:
+            suggestions_file = os.path.join(output_dir, "optimal_gfp_combinations.json")
+            with open(suggestions_file, 'w') as f:
+                json.dump({
+                    'n_suggestions': len(suggestions),
+                    'n_candidates_evaluated': n_candidates,
+                    'note': 'These are NEW feature combinations generated by MAICL, not from original dataset',
+                    'suggestions': suggestions,
+                    'feature_ranges_used': feature_ranges
+                }, f, indent=2)
+            logger.info(f"Saved suggestions to: {suggestions_file}")
+            
+            # Also save as CSV for easy viewing
+            try:
+                import pandas as pd
+                csv_data = []
+                for sug in suggestions:
+                    row = {'rank': sug['rank'], 'predicted_yield': sug['predicted_yield']}
+                    row.update(sug['features'])
+                    csv_data.append(row)
+                df_suggestions = pd.DataFrame(csv_data)
+                csv_file = os.path.join(output_dir, "optimal_gfp_combinations.csv")
+                df_suggestions.to_csv(csv_file, index=False)
+                logger.info(f"Saved suggestions CSV to: {csv_file}")
+            except Exception as e:
+                logger.warning(f"Could not save CSV: {e}")
+        
+        # Print top 5 suggestions
+        logger.info("\n" + "=" * 80)
+        logger.info("TOP 5 SUGGESTED GFP YIELD COMBINATIONS (Generated by MAICL)")
+        logger.info("=" * 80)
+        logger.info("NOTE: These are NEW combinations predicted by the trained MAICL model, not from original dataset")
+        for i, sug in enumerate(suggestions[:5], 1):
+            logger.info(f"\nRank {i}: Predicted Yield = {sug['predicted_yield']:.4f}")
+            logger.info("  Features:")
+            for feat, val in sug['features'].items():
+                logger.info(f"    {feat}: {val:.4f}")
+        
+        return suggestions
+        
+    except Exception as e:
+        logger.error(f"Failed to generate optimal combinations: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
 def run_fold_pipeline_regression(
     X_train, X_val, X_test, y_train, y_val, y_test,
     X_original_train, X_original_val, X_original_test,
@@ -2201,6 +2672,10 @@ def run_fold_pipeline_regression(
                 if args.topk_strategy == "residual_balanced":
                     X_topk, y_topk, top_indices = _select_topk_residual_balanced(
                         X_train_s, y_train_s, residuals, args.top_k, bins=10
+                    )
+                elif args.topk_strategy == "random":
+                    X_topk, y_topk, top_indices = _select_topk_random(
+                        X_train_s, y_train_s, residuals, args.top_k
                     )
                 else:
                     X_topk, y_topk, top_indices = get_top_k_residual_samples(
@@ -2506,9 +2981,9 @@ def main():
                         "Consider using TabPFN only as a baseline (it runs in isolated subprocess) "
                         "or use --ml_mech linear/xgboost for more stable ML mechanism.")
     parser.add_argument("--baseline_models", type=str, nargs='+', default=None,
-                        help="Select which baseline models to compute. Options: tabpfn, ebm, shap. "
+                        help="Select which baseline models to compute. Options: tabpfn, ebm, shap, llmlex. "
                              "If not specified, all available baselines will be computed. "
-                             "Example: --baseline_models tabpfn ebm")
+                             "Example: --baseline_models tabpfn ebm llmlex")
     parser.add_argument("--tabicl_bins", type=int, default=20,
                         help="Number of bins for TabICL regression quantization (default: 20). "
                              "Only used when --ml_mech=tabicl. Higher values = finer granularity but more classes.")
@@ -2521,8 +2996,8 @@ def main():
                         help="Dataset to use for acceptance evaluation during training. "
                              "Options: 'test' (risks overfitting to test), 'validation' (default), "
                              "or 'train' (may overfit to training data).")
-    parser.add_argument("--topk_strategy", choices=["residual", "residual_balanced"], default="residual",
-                        help="Top-K selection: 'residual' = global highest | 'residual_balanced' = highest within y-quantile bins")
+    parser.add_argument("--topk_strategy", choices=["residual", "residual_balanced", "random"], default="residual",
+                        help="Top-K selection: 'residual' = global highest | 'residual_balanced' = highest within y-quantile bins | 'random' = random selection (no sorting)")
     parser.add_argument("--relax_eval", type=int, default=0, choices=[0,1],
                         help="Relax ML routing during evaluation to let LLM contribute (default: 1, recommended for regression)")
     parser.add_argument("--val_size", type=float, default=0.2,
@@ -3145,6 +3620,11 @@ def main():
                 X_topk, y_topk, top_indices = _select_topk_residual_balanced(
                     X_train_s, y_train_s, residuals, args.top_k, bins=10
                 )
+            elif args.topk_strategy == "random":
+                logger.info(f"Selecting top-K residuals randomly (no sorting, K={args.top_k})")
+                X_topk, y_topk, top_indices = _select_topk_random(
+                    X_train_s, y_train_s, residuals, args.top_k
+                )
             else:
                 X_topk, y_topk, top_indices = get_top_k_residual_samples(
                     sorted_idx, residuals, X_train_s, y_train_s, args.top_k,
@@ -3179,6 +3659,18 @@ def main():
             X_original_topk = [X_original_train[i] for i in top_indices]
             logger.info(f"Top-K selection: balanced y-quantile, selected={len(top_indices)} examples.")
     
+    # CRITICAL: All final evaluations (baselines, pre-training, post-training) use TEST set
+    # acceptance_set is ONLY used during training iterations to accept/reject updates
+    # It does NOT affect final evaluation - all models are always evaluated on TEST set
+    X_eval = X_test_s
+    y_eval = y_test_s
+    X_original_eval = X_original_test if is_deepchem_dataset else None
+    eval_set_name = "test"
+    
+    logger.info(f"Using TEST set for ALL final evaluations (baselines, pre-training, post-training)")
+    logger.info(f"  Note: acceptance_set={args.acceptance_set} is only used during training iterations")
+    logger.info(f"  All models are evaluated on TEST set for fair comparison")
+    
     # ML model is FROZEN after initial training on full training set
     # Compute residuals on the top-K subset using the frozen model (for MA-ICL training)
     residuals_topk = None
@@ -3198,7 +3690,14 @@ def main():
             residuals_topk = residuals
             logger.info(f"Using full training set ({len(X_topk)} samples) - residuals already computed")
         
-        # Compute ML baseline metrics on test set using frozen model
+        # Compute ML baseline metrics on TEST set using frozen model
+        # All baselines use TEST set for final evaluation
+        X_ml_eval = X_test_s
+        y_ml_eval = y_test_s
+        X_original_ml_eval = X_original_test if is_deepchem_dataset else None
+        eval_set_name_ml = "test"
+        
+        # Compute ML baseline metrics on TEST set using frozen model
         ml_baseline_metrics: Dict[str, Any] = {}
         try:
             model = pretrained_ml.model
@@ -3213,11 +3712,11 @@ def main():
                 
                 # Create temporary files for prediction
                 temp_dir = Path(tempfile.mkdtemp(prefix="tabpfn_ml_baseline_"))
-                X_test_df = pd.DataFrame(X_test_s, columns=feature_cols)
-                X_test_path = temp_dir / "X_test.csv"
+                X_ml_eval_df = pd.DataFrame(X_ml_eval, columns=feature_cols)
+                X_ml_eval_path = temp_dir / "X_eval.csv"
                 output_path = temp_dir / "pred_result.json"
                 
-                X_test_df.to_csv(X_test_path, index=False)
+                X_ml_eval_df.to_csv(X_ml_eval_path, index=False)
                 
                 # Find subprocess script
                 script_path = Path(__file__).parent / "run_tabpfn_ml_mechanism.py"
@@ -3233,7 +3732,7 @@ def main():
                     [sys.executable, str(script_path), "predict",
                      pretrained_ml._tabpfn_training_data_path['X_train_path'],
                      pretrained_ml._tabpfn_training_data_path['y_train_path'],
-                     str(X_test_path),
+                     str(X_ml_eval_path),
                      pretrained_ml.task_type,
                      str(output_path)],
                     capture_output=True,
@@ -3265,7 +3764,7 @@ def main():
                 except:
                     pass
             else:
-                y_pred = model.predict(X_test_s).astype(float)
+                y_pred = model.predict(X_ml_eval).astype(float)
             
             # Clip predictions to [0,1] if targets are scaled (regression with scaling)
             if not args.no_scaling and y_scaler_target is not None:
@@ -3274,13 +3773,13 @@ def main():
                 if n_out_of_range > 0:
                     logger.warning(f"⚠️  ML predictions out of range [{SCALE_MIN}, {SCALE_MAX}]: {n_out_of_range}/{len(y_pred)} samples")
                     logger.warning(f"   Prediction range: [{y_pred.min():.4f}, {y_pred.max():.4f}]")
-                    logger.warning(f"   Target range: [{y_test_s.min():.4f}, {y_test_s.max():.4f}]")
+                    logger.warning(f"   Target range: [{y_ml_eval.min():.4f}, {y_ml_eval.max():.4f}]")
                     logger.info(f"   Using clipped predictions for metrics (clipped {n_out_of_range} values)")
                     y_pred = y_pred_clipped
             
-            r2 = r2_score(y_test_s, y_pred)
-            mae = mean_absolute_error(y_test_s, y_pred)
-            mse = mean_squared_error(y_test_s, y_pred)
+            r2 = r2_score(y_ml_eval, y_pred)
+            mae = mean_absolute_error(y_ml_eval, y_pred)
+            mse = mean_squared_error(y_ml_eval, y_pred)
             
             # Check for multicollinearity (can cause unstable coefficients)
             if len(feature_cols) > 1:
@@ -3309,14 +3808,14 @@ def main():
                 
                 # Check if predictions are systematically biased
                 mean_pred = y_pred.mean()
-                mean_true = y_test_s.mean()
+                mean_true = y_ml_eval.mean()
                 pred_std = y_pred.std()
-                true_std = y_test_s.std()
+                true_std = y_ml_eval.std()
                 logger.info(f"   Prediction mean: {mean_pred:.4f}, Target mean: {mean_true:.4f} (bias: {mean_pred - mean_true:.4f})")
                 logger.info(f"   Prediction std: {pred_std:.4f}, Target std: {true_std:.4f}")
                 
                 # Check correlation
-                correlation = np.corrcoef(y_test_s, y_pred)[0, 1]
+                correlation = np.corrcoef(y_ml_eval, y_pred)[0, 1]
                 logger.info(f"   Correlation: {correlation:.4f}")
                 
                 # CRITICAL: Negative correlation means model predicts opposite direction
@@ -3347,7 +3846,7 @@ def main():
                 
                 # Check if predictions are essentially constant
                 pred_range = y_pred.max() - y_pred.min()
-                true_range = y_test_s.max() - y_test_s.min()
+                true_range = y_ml_eval.max() - y_ml_eval.min()
                 if pred_range < 0.1:
                     logger.error(f"   ❌ Predictions are nearly constant (range={pred_range:.4f} vs target range={true_range:.4f})")
                     logger.error(f"   Model is not learning meaningful patterns from features")
@@ -3427,7 +3926,7 @@ def main():
         ml_baseline_metrics = {}
         logger.info(f"LLM-only mode: Training on {len(X_topk)} samples (no ML baseline)")
     
-    # Compute additional baselines (TabPFN, EBM, SHAP)
+    # Compute additional baselines (TabPFN, EBM, SHAP, LLM-LEx)
     logger.info("=" * 80)
     logger.info("COMPUTING ADDITIONAL BASELINES")
     logger.info("=" * 80)
@@ -3435,6 +3934,11 @@ def main():
         logger.warning("⚠ TabPFN not available - skipping TabPFN baseline")
         logger.warning("  Install with: pip install tabpfn")
         logger.warning("  Note: TabPFN requires GPU for datasets >1000 samples")
+    if not _HAS_LLMLEX:
+        logger.warning("⚠ LLM-LEx not available - skipping LLM-LEx baseline")
+        logger.warning("  Install with: pip install llmlex or clone from https://github.com/harveyThomas4692/llmlex")
+        logger.warning("  Note: LLM-LEx requires OPENROUTER_API_KEY in .env file")
+    # All baselines are evaluated on TEST set (for fair comparison with MA-ICL)
     additional_baselines = compute_additional_baselines(
         X_train_s, y_train_s, X_test_s, y_test_s,
         task_type="regression",
@@ -3466,6 +3970,7 @@ def main():
             pass
 
     # Pre metrics (MAE as loss; also R2/MSE)
+    # Always evaluate on TEST set for final comparison
     logger.info("=" * 80)
     logger.info("PRE-TRAINING EVALUATION")
     logger.info("=" * 80)
@@ -3510,6 +4015,13 @@ def main():
                 ml_residuals_for_init = None
             
             # Generate initial mechanism(s)
+            # Store residual source for logging (initial mechanisms always use ML residuals if available)
+            if args.use_ml and residuals_topk is not None:
+                residual_source = "ML Model"
+            else:
+                residual_source = "Mean-Centered Errors (no ML residuals)"
+            maicl.mech_generator._last_residual_source = residual_source
+            
             initial_mechanisms = maicl.mech_generator.generate_unknown_mechanisms(
                 X_topk, y_topk, prediction_errors, ml_residuals=ml_residuals_for_init
             )
@@ -3521,6 +4033,16 @@ def main():
                 maicl.mechanism_types = maicl.mech_generator.get_mechanism_types()
                 logger.info(f"  ✓ Generated {len(initial_mechanisms)} initial LLM mechanism(s) for pre-training evaluation")
                 logger.info(f"  Total mechanisms now: {len(maicl.mechanisms)} ({len([t for t in maicl.mechanism_types if t == 'llm'])} LLM + {len([t for t in maicl.mechanism_types if t == 'ml'])} ML)")
+                
+                # Log latent_zs for initial mechanism generation (iteration 0 / pre-training)
+                # Use the output_dir from maicl if available, otherwise use fold_output_dir
+                try:
+                    output_dir_for_logging = getattr(maicl, 'output_dir', None) or (fold_output_dir if 'fold_output_dir' in locals() else None)
+                    maicl._log_latent_zs(iteration=0, output_dir=output_dir_for_logging, residual_source=residual_source)
+                except Exception as e:
+                    logger.warning(f"  Failed to log latent_zs for initial mechanism generation: {e}")
+                    import traceback
+                    traceback.print_exc()
             else:
                 logger.warning("  ⚠️  Failed to generate initial LLM mechanisms")
         except Exception as e:
@@ -3555,11 +4077,11 @@ def main():
     
     # Generate pre-training plots
     if y_pred_pre is not None and len(y_pred_pre) > 0:
-        save_scatter_plot(y_test_s, y_pred_pre, 
-                         f"Pre-Training: Predicted vs Actual ({ds_label})", 
+        save_scatter_plot(y_test_s, y_pred_pre,
+                         f"Pre-Training: Predicted vs Actual ({ds_label}, TEST set)",
                          "pre_scatter.png", output_dir)
         save_residual_plot(y_test_s, y_pred_pre,
-                          f"Pre-Training ({ds_label})",
+                          f"Pre-Training ({ds_label}, TEST set)",
                           "pre_residuals.png", output_dir)
 
     logger.info("TRAINING MA-ICL")
@@ -3589,40 +4111,27 @@ def main():
     logger.info("POST-TRAINING EVALUATION")
     logger.info("=" * 80)
     
-    # CRITICAL FIX: Use SAME evaluation set and routing mode as training for exact reproduction
-    # Training uses acceptance_set (default: "validation") with relax_routing=True
-    # To get exact reproduction, we must use the same set and routing mode
-    if args.acceptance_set == "test":
-        # Training used test set for acceptance - use test set for final evaluation
-        X_final_eval = X_test_s
-        y_final_eval = y_test_s
-        X_original_final_eval = X_original_test if is_deepchem_dataset else None
-        eval_set_name = "test"
-    elif args.acceptance_set == "train":
-        # Training used train set for acceptance - use train set for final evaluation
-        X_final_eval = X_train_s
-        y_final_eval = y_train_s
-        X_original_final_eval = X_original_train if is_deepchem_dataset else None
-        eval_set_name = "train"
-    else:
-        # Default: Training used validation set for acceptance - use validation set for final evaluation
-        X_final_eval = X_val_s
-        y_final_eval = y_val_s
-        X_original_final_eval = X_original_val if is_deepchem_dataset else None
-        eval_set_name = "validation"
+    # CRITICAL: Final evaluation always uses TEST set (regardless of acceptance_set)
+    # acceptance_set is ONLY used during training iterations to accept/reject updates
+    # All models (baselines, pre-training, post-training) are evaluated on TEST set
+    X_final_eval = X_test_s
+    y_final_eval = y_test_s
+    X_original_final_eval = X_original_test if is_deepchem_dataset else None
     
     # CRITICAL: Always use relax_routing=True to match training mode
     # Training always uses relax_routing=True, so final evaluation must match
     final_relax_routing = True
     logger.info(f"Using SAME routing as best iteration for exact reproduction")
-    logger.info(f"  - Evaluation set: {eval_set_name} (same as acceptance_set during training)")
+    logger.info(f"  - Evaluation set: TEST (all models evaluated on TEST set for fair comparison)")
+    logger.info(f"  - Note: acceptance_set={args.acceptance_set} was only used during training iterations")
     logger.info(f"  - Routing mode: relax_routing=True (same as training)")
     
     # CRITICAL: Always preserve mechanism performance scores from best snapshot
     # This ensures final evaluation uses the exact same routing weights as the best iteration
     preserve_perf = True
-    logger.info(f"Preserving mechanism performance scores from best snapshot (calculated on {eval_set_name} set during training)")
+    logger.info(f"Preserving mechanism performance scores from best snapshot (calculated on {args.acceptance_set} set during training)")
     logger.info(f"  Note: This ensures final evaluation uses the same routing as the best iteration")
+    logger.info(f"  Note: Final evaluation is on TEST set, but routing weights were determined during training on {args.acceptance_set} set")
     
     # Log final accepted mechanisms for transparency
     final_mechanism_count = len(maicl.mechanisms) if hasattr(maicl, 'mechanisms') else 0
@@ -3651,8 +4160,8 @@ def main():
     post_r2 = float(post.get('r2', 0.0))
     post_rmse = float(post.get('rmse', 0.0))
     post_mse = float(post_rmse ** 2)
-    logger.info(f"Post-training ({eval_set_name} set): R2={post_r2:.4f} MAE={post_mae:.4f} MSE={post_mse:.4f}")
-    logger.info(f"  Note: Using {eval_set_name} set (same as acceptance_set during training) for exact reproduction")
+    logger.info(f"Post-training (TEST set): R2={post_r2:.4f} MAE={post_mae:.4f} MSE={post_mse:.4f}")
+    logger.info(f"  Note: All models evaluated on TEST set for fair comparison")
     
     # Compare with best iteration metrics if available
     if hasattr(maicl, '_best_iteration') and maicl._best_iteration is not None:
@@ -3684,10 +4193,10 @@ def main():
     # Use the same evaluation set that was used for evaluation (for consistency)
     if y_pred_post is not None and len(y_pred_post) > 0:
         save_scatter_plot(y_final_eval, y_pred_post,
-                         f"Post-Training: Predicted vs Actual ({ds_label}, {eval_set_name} set)",
+                         f"Post-Training: Predicted vs Actual ({ds_label}, TEST set)",
                          "post_scatter.png", output_dir)
         save_residual_plot(y_final_eval, y_pred_post,
-                          f"Post-Training ({ds_label}, {eval_set_name} set)",
+                          f"Post-Training ({ds_label}, TEST set)",
                           "post_residuals.png", output_dir)
     
     # Evaluate LLM-only mechanisms (excluding ML) to assess LLM learning
@@ -3698,6 +4207,7 @@ def main():
     y_pred_llm_only = None
     try:
         # For DeepChem datasets, pass X_original to use SMILES strings instead of vectorized features
+        # LLM-only evaluation also uses TEST set for consistency
         llm_only_kwargs = {}
         if is_deepchem_dataset:
             llm_only_kwargs['X_original'] = X_original_test
@@ -3713,10 +4223,10 @@ def main():
         y_pred_llm_only = np.array(llm_only_metrics.get('predictions', [])) if 'predictions' in llm_only_metrics else None
         if y_pred_llm_only is not None and len(y_pred_llm_only) > 0:
             save_scatter_plot(y_test_s, y_pred_llm_only,
-                             f"LLM-Only: Predicted vs Actual ({ds_label})",
+                             f"LLM-Only: Predicted vs Actual ({ds_label}, TEST set)",
                              "llm_only_scatter.png", output_dir)
             save_residual_plot(y_test_s, y_pred_llm_only,
-                              f"LLM-Only ({ds_label})",
+                              f"LLM-Only ({ds_label}, TEST set)",
                               "llm_only_residuals.png", output_dir)
     except Exception as e:
         logger.warning(f"Failed to evaluate LLM-only mechanisms: {e}")
@@ -4029,6 +4539,38 @@ def main():
                 logger.warning(f"Evaluation module not found: {eval_module_path}")
         except Exception as e:
             logger.warning(f"Failed to evaluate individual mechanisms: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    # Generate optimal GFP yield combinations (only for GFP yield dataset, not in CV mode)
+    if dataset_name_lower == "gfp_yield" and cv_folds == 0:
+        logger.info("\n" + "=" * 80)
+        logger.info("GENERATING OPTIMAL GFP YIELD COMBINATIONS")
+        logger.info("=" * 80)
+        try:
+            suggestions = suggest_optimal_gfp_combinations(
+                maicl=maicl,
+                X_train_original=X_original_train,
+                feature_cols=feature_cols,
+                scaler=scaler,
+                y_scaler_target=y_scaler_target,
+                n_suggestions=20,
+                n_candidates=1000,
+                output_dir=output_dir
+            )
+            
+            # Add suggestions to final results
+            if suggestions:
+                final_results['optimal_combinations'] = {
+                    'n_suggestions': len(suggestions),
+                    'suggestions': suggestions[:20]  # Store top 10 in results
+                }
+                # Update results file
+                with open(results_file, 'w') as f:
+                    json.dump(final_results, f, indent=2)
+                logger.info(f"Updated final_results.json with optimal combinations")
+        except Exception as e:
+            logger.warning(f"Failed to generate optimal GFP combinations: {e}")
             import traceback
             traceback.print_exc()
 

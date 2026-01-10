@@ -768,9 +768,12 @@ def compute_ml_residuals(
     """
     Compute ML predictions and residuals on training set.
     - classification: residual = 1.0 if prediction is wrong, 0.0 if correct (0/1 error, no probabilities used)
-    - regression: residual = |y_true - y_pred|
+    - regression: residual = y_true - y_pred (SIGNED difference, preserves sign for LLM to know over/under-prediction)
     Returns: (sorted_indices_desc, residuals, predictions, probabilities_or_None)
-    Note: For classification, probabilities are not extracted - only class predictions are used.
+    Note: 
+    - For classification, probabilities are not extracted - only class predictions are used.
+    - For regression, residuals are signed (positive = under-prediction, negative = over-prediction)
+    - Sorting uses absolute value to rank by magnitude, but sign is preserved in residuals array
     """
     logger.info("\n[Residuals] Computing ML residuals...")
     
@@ -865,10 +868,9 @@ def compute_ml_residuals(
             # Residual is 1.0 if prediction is wrong, 0.0 if correct
             residuals[i] = 1.0 if pred_cls != true_cls_int else 0.0
     else:
-        # Regression: absolute error
-        residuals = np.abs(y_true - predictions)
+        residuals = y_true - predictions
     
-    sorted_indices = np.argsort(residuals)[::-1]
+    sorted_indices = np.argsort(np.abs(residuals))[::-1]
     return sorted_indices, residuals, predictions, (probas if any(p is not None for p in probas) else None)
 
 
@@ -888,6 +890,8 @@ def get_top_k_residual_samples(
                      Sorting by residual (descending) naturally puts mismatched examples first.
                      Simply pick top-K from sorted_indices (already sorted by residual descending).
     - regression: uses top absolute errors by residual ranking
+                  Residuals are signed (positive = under-prediction, negative = over-prediction)
+                  Sorting uses absolute value, but sign is preserved in residuals array
     Returns: (X_topk, y_topk, top_k_indices)
     """
     if top_k == -1 or top_k >= len(X_train):
@@ -900,8 +904,9 @@ def get_top_k_residual_samples(
         # Just pick top-K directly - no filtering needed
         top_k_indices = sorted_indices[:min(top_k, len(sorted_indices))]
     else:
-        # Regression: use residual ranking (filter to non-zero residuals)
-        non_zero = sorted_indices[residuals[sorted_indices] > 0]
+        # Regression: sorted_indices is already sorted by absolute residual (descending)
+        # Filter to non-zero absolute residuals (residuals can be positive or negative)
+        non_zero = sorted_indices[np.abs(residuals[sorted_indices]) > 0]
         if len(non_zero) == 0:
             return X_train[:0], y_train[:0], np.array([], dtype=int)
         top_k_indices = non_zero[:min(top_k, len(non_zero))]

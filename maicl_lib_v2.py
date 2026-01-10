@@ -90,8 +90,8 @@ from visualization import (
 
 # Import from refactored modules
 from maicl_config import (
-    SCALE_MIN, SCALE_MAX, MAX_BATCH_SIZE, BATCH_TIMEOUT, EVAL_BATCH_SIZE, GRADIENT_BATCH_SIZE,
-    LLM_GROUP_SIZE, LLM_COMBINE_MECHANISMS, ATTENTION_TEMP, RANDOM_STATE,
+    SCALE_MIN, SCALE_MAX, MAX_BATCH_SIZE, BATCH_TIMEOUT,
+    LLM_GROUP_SIZE, LLM_COMBINE_MECHANISMS, ATTENTION_TEMP, RANDOM_STATE, ENCODER_BATCH_SIZE,
     IMPROVEMENT_THRESHOLD_CLASSIFICATION, ML_HIGH_CONFIDENCE_THRESHOLD, ML_LOW_CONFIDENCE_THRESHOLD,
     MIN_ML_WEIGHT, MAX_ML_WEIGHT, HARD_ML_GATE_THRESHOLD, OUTPUT_ROOT, RUN_FOLDER_NAME, OUTPUT_DIR,
     MAX_TOP_FEATURES, MAX_TOP_FEATURES_DISPLAY, MAX_TOP_ERROR_FEATURES, MAX_TOP_ERROR_FEATURES_CHECK,
@@ -111,7 +111,7 @@ from maicl_utils import (
 from maicl_llm import GoogleAPIKeyManager, BatchedLLM
 from maicl_ml_knowledge import (
     extract_ml_knowledge, generate_ml_guided_mechanism, analyze_ml_failure_patterns,
-    enhanced_textgrad_feedback
+    enhanced_textgrad_feedback, generate_ml_prediction_approximation
 )
 from maicl_few_shot import retrieve_few_shot_examples, format_few_shot_for_prompt
 
@@ -131,7 +131,10 @@ class MultiAgentPredictor:
                  hard_ml_gate_threshold: Optional[float] = None,
                  min_ml_weight: Optional[float] = None,
                  max_ml_weight: Optional[float] = None,
-                 use_scaling: bool = True):
+                 use_scaling: bool = True,
+                 known_context: Optional[str] = None,
+                 learned_ml_weight: Optional[float] = None,
+                 learned_llm_weight: Optional[float] = None):
         self.llm = batched_llm
         self.mechanisms = mechanisms
         self.mechanism_types = mechanism_types
@@ -142,13 +145,26 @@ class MultiAgentPredictor:
         self.task_type = task_type
         self.class_names = class_names
         self.use_scaling = use_scaling  # Flag to indicate if scaling is enabled
-        # Allow LLM mechanisms to contribute in regression by default (disable full ML routing)
-        # Set MAICL_REGRESSION_PREFER_ML=1 to force 100% ML routing
-        self.prefer_ml_for_regression = os.environ.get("MAICL_REGRESSION_PREFER_ML", "0") != "0"
-        # Routing overrides (if provided)
-        self.hard_ml_gate_threshold = HARD_ML_GATE_THRESHOLD if hard_ml_gate_threshold is None else float(hard_ml_gate_threshold)
-        self.min_ml_weight = MIN_ML_WEIGHT if min_ml_weight is None else float(min_ml_weight)
-        self.max_ml_weight = MAX_ML_WEIGHT if max_ml_weight is None else float(max_ml_weight)
+        # Context-only dataset background (NOT a mechanism to execute or route)
+        self.known_context = known_context
+        # Routing parameters (used when learned weights are not provided)
+        self.hard_ml_gate_threshold = hard_ml_gate_threshold
+        self.min_ml_weight = min_ml_weight
+        self.max_ml_weight = max_ml_weight
+        # Learned weights for ML and LLM mechanisms (learned via TextGrad)
+        # If not provided, will use performance-based routing
+        if learned_ml_weight is not None and learned_llm_weight is not None:
+            # Normalize to ensure they sum to 1.0
+            total = learned_ml_weight + learned_llm_weight
+            if total > 0:
+                self.learned_ml_weight = learned_ml_weight / total
+                self.learned_llm_weight = learned_llm_weight / total
+            else:
+                self.learned_ml_weight = None
+                self.learned_llm_weight = None
+        else:
+            self.learned_ml_weight = None
+            self.learned_llm_weight = None
         self.attention_prompt = self._init_attention_prompt()
         self._setup_parsers()
         self.mechanism_performance = {}
@@ -190,7 +206,7 @@ class MultiAgentPredictor:
             if self.use_scaling:
                 y_hat_desc = "Predicted numeric output (float in the target's scaled range)"
             else:
-                y_hat_desc = "Predicted numeric output (float, use raw target values)"
+                y_hat_desc = "Predicted numeric output (float, use raw/unscaled target values)"
             self.agent_format = get_prompt('prediction.format_instructions.regression',
                                           y_hat_desc=y_hat_desc)
         self.agent_parser = None
@@ -203,6 +219,8 @@ class MultiAgentPredictor:
         # Get predictions from all mechanisms
         llm_mechanisms, llm_indices, ml_indices = [], [], []
         for i, (mech, mech_type) in enumerate(zip(self.mechanisms, self.mechanism_types)):
+            # Only unknown LLM mechanisms are executed here.
+            # Under Option B, "known" mechanisms are context-only and should not appear in self.mechanisms.
             if mech_type == "llm":
                 llm_mechanisms.append(mech)
                 llm_indices.append(i)
@@ -248,10 +266,16 @@ Return confidence (0-10).
 
 Format: {"y_hat": <float (raw value)>, "confidence": <number>}"""
                 
-                # Build prompt with mechanism, few-shot examples, and format instructions
+                # Build prompt with optional context, mechanism, few-shot examples, and format instructions
                 prompt = f"""{task_instr}
 
-MECHANISM:
+"""
+                if self.known_context:
+                    prompt += f"""CONTEXT (dataset background; use as guidance, NOT as a mechanism):
+{self.known_context}
+
+"""
+                prompt += f"""MECHANISM:
 {mechanism}
 
 """
@@ -307,15 +331,17 @@ Please provide your prediction in the format specified above."""
         # ML mechanism predictions
         if len(ml_indices) > 0 and self.ml_mechanism is not None and self.ml_mechanism.is_trained:
             try:
-                # Convert x_dict to feature vector
-                x_array = np.array([[x_dict.get(feat, 0.0) for feat in self.feature_cols]])
-                
-                # Scale if scaler is available
-                if self.scaler is not None:
-                    x_array = self.scaler.transform(x_array)
-                
-                # Get ML prediction
-                ml_pred = self.ml_mechanism.predict(x_array)[0]
+                # MLModelMechanism.predict expects a feature dict in the model's training space.
+                # IMPORTANT: In MA-ICL, X is already scaled when use_scaling=True, so do NOT scale again here.
+                return_class_idx = (
+                    self.task_type == "classification"
+                    and self.class_names is not None
+                    and len(self.class_names) > 2
+                )
+                ml_pred = self.ml_mechanism.predict(x_dict, return_class_index=return_class_idx)
+                if self.task_type == "regression" and self.use_scaling:
+                    ymin, ymax = self._scaled_range_from(self.scaler)
+                    ml_pred = float(np.clip(float(ml_pred), ymin, ymax))
                 
                 # Store for all ML mechanism indices
                 for ml_idx in ml_indices:
@@ -378,6 +404,8 @@ Please provide your prediction in the format specified above."""
         # Get LLM mechanisms
         llm_mechanisms, llm_indices, ml_indices = [], [], []
         for i, (mech, mech_type) in enumerate(zip(self.mechanisms, self.mechanism_types)):
+            # Only unknown LLM mechanisms are executed here.
+            # Under Option B, "known" mechanisms are context-only and should not appear in self.mechanisms.
             if mech_type == "llm":
                 llm_mechanisms.append(mech)
                 llm_indices.append(i)
@@ -402,6 +430,13 @@ Please provide your prediction in the format specified above."""
 
 IMPORTANT: Data is NOT normalized; use raw feature and target values.
 Apply the mechanism's mathematical description to compute the output value from the input features."""
+
+        # Add context-only dataset background (if provided)
+        if self.known_context:
+            task_instr = f"""{task_instr}
+
+CONTEXT (dataset background; use as guidance, NOT as a mechanism):
+{self.known_context}"""
         
         # Grouped predictions: combine mechanisms per input group to reduce calls by factor M
         all_mechanism_responses: Dict[int, List[Tuple[float, float]]] = {idx: [None] * len(x_dicts) for idx in llm_indices}
@@ -643,123 +678,26 @@ Apply the mechanism's mathematical description to compute the output value from 
                         results[idx] = (y_hat, conf)
                     except:
                         if self.task_type == "regression":
-                            ymin, ymax = self._scaled_range_from(self.scaler)
-                            results[idx] = ((ymin + ymax) / 2, 0.1)
+                            if self.use_scaling:
+                                ymin, ymax = self._scaled_range_from(self.scaler)
+                                results[idx] = ((ymin + ymax) / 2, 0.1)
+                            else:
+                                results[idx] = (0.0, 0.1)  # Use 0.0 as fallback for unscaled
                         else:
                             results[idx] = (0.0, 0.1)
                 else:
                     if self.task_type == "regression":
-                        ymin, ymax = self._scaled_range_from(self.scaler)
-                        results[idx] = ((ymin + ymax) / 2, 0.1)
+                        if self.use_scaling:
+                            ymin, ymax = self._scaled_range_from(self.scaler)
+                            results[idx] = ((ymin + ymax) / 2, 0.1)
+                        else:
+                            results[idx] = (0.0, 0.1)  # Use 0.0 as fallback for unscaled
                     else:
                         results[idx] = (0.0, 0.1)
             
-            # Aggregate with confidence-based routing (same as predict_single)
+            # Aggregate using routing weights (learned weights > performance-based > uniform)
             agent_preds = [r[0] if r is not None else 0.0 for r in results]
-            confidences = [r[1] if r is not None else 0.1 for r in results]
-            
-            ml_indices_list = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "ml"]
-            ml_confidence = 0.5
-            
-            if len(ml_indices_list) > 0 and self.ml_mechanism is not None and self.ml_mechanism.is_trained:
-                ml_idx = ml_indices_list[0]
-                ml_pred = agent_preds[ml_idx]
-                ml_predicted_class, ml_max_prob, ml_proba = get_ml_prediction_probability(
-                    self.ml_mechanism, x_dict, predicted_class=int(ml_pred) if ml_pred is not None else None, 
-                    scaler=self.scaler
-                )
-                if ml_max_prob is not None:
-                    ml_confidence = ml_max_prob
-            
-            # Compute weights
-            if self.task_type == "regression" and self.prefer_ml_for_regression and len(ml_indices_list) > 0:
-                weights = np.zeros(len(results))
-                for ml_idx in ml_indices_list:
-                    weights[ml_idx] = 1.0 / len(ml_indices_list)
-                weights = weights / np.sum(weights)
-            elif hasattr(self, 'mechanism_performance') and self.mechanism_performance:
-                # Use performance-based weighting with temperature scaling for better discrimination
-                perf_scores = [self.mechanism_performance.get(i, 1.0) for i in range(len(results))]
-                perf_array = np.array(perf_scores)
-                
-                # CRITICAL FIX: Exclude mechanisms with very low performance (likely failing)
-                # This prevents bad mechanisms from dragging down the ensemble
-                MIN_PERFORMANCE_THRESHOLD = 0.1  # Mechanisms below this are excluded
-                max_perf = max(perf_scores) if perf_scores else 1.0
-                
-                # If max performance is good (>0.5), exclude mechanisms that are much worse
-                if max_perf > 0.5:
-                    # Exclude mechanisms that are more than 5x worse than the best
-                    exclusion_threshold = max(MIN_PERFORMANCE_THRESHOLD, max_perf / 5.0)
-                    for i in range(len(perf_array)):
-                        if perf_scores[i] < exclusion_threshold:
-                            perf_array[i] = 0.0  # Zero weight for very bad mechanisms
-                            logger.debug(f"  Excluding mechanism {i} (perf={perf_scores[i]:.3f} < threshold={exclusion_threshold:.3f})")
-                
-                # Check if ML mechanism is significantly better
-                ml_indices_list = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "ml"]
-                llm_indices_list = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "llm"]
-                
-                if len(ml_indices_list) > 0 and len(llm_indices_list) > 0:
-                    ml_perf = max([perf_scores[i] for i in ml_indices_list])
-                    llm_perf = max([perf_scores[i] for i in llm_indices_list])
-                    perf_ratio = ml_perf / (llm_perf + 1e-6)
-                    
-                    # If ML is significantly better, use higher temperature for sharper weighting
-                    if perf_ratio > 1.2:
-                        # High temperature: exp(score / temp) with temp < 1 makes differences more pronounced
-                        temperature = 0.3  # Lower temp = sharper differences (was 0.5)
-                        perf_array = np.exp(perf_array / temperature - np.max(perf_array / temperature))
-                    else:
-                        # Similar performance: use standard softmax
-                        perf_array = np.exp(perf_array - np.max(perf_array))
-                else:
-                    # Standard softmax
-                    perf_array = np.exp(perf_array - np.max(perf_array))
-                
-                # Normalize weights (zero weights stay zero)
-                if np.sum(perf_array) > 0:
-                    weights = perf_array / np.sum(perf_array)
-                else:
-                    # Fallback: if all mechanisms were excluded, use ML mechanism only
-                    ml_indices_list = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "ml"]
-                    if len(ml_indices_list) > 0:
-                        logger.warning(f"  All mechanisms excluded by performance threshold, falling back to ML-only (indices: {ml_indices_list})")
-                        weights = np.zeros(len(results))
-                        for ml_idx in ml_indices_list:
-                            weights[ml_idx] = 1.0 / len(ml_indices_list)
-                    else:
-                        # No ML mechanism: use uniform weights as last resort
-                        logger.warning("  All mechanisms excluded and no ML mechanism available, using uniform weights")
-                        weights = np.ones(len(results)) / len(results)
-            else:
-                ml_indices_list = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "ml"]
-                if len(ml_indices_list) > 0 and self.ml_mechanism is not None and self.ml_mechanism.is_trained:
-                    num_llm = len(results) - len(ml_indices_list)
-                    if ml_confidence >= self.hard_ml_gate_threshold:
-                        weights = np.zeros(len(results))
-                        for ml_idx in ml_indices_list:
-                            weights[ml_idx] = 1.0 / len(ml_indices_list)
-                        weights = weights / np.sum(weights)
-                    else:
-                        if ml_confidence >= ML_HIGH_CONFIDENCE_THRESHOLD:
-                            ml_weight = self.max_ml_weight
-                        elif ml_confidence <= ML_LOW_CONFIDENCE_THRESHOLD:
-                            ml_weight = self.min_ml_weight
-                        else:
-                            confidence_range = ML_HIGH_CONFIDENCE_THRESHOLD - ML_LOW_CONFIDENCE_THRESHOLD
-                            confidence_delta = ml_confidence - ML_LOW_CONFIDENCE_THRESHOLD
-                            ml_weight = self.min_ml_weight + (confidence_delta / confidence_range) * (self.max_ml_weight - self.min_ml_weight)
-                        if num_llm > 0:
-                            llm_weight_total = 1.0 - ml_weight
-                            weights = np.ones(len(results)) * llm_weight_total / num_llm
-                        else:
-                            weights = np.ones(len(results)) / len(results)
-                        for ml_idx in ml_indices_list:
-                            weights[ml_idx] = ml_weight / len(ml_indices_list)
-                        weights = weights / np.sum(weights)
-                else:
-                    weights = np.ones(len(results)) / len(results)
+            weights = self._compute_attention_weights(agent_preds, x_dict)
             
             # Weighted prediction
             if self.task_type == "classification" and self.class_names is not None and len(self.class_names) > 2:
@@ -802,48 +740,81 @@ Apply the mechanism's mathematical description to compute the output value from 
         return batch_results
     
     def _compute_attention_weights(self, predictions: List[Any], x_dict: Dict) -> np.ndarray:
-        """Compute attention weights for mechanisms based on confidence"""
-        # Simple uniform weights for now (can be enhanced with confidence-based routing)
+        """
+        Compute routing weights.
+        Priority:
+        1) If TextGrad learned weights exist: use them (ML vs LLM group weights)
+        2) Else if mechanism_performance exists: use it (per-mechanism weights)
+        3) Else: uniform
+
+        Also enforces ML min/max weight constraints when both ML and LLM mechanisms exist.
+        """
         n_mechanisms = len(predictions)
-        weights = np.ones(n_mechanisms) / n_mechanisms
+        weights = np.ones(n_mechanisms, dtype=float) / max(1, n_mechanisms)
         
-        # Apply ML confidence-based routing if enabled
-        if self.ml_mechanism is not None and self.ml_mechanism.is_trained:
-            try:
-                x_array = np.array([[x_dict.get(feat, 0.0) for feat in self.feature_cols]])
-                if self.scaler is not None:
-                    x_array = self.scaler.transform(x_array)
-                
-                ml_confidence = self.ml_mechanism.get_confidence(x_array)[0]
-                
-                # Find ML mechanism indices
-                ml_indices = [i for i, mech_type in enumerate(self.mechanism_types) if mech_type == "ml"]
-                llm_indices = [i for i, mech_type in enumerate(self.mechanism_types) if mech_type == "llm"]
-                
-                if ml_indices and llm_indices:
-                    if ml_confidence >= self.hard_ml_gate_threshold:
-                        # High confidence: prefer ML
-                        ml_weight = min(self.max_ml_weight, ml_confidence)
-                        llm_weight = (1.0 - ml_weight) / len(llm_indices)
-                        
-                        for ml_idx in ml_indices:
-                            weights[ml_idx] = ml_weight / len(ml_indices)
-                        for llm_idx in llm_indices:
-                            weights[llm_idx] = llm_weight
-                    else:
-                        # Low confidence: allow LLM to contribute
-                        ml_weight = max(self.min_ml_weight, ml_confidence * 0.5)
-                        llm_weight = (1.0 - ml_weight) / len(llm_indices)
-                        
-                        for ml_idx in ml_indices:
-                            weights[ml_idx] = ml_weight / len(ml_indices)
-                        for llm_idx in llm_indices:
-                            weights[llm_idx] = llm_weight
-            except Exception as e:
-                logger.warning(f"Failed to compute ML confidence-based weights: {e}")
+        # Find ML and LLM mechanism indices
+        ml_indices = [i for i, mech_type in enumerate(self.mechanism_types) if mech_type == "ml"]
+        llm_indices = [i for i, mech_type in enumerate(self.mechanism_types) if mech_type == "llm"]
         
-        # Normalize weights
-        weights = weights / weights.sum() if weights.sum() > 0 else weights
+        # Use learned weights if available
+        if self.learned_ml_weight is not None and self.learned_llm_weight is not None and ml_indices and llm_indices:
+            ml_weight_per_mechanism = self.learned_ml_weight / len(ml_indices)
+            llm_weight_per_mechanism = self.learned_llm_weight / len(llm_indices)
+            
+            for ml_idx in ml_indices:
+                weights[ml_idx] = ml_weight_per_mechanism
+            for llm_idx in llm_indices:
+                weights[llm_idx] = llm_weight_per_mechanism
+        elif hasattr(self, "mechanism_performance") and isinstance(self.mechanism_performance, dict) and self.mechanism_performance:
+            # Performance-based routing (higher = more weight). Works for both pre-training snapshots and training.
+            # Use a small epsilon to avoid zeroing any mechanism entirely unless constrained below.
+            eps = 1e-6
+            for i in range(n_mechanisms):
+                perf = self.mechanism_performance.get(i, 0.5)
+                try:
+                    perf = float(perf)
+                except Exception:
+                    perf = 0.5
+                if not np.isfinite(perf):
+                    perf = 0.5
+                weights[i] = max(eps, perf)
+        
+        # Normalize base weights
+        s = float(weights.sum())
+        weights = (weights / s) if s > 0 else weights
+
+        # Enforce ML weight constraints (only meaningful when both groups exist)
+        if ml_indices and llm_indices:
+            total_ml = float(np.sum(weights[ml_indices]))
+            total_llm = float(np.sum(weights[llm_indices]))
+            if total_ml + total_llm > 0:
+                # hard_ml_gate_threshold acts as an additional minimum ML weight
+                eff_min = self.min_ml_weight if self.min_ml_weight is not None else 0.0
+                if self.hard_ml_gate_threshold is not None:
+                    eff_min = max(eff_min, float(self.hard_ml_gate_threshold))
+                eff_max = self.max_ml_weight if self.max_ml_weight is not None else 1.0
+                eff_min = float(np.clip(eff_min, 0.0, 1.0))
+                eff_max = float(np.clip(eff_max, 0.0, 1.0))
+                if eff_max < eff_min:
+                    eff_max = eff_min
+
+                desired_ml = float(np.clip(total_ml, eff_min, eff_max))
+                desired_llm = 1.0 - desired_ml
+
+                # Rescale within each group while preserving relative within-group proportions
+                if total_ml > 0:
+                    weights[ml_indices] *= (desired_ml / total_ml)
+                else:
+                    # If ML group has no weight yet, distribute evenly
+                    weights[ml_indices] = desired_ml / len(ml_indices)
+                if total_llm > 0:
+                    weights[llm_indices] *= (desired_llm / total_llm)
+                else:
+                    weights[llm_indices] = desired_llm / len(llm_indices)
+
+                # Final renormalize for numerical safety
+                s2 = float(weights.sum())
+                weights = (weights / s2) if s2 > 0 else weights
         return weights
     
     def update_mechanism_performance(self, mechanism_idx: int, performance_score: float):
@@ -860,7 +831,7 @@ class VariationalMechanismGenerator:
                  data_insights: Optional[Dict[str, Any]] = None,
                  diversity_ngram_n: int = 3, diversity_min_jaccard: float = 0.35,
                  scaler: Any = None, num_mechanisms_unknown: Optional[int] = None,
-                 use_scaling: bool = True):
+                 use_scaling: bool = True, encoder_batch_size: Optional[int] = None):
         self.llm = batched_llm
         self.feature_cols = feature_cols
         self.use_ml_mechanism = use_ml_mechanism
@@ -872,6 +843,8 @@ class VariationalMechanismGenerator:
         self.use_scaling = use_scaling  # Flag to indicate if scaling is enabled
         # Number of unknown mechanisms to generate (defaults to 1 if not provided)
         self.num_mechanisms_unknown = num_mechanisms_unknown if num_mechanisms_unknown is not None else 1
+        # Batch size for encoding residual samples (None = no batching, use config default)
+        self.encoder_batch_size = encoder_batch_size if encoder_batch_size is not None else ENCODER_BATCH_SIZE
         self.known_mechanisms = self._init_known_mechanisms()
         self.unknown_mechanisms = self._init_unknown_mechanisms()
         self.encoder_prompt = self._init_encoder_prompt()
@@ -1068,79 +1041,37 @@ class VariationalMechanismGenerator:
         if self.ml_mechanism is not None:
             self.ml_mechanism.train(X_train, y_train, self.feature_cols, y_scaler)
     
-    def encode_latent_space(self, X_sample, y_sample, prediction_errors, ml_residuals: Optional[np.ndarray] = None) -> str:
-        """Encode dataset patterns into latent representation"""
-        stats = compute_dataset_stats(X_sample, y_sample)
+    def _encode_single_batch(self, X_batch, y_batch, prediction_errors_batch, ml_residuals_batch: Optional[np.ndarray],
+                            batch_idx: int, total_batches: int, X_original_batch: Optional[List] = None) -> str:
+        """Encode a single batch of samples into latent representation"""
+        stats = compute_dataset_stats(X_batch, y_batch)
         
         # Check if this is a DeepChem dataset - don't show ECFP features
         is_deepchem = (self.feature_cols and len(self.feature_cols) > 0 and 
                       all(feat.startswith('ecfp_bit_') for feat in self.feature_cols[:10]))
         has_smiles = False
         if is_deepchem:
-            X_original_check = None
-            if hasattr(self, 'X_train_original') and self.X_train_original is not None:
-                X_original_check = self.X_train_original
-            elif hasattr(self, 'predictor') and hasattr(self.predictor, 'X_train_original'):
-                X_original_check = self.predictor.X_train_original
-            
+            X_original_check = X_original_batch if X_original_batch is not None else None
             if X_original_check and len(X_original_check) > 0:
                 if isinstance(X_original_check[0], dict) and 'SMILES' in X_original_check[0]:
                     has_smiles = True
         
-        # Prefer raw/non-encoded features for what the LLM "sees".
-        # The ML baseline still uses X_sample (numeric/encoded), but the mechanism generator should
-        # reason over human-readable fields (categoricals/text/SMILES) when available.
-        X_original_src = None
-        try:
-            if hasattr(self, "X_train_original") and self.X_train_original is not None:
-                X_original_src = self.X_train_original
-            elif hasattr(self, "predictor") and hasattr(self.predictor, "X_train_original"):
-                X_original_src = self.predictor.X_train_original
-        except Exception:
-            X_original_src = None
-
-        # Describe features without exploding token usage on high-dimensional encodings (ECFP, gene-expression, etc.)
-        n_features = int(getattr(X_sample, "shape", [0, 0])[1]) if hasattr(X_sample, "shape") and len(X_sample.shape) > 1 else 0
-        feature_cols = self.feature_cols or [f"x{i}" for i in range(n_features)]
-        # Check if we have categorical features in X_original (e.g., SU dataset)
-        has_categorical_strings = False
-        categorical_feature_info = ""
-        if X_original_src is not None and len(X_original_src) > 0:
-            sample = X_original_src[0]
-            if isinstance(sample, dict):
-                # Check for categorical features that are strings (e.g., chemical, concentration_label)
-                categorical_features = [k for k in sample.keys() 
-                                      if k in feature_cols and isinstance(sample.get(k), str)
-                                      and k not in ['SMILES', 'SEQ', 'SUBSTRATES']]
-                if categorical_features:
-                    has_categorical_strings = True
-                    # Get unique values for each categorical feature
-                    unique_vals = {}
-                    for cat_feat in categorical_features[:3]:  # Limit to first 3 to avoid token explosion
-                        vals = set()
-                        for s in X_original_src[:min(50, len(X_original_src))]:  # Sample up to 50
-                            if isinstance(s, dict) and cat_feat in s:
-                                vals.add(str(s[cat_feat]))
-                        unique_vals[cat_feat] = sorted(list(vals))[:10]  # Limit to 10 unique values
-                    if unique_vals:
-                        cat_info_parts = []
-                        for cat_feat, vals in unique_vals.items():
-                            cat_info_parts.append(f"{cat_feat} (values: {', '.join(vals)}{'...' if len(vals) == 10 else ''})")
-                        categorical_feature_info = f"\n\nCRITICAL: This dataset has categorical features that are label-encoded: {', '.join(cat_info_parts)}. The feature names (e.g., 'chemical', 'concentration_label') contain NUMERIC encoded values (0, 1, 2, ...) for use in mathematical formulas. For conditional logic, you can also use the original string values via the '_name' suffix (e.g., 'chemical_name' contains the original string like \"DMSO\", \"PFOS\"). Use the numeric encoded values (e.g., 'chemical') for arithmetic operations in formulas."
+        # Prefer raw/non-encoded features for what the LLM "sees"
+        X_original_src = X_original_batch
         
+        # Describe features
+        n_features = int(getattr(X_batch, "shape", [0, 0])[1]) if hasattr(X_batch, "shape") and len(X_batch.shape) > 1 else 0
+        feature_cols = self.feature_cols or [f"x{i}" for i in range(n_features)]
         if is_deepchem and has_smiles:
             features_desc = "SMILES strings (molecular structures) - ML model uses ECFP fingerprints internally"
             deepchem_note = "\n\nCRITICAL: This is a DeepChem molecular dataset. The LLM mechanism MUST work with SMILES strings and molecular properties (molecular_weight, num_rings, num_hydroxyl_groups, etc.), NOT ECFP bit features (ecfp_bit_0, ecfp_bit_1, etc.)."
         else:
-            # Only show a small prefix of feature names to keep prompts compact
             if feature_cols and len(feature_cols) > 0:
-                shown = ", ".join([str(c) for c in feature_cols[:10]])
-                more = f", ... ({len(feature_cols)} total)" if len(feature_cols) > 10 else ""
-                features_desc = f"{shown}{more}"
+                features_desc = ", ".join([str(c) for c in feature_cols])
             else:
                 features_desc = "features"
-            deepchem_note = categorical_feature_info if has_categorical_strings else ""
-
+            deepchem_note = ""
+        
         def _truncate(v: Any, max_len: int = 140) -> str:
             try:
                 s = str(v)
@@ -1148,13 +1079,11 @@ class VariationalMechanismGenerator:
                 s = repr(v)
             s = s.replace("\n", " ").replace("\r", " ")
             return s if len(s) <= max_len else s[: max_len - 3] + "..."
-
+        
         def _format_example(i: int) -> str:
-            # Prefer raw dict if we have it and indices line up
             if X_original_src is not None and i < len(X_original_src):
                 orig = X_original_src[i]
                 if isinstance(orig, dict):
-                    # Prefer a single, semantically rich field if present
                     if "SMILES" in orig:
                         return f"SMILES={_truncate(orig.get('SMILES'))}"
                     if "SEQ" in orig or "SUBSTRATES" in orig:
@@ -1163,20 +1092,16 @@ class VariationalMechanismGenerator:
                             parts.append(f"SEQ={_truncate(orig.get('SEQ'))}")
                         if "SUBSTRATES" in orig:
                             parts.append(f"SUBSTRATES={_truncate(orig.get('SUBSTRATES'))}")
-                        # Add a couple extra numeric descriptors if present
                         extra = [(k, v) for k, v in orig.items() if k not in ("SEQ", "SUBSTRATES")]
                         for k, v in extra[: max(0, MAX_FEATURES_IN_COMPONENT_LIST - len(parts))]:
                             parts.append(f"{k}={_truncate(v)}")
                         return ", ".join(parts)
-                    # Generic dict: show first few key/vals (raw categorical/text preserved by loaders)
                     kvs = list(orig.items())[:MAX_FEATURES_IN_COMPONENT_LIST]
                     return ", ".join([f"{k}={_truncate(v)}" for k, v in kvs])
-                # Non-dict raw item
                 return _truncate(orig)
-
-            # Fallback: show encoded/numeric row (best effort, capped)
+            
             try:
-                row = X_sample[i]
+                row = X_batch[i]
                 if hasattr(row, "shape") and len(row.shape) > 0:
                     row = np.asarray(row, dtype=float).ravel()
                     kvs = []
@@ -1186,15 +1111,14 @@ class VariationalMechanismGenerator:
             except Exception:
                 pass
             return f"sample_{i}"
-
-        # Compact numeric stats (avoid dumping 2048+ floats / huge gene-expression vectors)
+        
+        # Compact numeric stats
         x_mean = stats.get("X_mean", None)
         x_std = stats.get("X_std", None)
         show_full_stats = (not (is_deepchem and has_smiles)) and isinstance(x_mean, np.ndarray) and x_mean.size <= 50
         if show_full_stats:
             x_stats_str = f"- X mean (per-feature): {x_mean.tolist()}\n- X std (per-feature): {x_std.tolist() if isinstance(x_std, np.ndarray) else 'N/A'}"
         else:
-            # Summaries over features
             try:
                 x_mean_arr = np.asarray(x_mean, dtype=float).ravel()
                 x_std_arr = np.asarray(x_std, dtype=float).ravel() if x_std is not None else None
@@ -1211,36 +1135,96 @@ class VariationalMechanismGenerator:
                     x_stats_str = f"- X mean summary: min={mean_min:.4f}, avg={mean_avg:.4f}, max={mean_max:.4f}"
             except Exception:
                 x_stats_str = "- X stats: (unavailable)"
-
-        # Provide a few raw examples for the LLM to ground its mechanism (categoricals/text/SMILES).
-        n_examples = min(6, int(len(X_sample)) if hasattr(X_sample, "__len__") else 0)
+        
+        # Build example lines for this batch with error and residual information
+        max_examples = int(len(X_batch)) if hasattr(X_batch, "__len__") else 0
+        n_examples = max_examples
         example_lines = []
         for i in range(n_examples):
             try:
-                yv = y_sample[i]
+                yv = y_batch[i]
+                error_val = prediction_errors_batch[i] if i < len(prediction_errors_batch) else None
+                residual_val = ml_residuals_batch[i] if ml_residuals_batch is not None and i < len(ml_residuals_batch) else None
+                
+                # Build example string with error/residual context
+                example_str = f"  - {i}: {_format_example(i)} -> y={_truncate(yv)}"
+                if error_val is not None:
+                    example_str += f" | error={error_val:.4f}"
+                if residual_val is not None:
+                    residual_sign = "+" if residual_val >= 0 else ""
+                    example_str += f" | residual={residual_sign}{residual_val:.4f}"
+                example_lines.append(example_str)
             except Exception:
-                yv = None
-            example_lines.append(f"  - {i}: {_format_example(i)} -> y={_truncate(yv)}")
+                try:
+                    yv = y_batch[i]
+                except Exception:
+                    yv = None
+                example_lines.append(f"  - {i}: {_format_example(i)} -> y={_truncate(yv)}")
         examples_block = "\n".join(example_lines) if example_lines else "  (no examples available)"
-
+        
+        # Add batch context if multiple batches
+        batch_context = ""
+        if total_batches > 1:
+            batch_context = f"\n\nNOTE: This is batch {batch_idx + 1} of {total_batches}. You are seeing a subset of the residual samples. Focus on the patterns in this batch, but be aware there are additional samples in other batches."
+        
+        # Compute error statistics for this batch
+        error_stats = ""
+        if len(prediction_errors_batch) > 0:
+            error_mean = float(np.mean(prediction_errors_batch))
+            error_std = float(np.std(prediction_errors_batch))
+            error_max = float(np.max(prediction_errors_batch))
+            error_min = float(np.min(prediction_errors_batch))
+            error_median = float(np.median(prediction_errors_batch))
+            error_stats = f"- Error statistics: mean={error_mean:.4f}, std={error_std:.4f}, min={error_min:.4f}, median={error_median:.4f}, max={error_max:.4f}"
+        
+        # Compute residual statistics for this batch
+        residual_stats = ""
+        if ml_residuals_batch is not None and len(ml_residuals_batch) > 0:
+            residual_mean = float(np.mean(ml_residuals_batch))
+            residual_std = float(np.std(ml_residuals_batch))
+            residual_max = float(np.max(ml_residuals_batch))
+            residual_min = float(np.min(ml_residuals_batch))
+            residual_median = float(np.median(ml_residuals_batch))
+            # Count positive vs negative residuals
+            n_positive = int(np.sum(ml_residuals_batch > 0))
+            n_negative = int(np.sum(ml_residuals_batch < 0))
+            residual_stats = f"- Residual statistics: mean={residual_mean:.4f}, std={residual_std:.4f}, min={residual_min:.4f}, median={residual_median:.4f}, max={residual_max:.4f} (positive={n_positive}, negative={n_negative})"
+        
         data_summary = f"""Dataset statistics:
 - Features (LLM-facing): {features_desc}{deepchem_note}
 {x_stats_str}
 - y mean: {float(stats.get('y_mean', 0.0)):.4f}
 - y std: {float(stats.get('y_std', 0.0)):.4f}
-- Sample size: {len(X_sample)}
-- Prediction errors (MAE): {np.mean(prediction_errors):.3f}
-- Example samples (raw/non-encoded when available):
-{examples_block}"""
+- Sample size: {len(X_batch)}{batch_context}
+- Prediction errors (MAE): {np.mean(prediction_errors_batch):.3f}
+{error_stats}
+{residual_stats}
+- Example samples with errors and residuals (raw/non-encoded when available):
+{examples_block}
+
+CRITICAL: These are RESIDUAL SAMPLES - samples where the ML model makes large errors. 
+Study the patterns in these examples from TWO perspectives:
+
+1. ERROR PATTERNS (gap-filling perspective):
+- Which feature combinations lead to high errors?
+- What patterns distinguish high-error samples from low-error ones?
+- What residual patterns (over-prediction vs under-prediction) appear?
+- What nonlinearities or interactions might explain these errors?
+
+2. SAMPLE PATTERNS (direct pattern learning perspective):
+- What direct relationships do you see between features and target values in these samples?
+- How do feature values relate to target values? (e.g., "When age is high and BMI is high, target is typically high")
+- What prediction rules would work based on the sample patterns themselves?
+- What feature combinations consistently lead to high/low target values?
+- Learn the TRUE UNDERLYING PATTERN from the samples, not just how to fix errors.
+
+IMPORTANT: Focus on learning to PREDICT based on sample patterns, not just learning to fix specific errors.
+Your mechanism should capture the true underlying relationships visible in the samples."""
         
         if self.use_ml_mechanism and self.ml_mechanism is not None and self.ml_mechanism.is_trained:
             ml_mech_name = self.ml_mechanism.model_name if hasattr(self.ml_mechanism, 'model_name') else "ML"
-            # Include detailed ML mechanism description
             ml_mech_description = self.ml_mechanism.get_description()
-            # For DeepChem datasets, add a note that ML uses ECFP internally but LLM should use SMILES
             if is_deepchem and has_smiles:
-                # Remove ECFP bit details from description to avoid confusion
-                # The LLM should focus on SMILES-based molecular properties, not ECFP bits
                 ml_mech_description_clean = ml_mech_description.split("Trained model:")[0] if "Trained model:" in ml_mech_description else ml_mech_description
                 ml_mech_description_clean = ml_mech_description_clean.rstrip()
                 ml_mech_description_clean += ". NOTE: The ML model uses ECFP fingerprints internally, but your LLM mechanism MUST use SMILES strings and molecular properties instead."
@@ -1248,16 +1232,26 @@ class VariationalMechanismGenerator:
             else:
                 data_summary += f"\n- ML baseline mechanism: {ml_mech_description}"
         
-        if ml_residuals is not None and len(ml_residuals) > 0:
-            data_summary += f"\n- ML baseline mean|residual|: {float(np.mean(np.abs(ml_residuals))):.3f}"
+        if ml_residuals_batch is not None and len(ml_residuals_batch) > 0:
+            data_summary += f"\n- ML baseline mean|residual|: {float(np.mean(np.abs(ml_residuals_batch))):.3f}"
         
         if self.task_type == "classification":
-            task_desc = "Task: Infer a latent mechanism for classification explaining decision boundaries and class separation."
+            task_desc = "Task: Infer a latent mechanism for classification explaining decision boundaries and class separation based on the residual patterns shown above."
         else:
             if self.use_scaling:
-                task_desc = "Task: Infer a latent mechanism explaining smooth curved tendencies. IMPORTANT: Data is normalized to [0, 1] range for both inputs and outputs."
+                task_desc = """Task: Infer a latent mechanism that explains the RESIDUAL PATTERNS shown in the examples above. 
+IMPORTANT: 
+- Data is normalized to [0, 1] range for both inputs and outputs.
+- Focus on patterns that explain WHY these samples have high errors/residuals.
+- Identify nonlinearities, interactions, or missing relationships that the ML model failed to capture.
+- The mechanism should address the specific error patterns visible in the examples."""
             else:
-                task_desc = "Task: Infer a latent mechanism explaining smooth curved tendencies. IMPORTANT: Data is NOT normalized - use raw feature and target values as provided."
+                task_desc = """Task: Infer a latent mechanism that explains the RESIDUAL PATTERNS shown in the examples above.
+IMPORTANT:
+- Data is NOT normalized - use raw feature and target values as provided.
+- Focus on patterns that explain WHY these samples have high errors/residuals.
+- Identify nonlinearities, interactions, or missing relationships that the ML model failed to capture.
+- The mechanism should address the specific error patterns visible in the examples."""
         
         prompt = get_prompt('mechanism_generation.encoder_with_data',
                            encoder_prompt=self.encoder_prompt,
@@ -1266,8 +1260,136 @@ class VariationalMechanismGenerator:
         latent_z = self.llm.invoke_single(HumanMessage(content=prompt))
         return latent_z
     
+    def _concatenate_latent_representations(self, latent_zs: List[str]) -> str:
+        """Concatenate multiple latent_z representations without summarization - preserve all batch insights"""
+        if len(latent_zs) == 0:
+            return ""
+        if len(latent_zs) == 1:
+            return latent_zs[0]
+        
+        # Concatenate all batch insights with clear separators
+        # This preserves all detailed information from each batch for mechanism generation
+        concatenated_parts = []
+        concatenated_parts.append(f"LATENT MECHANISM INSIGHTS FROM {len(latent_zs)} BATCHES OF RESIDUAL SAMPLES:")
+        concatenated_parts.append("=" * 80)
+        concatenated_parts.append("")
+        concatenated_parts.append("CRITICAL: Use ALL insights from ALL batches below when generating the mechanism.")
+        concatenated_parts.append("Each batch reveals different error patterns - incorporate all of them into your mechanism design.")
+        concatenated_parts.append("Look for:")
+        concatenated_parts.append("- Common patterns across multiple batches (high priority)")
+        concatenated_parts.append("- Unique insights from specific batches (also important)")
+        concatenated_parts.append("- Non-linearities and interactions mentioned in any batch")
+        concatenated_parts.append("- Intermediate concepts (latent variables) that explain the error patterns")
+        concatenated_parts.append("")
+        concatenated_parts.append("=" * 80)
+        concatenated_parts.append("")
+        
+        for i, z in enumerate(latent_zs):
+            concatenated_parts.append(f"BATCH {i+1} INSIGHTS:")
+            concatenated_parts.append("-" * 80)
+            concatenated_parts.append(z)
+            concatenated_parts.append("")
+        
+        concatenated_parts.append("=" * 80)
+        concatenated_parts.append("")
+        concatenated_parts.append("END OF ALL BATCH INSIGHTS - Use all of the above when designing your mechanism.")
+        
+        concatenated_z = "\n".join(concatenated_parts)
+        return concatenated_z
+    
+    def _aggregate_latent_representations(self, latent_zs: List[str]) -> str:
+        """DEPRECATED: Use _concatenate_latent_representations instead. Kept for backward compatibility."""
+        return self._concatenate_latent_representations(latent_zs)
+    
+    def encode_latent_space(self, X_sample, y_sample, prediction_errors, ml_residuals: Optional[np.ndarray] = None) -> str:
+        """Encode dataset patterns into latent representation with optional batching"""
+        # Check if batching is enabled
+        batch_size = self.encoder_batch_size
+        n_samples = len(X_sample) if hasattr(X_sample, "__len__") else 0
+        
+        logger.debug(f"  [Encode Latent] Starting encoding: n_samples={n_samples}, batch_size={batch_size}, encoder_batch_size={self.encoder_batch_size}")
+        
+        # Initialize list to track all latent_zs for logging
+        if not hasattr(self, '_current_latent_zs'):
+            self._current_latent_zs = []
+        self._current_latent_zs = []  # Reset for this encoding call
+        
+        # If no batching or samples fit in one batch, use single batch
+        if batch_size is None or n_samples <= batch_size:
+            # Use original single-batch implementation
+            latent_z = self._encode_single_batch(
+                X_sample, y_sample, prediction_errors, ml_residuals,
+                batch_idx=0, total_batches=1,
+                X_original_batch=self._get_X_original_for_batch(X_sample, 0, len(X_sample))
+            )
+            # Always store, even for single batch
+            if not hasattr(self, '_current_latent_zs'):
+                self._current_latent_zs = []
+            self._current_latent_zs.append(('single_batch', latent_z))
+            return latent_z
+        
+        # Batching enabled: split samples into batches
+        n_batches = (n_samples + batch_size - 1) // batch_size
+        logger.info(f"  [Encode Latent] Batching {n_samples} residual samples into {n_batches} batches (batch_size={batch_size})")
+        
+        latent_zs = []
+        for i in range(n_batches):
+            start = i * batch_size
+            end = min((i + 1) * batch_size, n_samples)
+            
+            X_batch = X_sample[start:end]
+            y_batch = y_sample[start:end]
+            prediction_errors_batch = prediction_errors[start:end]
+            ml_residuals_batch = ml_residuals[start:end] if ml_residuals is not None else None
+            X_original_batch = self._get_X_original_for_batch(X_sample, start, end)
+            
+            logger.debug(f"  [Encode Latent] Processing batch {i+1}/{n_batches} (samples {start}-{end-1})")
+            
+            # Encode this batch
+            z_batch = self._encode_single_batch(
+                X_batch, y_batch, prediction_errors_batch, ml_residuals_batch,
+                batch_idx=i, total_batches=n_batches,
+                X_original_batch=X_original_batch
+            )
+            latent_zs.append(z_batch)
+            self._current_latent_zs.append((f'batch_{i+1}', z_batch))
+        
+        logger.info(f"  [Encode Latent] Concatenating {len(latent_zs)} latent representations (no summarization - preserving all batch insights)")
+        
+        # Concatenate all latent_z values instead of aggregating/summarizing
+        # This preserves all detailed insights from each batch for mechanism generation
+        concatenated_z = self._concatenate_latent_representations(latent_zs)
+        
+        # Ensure _current_latent_zs exists before appending
+        if not hasattr(self, '_current_latent_zs'):
+            self._current_latent_zs = []
+        self._current_latent_zs.append(('concatenated', concatenated_z))
+        logger.info(f"  [Encode Latent] Stored {len(self._current_latent_zs)} latent_z entries ({len(latent_zs)} batches + 1 concatenated)")
+        return concatenated_z
+    
+    def _get_X_original_for_batch(self, X_sample, start_idx: int, end_idx: int) -> Optional[List]:
+        """Get X_original samples for a specific batch range"""
+        try:
+            if hasattr(self, "X_train_original") and self.X_train_original is not None:
+                if start_idx < len(self.X_train_original) and end_idx <= len(self.X_train_original):
+                    return self.X_train_original[start_idx:end_idx]
+            elif hasattr(self, "predictor") and hasattr(self.predictor, "X_train_original"):
+                if self.predictor.X_train_original is not None:
+                    if start_idx < len(self.predictor.X_train_original) and end_idx <= len(self.predictor.X_train_original):
+                        return self.predictor.X_train_original[start_idx:end_idx]
+        except Exception:
+            pass
+        return None
+    
     def generate_unknown_mechanisms(self, X_train: np.ndarray, y_train: np.ndarray, prediction_errors: np.ndarray, ml_residuals: Optional[np.ndarray] = None) -> List[str]:
         """Generate new unknown mechanisms based on data and residuals"""
+        # Context-only background from known mechanisms (Option B)
+        known_context = ""
+        try:
+            if hasattr(self, "known_mechanisms") and isinstance(self.known_mechanisms, list) and len(self.known_mechanisms) > 0:
+                known_context = "\n\n---\n\n".join([str(x) for x in self.known_mechanisms if x is not None and str(x).strip() != ""])
+        except Exception:
+            known_context = ""
         # Check if this is a DeepChem dataset (ECFP fingerprints) - skip ML-guided init for these
         is_deepchem = (self.feature_cols and len(self.feature_cols) > 0 and 
                       all(feat.startswith('ecfp_bit_') for feat in self.feature_cols[:10]))
@@ -1300,16 +1422,22 @@ class VariationalMechanismGenerator:
             if ml_residuals is not None and len(ml_residuals) > 0:
                 try:
                     # For classification: residuals are 1.0 (mismatched) or 0.0 (matched)
-                    # Sort descending to put mismatched (1.0) first
-                    sorted_indices = np.argsort(ml_residuals)[::-1]  # Sort by residual descending (1.0 first, then 0.0)
-                    top_5_idx = sorted_indices[:MAX_WORST_RESIDUAL_SAMPLES]
+                    # For regression: residuals are signed (positive = under-prediction, negative = over-prediction)
+                    # Re-rank residuals for logging: sort by magnitude (absolute value) descending
+                    # Note: ml_residuals may already be from compute_ml_residuals (which returns sorted_indices)
+                    # but we re-rank here for logging to show worst examples
+                    if self.task_type == "regression":
+                        sorted_indices = np.argsort(np.abs(ml_residuals))[::-1]  # Sort by absolute value (worst first)
+                    else:
+                        sorted_indices = np.argsort(ml_residuals)[::-1]  # Sort by residual descending (1.0 first, then 0.0)
+                    top_5_idx = sorted_indices  # All worst predictions (no limit)
                     
                     # Check if we have any mismatched examples (residual > 0)
                     mismatched_count = np.sum(ml_residuals > 0)
                     if mismatched_count == 0:
                         logger.warning(f"  [Residual Samples] ⚠️  No mismatched examples found (ML model has 100% accuracy on training set). Showing top samples by residual (all are 0.0):")
                     else:
-                        logger.info(f"  [Residual Samples] Top {min(MAX_WORST_RESIDUAL_SAMPLES, mismatched_count)} worst ML residuals (mismatched examples) passed to LLM during mechanism generation:")
+                        logger.info(f"  [Residual Samples] Top {mismatched_count} worst ML residuals (mismatched examples) passed to LLM during mechanism generation:")
                     # Try to get X_train_original (SMILES) from parent TrainableMAICL if available
                     X_original = None
                     if hasattr(self, 'X_train_original') and self.X_train_original is not None:
@@ -1319,29 +1447,35 @@ class VariationalMechanismGenerator:
                     
                     for rank, idx in enumerate(top_5_idx, 1):
                         if idx < len(X_train) and idx < len(y_train):
-                            # Use X_original if available (includes RDKit features for enzyme datasets, SMILES for DeepChem)
+                            feature_names = self.feature_cols if self.feature_cols else [f"x{j}" for j in range(X_train.shape[1])]
+                            # Use X_train values as-is (scaled if use_scaling=True, raw if use_scaling=False)
+                            # Only use X_original for non-numerical features like SMILES strings
                             if X_original is not None and idx < len(X_original):
                                 original_feat = X_original[idx]
                                 if isinstance(original_feat, dict):
-                                    # For DeepChem: show SMILES
+                                    # For DeepChem: show SMILES (non-numerical, can't be scaled)
                                     if 'SMILES' in original_feat:
                                         feat_display = f"SMILES={original_feat['SMILES']}"
                                     else:
-                                        # For enzyme datasets: show numerical features including RDKit
-                                        # Filter out text fields and show numerical features
-                                        num_feats = {k: v for k, v in original_feat.items() 
-                                                   if k not in ['SEQ', 'SUBSTRATES', 'SMILES'] and isinstance(v, (int, float))}
-                                        # Prioritize showing RDKit features along with regular features
-                                        rdkit_feats = {k: v for k, v in num_feats.items() if k.startswith('rdkit_')}
-                                        other_feats = {k: v for k, v in num_feats.items() if not k.startswith('rdkit_')}
+                                        # For enzyme datasets: use values from X_train (scaled if use_scaling=True, raw if use_scaling=False)
+                                        # Map feature names to their indices in X_train
+                                        feat_vals = {}
+                                        for j, feat_name in enumerate(feature_names):
+                                            if j < X_train.shape[1]:
+                                                # Use scaled value from X_train (what LLM sees)
+                                                feat_vals[feat_name] = float(X_train[idx, j])
+                                        # Prioritize showing non-RDKit features for readability
+                                        rdkit_feats = {k: v for k, v in feat_vals.items() if k.startswith('rdkit_')}
+                                        other_feats = {k: v for k, v in feat_vals.items() if not k.startswith('rdkit_')}
                                         # Combine: show some regular features + RDKit features
                                         all_feats = dict(list(other_feats.items())[:MAX_FEATURES_IN_COMPONENT_LIST-3] + list(rdkit_feats.items())[:3])
                                         feat_display = ', '.join([f"{k}={v:.2f}" for k, v in all_feats.items()])
                                 else:
-                                    feat_display = f"original_feat={str(original_feat)[:MAX_FEATURE_DISPLAY_LENGTH]}"
+                                    # Fallback: use values from X_train (scaled if use_scaling=True, raw if use_scaling=False)
+                                    feat_vals = {feature_names[j]: float(X_train[idx, j]) for j in range(min(len(feature_names), X_train.shape[1]))}
+                                    feat_display = ', '.join([f"{k}={v:.2f}" for k, v in list(feat_vals.items())[:MAX_FEATURES_IN_COMPONENT_LIST]])
                             else:
-                                # Fallback: use feature names (vectorized)
-                                feature_names = self.feature_cols if self.feature_cols else [f"x{j}" for j in range(X_train.shape[1])]
+                                # Use values from X_train as-is (scaled if use_scaling=True, raw if use_scaling=False)
                                 feat_vals = {feature_names[j]: float(X_train[idx, j]) for j in range(min(len(feature_names), X_train.shape[1]))}
                                 feat_display = ', '.join([f"{k}={v:.2f}" for k, v in list(feat_vals.items())[:MAX_FEATURES_IN_COMPONENT_LIST]])
                             
@@ -1379,41 +1513,149 @@ class VariationalMechanismGenerator:
             
             ml_knowledge = extract_ml_knowledge(self.ml_mechanism, self.feature_cols, self.task_type)
             
-            # Determine if ML model is linear
-            model_name = getattr(self.ml_mechanism, "model_name", "unknown")
-            is_linear_ml = model_name in ["LinearRegression", "LogisticRegression"]
+            # Instead of using template mechanisms, have LLM generate initial mechanism from scratch
+            # after seeing residual samples. Use encoder-decoder flow with enhanced prompts.
+            logger.info("  [LLM Generation] Generating initial mechanism(s) from residual samples (not using templates)...")
             
-            # Generate variants (up to num_mechanisms_unknown)
             mechanisms = []
-            num_variants = min(3, self.num_mechanisms_unknown)
+            all_latent_zs_for_mechanism = []  # Track all latent_zs for this mechanism generation
+            for mech_idx in range(self.num_mechanisms_unknown):
+                # Build enhanced latent representation that includes ML knowledge and residual samples
+                latent_z = self.encode_latent_space(X_train, y_train, prediction_errors, ml_residuals)
+                
+                # Store latent_zs from this encoding (includes batch latent_zs if batching was used)
+                if hasattr(self, '_current_latent_zs') and self._current_latent_zs:
+                    all_latent_zs_for_mechanism.append({
+                        'mechanism_index': mech_idx,
+                        'latent_zs': self._current_latent_zs.copy()
+                    })
+                
+                # Enhance latent_z with ML knowledge context and predictions
+                ml_context = ""
+                if ml_knowledge.get("top_features"):
+                    ml_context = f"\n\nML MODEL INSIGHTS:\n"
+                    ml_context += f"The ML baseline identifies these as the most important features:\n"
+                    for i, feat in enumerate(ml_knowledge["top_features"][:]):
+                        imp = ml_knowledge["feature_importance"].get(feat, 0)
+                        ml_context += f"  {i+1}. {feat} (importance: {imp:.3f})\n"
+                    if ml_knowledge.get("model_formula"):
+                        ml_context += f"\nML baseline formula: {ml_knowledge['model_formula']}\n"
+                    
+                    # Add ML predictions as examples to guide initialization
+                    ml_predictions_context = ""
+                    if self.ml_mechanism is not None and ml_residuals is not None and len(ml_residuals) > 0:
+                        try:
+                            # Get ML predictions for a few representative samples
+                            n_examples = min(5, len(X_train))
+                            sample_indices = np.linspace(0, len(X_train)-1, n_examples, dtype=int)
+                            
+                            ml_predictions_context = f"\n\nML PREDICTIONS AS GUIDANCE (use these to initialize your mechanism):\n"
+                            ml_predictions_context += f"The ML model makes these predictions on representative samples:\n"
+                            
+                            for idx in sample_indices:
+                                if idx < len(X_train) and idx < len(y_train):
+                                    # Get ML prediction
+                                    x_dict = {self.feature_cols[j]: float(X_train[idx, j]) 
+                                             for j in range(min(len(self.feature_cols), X_train.shape[1]))}
+                                    try:
+                                        ml_pred = self.ml_mechanism.predict(x_dict)
+                                        true_val = float(y_train[idx])
+                                        residual = float(ml_residuals[idx]) if idx < len(ml_residuals) else (true_val - ml_pred)
+                                        
+                                        # Show key features for this sample
+                                        top_feat_vals = []
+                                        for feat in ml_knowledge["top_features"][:3]:
+                                            if feat in x_dict:
+                                                top_feat_vals.append(f"{feat}={x_dict[feat]:.3f}")
+                                        
+                                        ml_predictions_context += f"  Sample {idx}: {', '.join(top_feat_vals)} → ML_pred={ml_pred:.3f}, true={true_val:.3f}, residual={residual:+.3f}\n"
+                                    except Exception as e:
+                                        logger.debug(f"Failed to get ML prediction for sample {idx}: {e}")
+                            
+                            ml_predictions_context += f"\nINITIALIZATION STRATEGY:\n"
+                            ml_predictions_context += f"1. Your mechanism should produce predictions CLOSE to ML predictions initially (within ~0.1-0.2 range)\n"
+                            ml_predictions_context += f"2. Then add corrections for cases where ML has large residuals (|residual| > 0.2)\n"
+                            ml_predictions_context += f"3. Use nonlinear transformations to capture patterns ML misses, but start from a base that approximates ML performance\n"
+                            ml_predictions_context += f"4. Your initial formula should achieve R² > 0.3 and MAE < 0.25 when used alone (similar to ML baseline)\n"
+                            ml_predictions_context += f"5. The mechanism should complement ML, not replace it - focus on cases with large residuals\n"
+                            
+                        except Exception as e:
+                            logger.warning(f"Failed to generate ML predictions context: {e}")
+                    
+                    ml_context += ml_predictions_context
+                    
+                    # Add suggested starting formula approximation
+                    try:
+                        formula_suggestion = generate_ml_prediction_approximation(
+                            self.ml_mechanism, X_train, y_train, self.feature_cols, ml_knowledge
+                        )
+                        if formula_suggestion:
+                            ml_context += formula_suggestion
+                    except Exception as e:
+                        logger.debug(f"Failed to generate formula suggestion: {e}")
+                    
+                    ml_context += f"\nYOUR TASK: Generate an initial mechanism that:\n"
+                    ml_context += f"1. Starts with predictions CLOSE to ML baseline (use ML insights and predictions as starting point)\n"
+                    ml_context += f"2. Adds nonlinear corrections for cases where ML has large residuals\n"
+                    ml_context += f"3. Uses nonlinear transformations (saturation, interactions, intermediate variables) to capture patterns ML misses\n"
+                    ml_context += f"4. Should achieve reasonable standalone performance (R² > 0.3, MAE < 0.25) - don't start from a completely random formula\n"
+                    ml_context += f"5. Focus on addressing the residual patterns shown above, especially for samples with |residual| > 0.2\n"
+                
+                # Prepend known context so the LLM uses it as background while generating the unknown mechanism
+                enhanced_latent_z = latent_z
+                if known_context:
+                    enhanced_latent_z = f"KNOWN BACKGROUND (context-only; do NOT output this verbatim, use it as guidance):\n{known_context}\n\n{enhanced_latent_z}"
+                enhanced_latent_z = enhanced_latent_z + ml_context
+                
+                # Decode to mechanism
+                mechanism = self.decode_latent_space(enhanced_latent_z)
+                mechanisms.append(mechanism)
             
-            # If ML model is linear, skip linear variant (variant 0) and use non-linear variants
-            # This ensures LLM mechanisms complement rather than replicate the ML model
-            if is_linear_ml and num_variants == 1:
-                # Only 1 mechanism needed: use non-linear variant (variant 2)
-                variant = 2
-                mech = generate_ml_guided_mechanism(
-                    ml_knowledge, self.feature_cols, self.task_type, self.class_names, variant,
-                    use_scaling=getattr(self, 'use_scaling', True)
-                )
-                mechanisms.append(mech)
+            # Store all latent_zs for logging
+            if all_latent_zs_for_mechanism:
+                self._all_latent_zs = all_latent_zs_for_mechanism
+                logger.info(f"  [Latent Z] Stored {len(all_latent_zs_for_mechanism)} mechanism(s) with latent_zs for logging")
+                # Log total number of latent_z entries
+                total_latent_zs = sum(len(mech_data.get('latent_zs', [])) for mech_data in all_latent_zs_for_mechanism)
+                logger.info(f"  [Latent Z] Total latent_z entries: {total_latent_zs}")
             else:
-                # Generate multiple variants
-                for variant in range(num_variants):
-                    mech = generate_ml_guided_mechanism(
-                        ml_knowledge, self.feature_cols, self.task_type, self.class_names, variant
-                    )
-                    mechanisms.append(mech)
+                logger.warning(f"  [Latent Z] No latent_zs were stored during mechanism generation")
             
             self.unknown_mechanisms = mechanisms
             return mechanisms
         
         # Standard mechanism generation (not ML-guided)
         mechanisms = []
-        for _ in range(self.num_mechanisms_unknown):
+        all_latent_zs_for_mechanism = []  # Track all latent_zs for this mechanism generation
+        for mech_idx in range(self.num_mechanisms_unknown):
             latent_z = self.encode_latent_space(X_train, y_train, prediction_errors, ml_residuals)
-            mechanism = self.decode_latent_space(latent_z)
+            
+            # Store latent_zs from this encoding (includes batch latent_zs if batching was used)
+            # Check if _current_latent_zs was populated during encoding
+            if hasattr(self, '_current_latent_zs') and self._current_latent_zs:
+                all_latent_zs_for_mechanism.append({
+                    'mechanism_index': mech_idx,
+                    'latent_zs': self._current_latent_zs.copy()
+                })
+                logger.debug(f"  [Latent Z] Stored {len(self._current_latent_zs)} latent_z(s) for mechanism {mech_idx + 1}")
+            else:
+                logger.warning(f"  [Latent Z] No _current_latent_zs found after encoding for mechanism {mech_idx + 1}")
+            
+            enhanced_latent_z = latent_z
+            if known_context:
+                enhanced_latent_z = f"KNOWN BACKGROUND (context-only; do NOT output this verbatim, use it as guidance):\n{known_context}\n\n{enhanced_latent_z}"
+            mechanism = self.decode_latent_space(enhanced_latent_z)
             mechanisms.append(mechanism)
+        
+        # Store all latent_zs for logging
+        if all_latent_zs_for_mechanism:
+            self._all_latent_zs = all_latent_zs_for_mechanism
+            logger.info(f"  [Latent Z] Stored {len(all_latent_zs_for_mechanism)} mechanism(s) with latent_zs for logging")
+            # Log total number of latent_z entries
+            total_latent_zs = sum(len(mech_data.get('latent_zs', [])) for mech_data in all_latent_zs_for_mechanism)
+            logger.info(f"  [Latent Z] Total latent_z entries: {total_latent_zs}")
+        else:
+            logger.warning(f"  [Latent Z] No latent_zs were stored during mechanism generation")
         
         self.unknown_mechanisms = mechanisms
         return mechanisms
@@ -1486,12 +1728,12 @@ MECHANISM DESCRIPTION:
 [2-4 sentences clearly describing the classification task and how features are used to distinguish between classes]
 
 CLASS-SPECIFIC INTERPRETATIONS AND EQUATIONS:
-CLASS 0 ({class_names[0] if class_names and len(class_names) > 0 else 'class0'}):
+CLASS 0 ({self.class_names[0] if self.class_names and len(self.class_names) > 0 else 'class0'}):
   INTERPRETATION: [Textual description of what this class represents, its relationship to input features, and what patterns characterize it. If the class has a meaningful label, interpret what that label means in the context of the features.]
   EQUATION:
     score_0 = [equation using features that are important for this class]
 
-CLASS 1 ({class_names[1] if class_names and len(class_names) > 1 else 'class1'}):
+CLASS 1 ({self.class_names[1] if self.class_names and len(self.class_names) > 1 else 'class1'}):
   INTERPRETATION: [Textual description of what this class represents, its relationship to input features, and what patterns characterize it. If the class has a meaningful label, interpret what that label means in the context of the features.]
   EQUATION:
     score_1 = [equation using features that are important for this class]
@@ -1501,18 +1743,38 @@ CLASS 1 ({class_names[1] if class_names and len(class_names) > 1 else 'class1'})
 FINAL PREDICTION:
 ŷ = argmax([score_0, score_1, ...])
 
+CRITICAL FORMAT REQUIREMENT:
+- You MUST provide a separate score equation for EACH class (score_0, score_1, score_2, etc.)
+- Each score equation should be on its own line
+- DO NOT put all class formulas inside a single argmax() call
+- The final argmax should reference the pre-computed score variables
+
+CORRECT FORMAT:
+score_0 = [formula for class 0]
+score_1 = [formula for class 1]
+score_2 = [formula for class 2]
+...
+ŷ = argmax([score_0, score_1, score_2, ...])
+
+INCORRECT FORMAT (DO NOT USE):
+ŷ = argmax([
+    [formula for class 0],
+    [formula for class 1],
+    ...
+])
+
 EXAMPLE FORMAT:
 MECHANISM DESCRIPTION:
-This mechanism classifies examples into {len(class_names) if class_names else 'N'} classes: {class_names_str if class_names_str else '[class names]'}. Each class has distinct characteristics that can be identified through different feature combinations.
+This mechanism classifies examples into {len(self.class_names) if self.class_names else 'N'} classes: {class_names_str if class_names_str else '[class names]'}. Each class has distinct characteristics that can be identified through different feature combinations.
 
 CLASS-SPECIFIC EQUATIONS:
-CLASS 0 ({class_names[0] if class_names and len(class_names) > 0 else 'class0'}): This class is characterized by high values of [feature1] and low values of [feature2]. Examples with [specific pattern] tend to belong to this class.
-  score_0 = 0.5*feature1 + 0.3*feature2 - 0.2*feature3
+CLASS 0 ({self.class_names[0] if self.class_names and len(self.class_names) > 0 else 'class0'}): This class is characterized by high values of [feature1] and low values of [feature2]. Examples with [specific pattern] tend to belong to this class.
+score_0 = 0.5*feature1 + 0.3*feature2 - 0.2*feature3
 
-CLASS 1 ({class_names[1] if class_names and len(class_names) > 1 else 'class1'}): This class is characterized by moderate [feature1] and high [feature3]. Examples with [specific pattern] tend to belong to this class.
-  score_1 = 0.3*feature1 + 0.6*feature3 + 0.1*feature4
+CLASS 1 ({self.class_names[1] if self.class_names and len(self.class_names) > 1 else 'class1'}): This class is characterized by moderate [feature1] and high [feature3]. Examples with [specific pattern] tend to belong to this class.
+score_1 = 0.3*feature1 + 0.6*feature3 + 0.1*feature4
 
-[Continue for all classes...]
+[Continue for all classes with separate score equations...]
 
 FINAL PREDICTION:
 ŷ = argmax([score_0, score_1, ...])
@@ -1713,7 +1975,7 @@ class TrainableMAICL:
                  max_ml_weight: Optional[float] = None,
                  hard_ml_gate_threshold: Optional[float] = None,
                  num_mechanisms_unknown: Optional[int] = None,
-                 use_scaling: bool = True):
+                 use_scaling: bool = True, encoder_batch_size: Optional[int] = None):
         self.llm = batched_llm
         self.feature_cols = feature_cols
         self.scaler = scaler
@@ -1760,6 +2022,10 @@ class TrainableMAICL:
                 logger.warning(f"classification_loss_metric='{classification_loss_metric}' is ignored for regression tasks.")
             self.classification_loss_metric = None
         
+        # Use provided encoder_batch_size or default from config
+        if encoder_batch_size is None:
+            encoder_batch_size = ENCODER_BATCH_SIZE
+        
         self.mech_generator = VariationalMechanismGenerator(
             batched_llm, feature_cols, use_ml_mechanism, dataset_name,
             task_type=task_type, class_names=class_names,
@@ -1767,28 +2033,14 @@ class TrainableMAICL:
             data_insights=data_insights,
             scaler=scaler,
             num_mechanisms_unknown=num_mechanisms_unknown,
-            use_scaling=use_scaling
+            use_scaling=use_scaling,
+            encoder_batch_size=encoder_batch_size
         )
         
         # Get scale range (for target/output range) to pass to TextGrad.
         # IMPORTANT: when use_scaling=False, do NOT inject any scaling range into prompts.
         if use_scaling:
-            # Helper function to get scaled range (can't use static method during __init__)
-            def _get_scaled_range(scaler):
-                if scaler is not None:
-                    # Check for feature_range (without underscore) first - used by MinMaxScaler010
-                    if hasattr(scaler, "feature_range"):
-                        feature_range = scaler.feature_range
-                        if hasattr(feature_range, '__iter__') and not isinstance(feature_range, str):
-                            return tuple(float(x) for x in feature_range)
-                        else:
-                            return (float(feature_range), float(feature_range))
-                    # Check for feature_range_ (with underscore) - used by sklearn MinMaxScaler
-                    elif hasattr(scaler, "feature_range_"):
-                        return tuple(float(x) for x in scaler.feature_range_)
-                return (SCALE_MIN, SCALE_MAX)  # fallback
-            
-            scale_min, scale_max = _get_scaled_range(y_scaler) if y_scaler is not None else (SCALE_MIN, SCALE_MAX)
+            scale_min, scale_max = self._scaled_range_from(y_scaler) if y_scaler is not None else (SCALE_MIN, SCALE_MAX)
         else:
             scale_min, scale_max = None, None
         self.textgrad = TextGrad(
@@ -1833,13 +2085,87 @@ class TrainableMAICL:
         self.ml_baseline_performance = None
         self.mechanism_performance_snapshot = {}
         
+        # Learned routing weights (optimized via TextGrad)
+        # Initialize with balanced weights (can be optimized during training)
+        self.learned_ml_weight = 0.5
+        self.learned_llm_weight = 0.5
+        
         logger.info(f"  Initialized MA-ICL with {len(self.mechanisms)} mechanisms:")
         logger.info(f"    • {len([t for t in self.mechanism_types if t == 'llm'])} LLM mechanisms")
         logger.info(f"    • {len([t for t in self.mechanism_types if t == 'ml'])} ML mechanism(s)")
+        logger.info(f"    • Initial routing weights: ML={self.learned_ml_weight:.4f}, LLM={self.learned_llm_weight:.4f}")
     
-    @staticmethod
-    def _scaled_range_from_static(scaler):
-        """Get the actual scaling range from scaler or use defaults (static method)"""
+    def _log_latent_zs(self, iteration: int, output_dir: Optional[str] = None, residual_source: Optional[str] = None):
+        """Log all latent_z values to a text file for the given iteration
+        
+        Args:
+            iteration: Iteration number
+            output_dir: Output directory for the file
+            residual_source: Source of residuals used ("ML Model" or "MA-ICL Ensemble" or None if unknown)
+        """
+        if output_dir is None:
+            output_dir = getattr(self, 'output_dir', None)
+        if output_dir is None:
+            from maicl_lib_v2 import OUTPUT_DIR
+            output_dir = OUTPUT_DIR
+        
+        # Check if mechanism generator has latent_zs stored
+        if not hasattr(self.mech_generator, '_all_latent_zs') or not self.mech_generator._all_latent_zs:
+            logger.debug(f"  [Latent Z Logging] No latent_zs found for iteration {iteration} (mechanisms may not have been regenerated)")
+            return
+        
+        logger.info(f"  [Latent Z Logging] Found {len(self.mech_generator._all_latent_zs)} mechanism(s) with latent_zs to log")
+        
+        # Log total number of latent_z entries across all mechanisms
+        total_entries = sum(len(mech_data.get('latent_zs', [])) for mech_data in self.mech_generator._all_latent_zs)
+        logger.info(f"  [Latent Z Logging] Total latent_z entries to log: {total_entries}")
+        
+        # Determine residual source from mechanism generator if not provided
+        if residual_source is None:
+            if hasattr(self.mech_generator, '_last_residual_source'):
+                residual_source = self.mech_generator._last_residual_source
+            else:
+                residual_source = "Unknown (check training logs)"
+        
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+            latent_z_file = os.path.join(output_dir, f"latent_zs_iter_{iteration}.txt")
+            
+            with open(latent_z_file, 'w', encoding='utf-8') as f:
+                f.write("=" * 80 + "\n")
+                f.write(f"LATENT Z REPRESENTATIONS - ITERATION {iteration}\n")
+                f.write(f"Dataset: {self.dataset_name}, Task: {self.task_type}\n")
+                f.write(f"Residual Source: {residual_source}\n")
+                f.write("=" * 80 + "\n\n")
+                
+                for mech_data in self.mech_generator._all_latent_zs:
+                    mech_idx = mech_data.get('mechanism_index', 0)
+                    latent_zs = mech_data.get('latent_zs', [])
+                    
+                    f.write(f"\n{'='*80}\n")
+                    f.write(f"MECHANISM {mech_idx + 1}\n")
+                    f.write(f"{'='*80}\n\n")
+                    
+                    for batch_type, latent_z in latent_zs:
+                        if batch_type == 'concatenated':
+                            f.write(f"--- {batch_type.upper().replace('_', ' ')} (ALL BATCHES - NO SUMMARIZATION) ---\n")
+                        else:
+                            f.write(f"--- {batch_type.upper().replace('_', ' ')} ---\n")
+                        f.write(f"{latent_z}\n")
+                        f.write("\n")
+                    
+                    f.write("\n")
+                
+                f.write("=" * 80 + "\n")
+                f.write("END OF LATENT Z REPRESENTATIONS\n")
+                f.write("=" * 80 + "\n")
+            
+            logger.info(f"  ✓ Saved latent_z representations to {latent_z_file}")
+        except Exception as e:
+            logger.error(f"  Failed to save latent_z representations: {e}", exc_info=True)
+    
+    def _scaled_range_from(self, scaler):
+        """Get the actual scaling range from scaler or use defaults"""
         if scaler is not None:
             # Check for feature_range (without underscore) first - used by MinMaxScaler010
             if hasattr(scaler, "feature_range"):
@@ -2235,12 +2561,33 @@ class TrainableMAICL:
             hard_gate = hard_ml_gate_threshold if hard_ml_gate_threshold is not None else HARD_ML_GATE_THRESHOLD
             min_w = min_ml_weight if min_ml_weight is not None else MIN_ML_WEIGHT
             max_w = max_ml_weight if max_ml_weight is not None else MAX_ML_WEIGHT
+        # Option B: treat "known" mechanisms as context-only (NOT predictors).
+        # Build context text from generator's known mechanisms, but exclude them from routing/prediction lists.
+        known_context = ""
+        try:
+            if hasattr(self, "mech_generator") and self.mech_generator is not None and hasattr(self.mech_generator, "known_mechanisms"):
+                km = self.mech_generator.known_mechanisms or []
+                if isinstance(km, list) and len(km) > 0:
+                    known_context = "\n\n---\n\n".join([str(x) for x in km if x is not None and str(x).strip() != ""])
+        except Exception:
+            known_context = ""
+        mechanisms_pred: List[str] = []
+        mechanism_types_pred: List[str] = []
+        old_to_new_idx: Dict[int, int] = {}
+        for old_idx, (mech, mtype) in enumerate(zip(self.mechanisms, self.mechanism_types)):
+            if mtype == "known":
+                continue
+            old_to_new_idx[old_idx] = len(mechanisms_pred)
+            mechanisms_pred.append(mech)
+            mechanism_types_pred.append(mtype)
+        
         predictor = MultiAgentPredictor(
-            self.llm, self.mechanisms, self.mechanism_types,
+            self.llm, mechanisms_pred, mechanism_types_pred,
             self.mech_generator.ml_mechanism, self.feature_cols, self.scaler, att_temp,
             task_type=self.task_type, class_names=self.class_names,
             hard_ml_gate_threshold=hard_gate, min_ml_weight=min_w, max_ml_weight=max_w,
-            use_scaling=getattr(self, 'use_scaling', True)  # Pass use_scaling flag
+            use_scaling=getattr(self, 'use_scaling', True),  # Pass use_scaling flag
+            known_context=known_context
         )
         
         # Transfer mechanism performance scores
@@ -2273,14 +2620,16 @@ class TrainableMAICL:
             logger.debug(f"  [Evaluate] Using pre-training performance snapshot (ML performance={ml_perf:.2f} is boosted)")
         
         if should_preserve and hasattr(self, 'mechanism_performance_snapshot') and self.mechanism_performance_snapshot:
-            for mech_idx, perf in self.mechanism_performance_snapshot.items():
-                predictor.update_mechanism_performance(mech_idx, perf)
+            # Map snapshot indices (full mechanism list) onto predictor indices (known removed)
+            for old_idx, perf in self.mechanism_performance_snapshot.items():
+                if old_idx in old_to_new_idx:
+                    predictor.update_mechanism_performance(old_to_new_idx[old_idx], perf)
             
             # During pre-training: set LLM mechanisms to very low performance to minimize their impact
             # This ensures ML mechanism dominates and MA-ICL starts at baseline performance
             if is_pre_training:
-                for mech_idx, mtype in enumerate(self.mechanism_types):
-                    if mtype == "llm" and mech_idx not in self.mechanism_performance_snapshot:
+                for mech_idx, mtype in enumerate(predictor.mechanism_types):
+                    if mtype == "llm" and mech_idx not in predictor.mechanism_performance:
                         # Set LLM mechanisms to very low performance (0.01) so they get minimal weight
                         predictor.update_mechanism_performance(mech_idx, 0.01)
                         logger.debug(f"  [Evaluate] Set LLM mechanism {mech_idx} to minimal performance (0.01) for pre-training")
@@ -2598,6 +2947,16 @@ class TrainableMAICL:
         
         # Create predictor with only LLM mechanisms
         att_temp = self.attention_temp
+        # Context-only background: include known mechanisms as prompt context
+        known_context = ""
+        try:
+            if hasattr(self, "mech_generator") and self.mech_generator is not None and hasattr(self.mech_generator, "known_mechanisms"):
+                km = self.mech_generator.known_mechanisms or []
+                if isinstance(km, list) and len(km) > 0:
+                    known_context = "\n\n---\n\n".join([str(x) for x in km if x is not None and str(x).strip() != ""])
+        except Exception:
+            known_context = ""
+
         predictor = MultiAgentPredictor(
             self.llm, llm_mechanisms, llm_mechanism_types,
             None,  # No ML mechanism
@@ -2605,7 +2964,8 @@ class TrainableMAICL:
             task_type=self.task_type, class_names=self.class_names,
             hard_ml_gate_threshold=0.0,  # No ML routing needed
             min_ml_weight=0.0, max_ml_weight=0.0,
-            use_scaling=getattr(self, 'use_scaling', True)  # Pass use_scaling flag
+            use_scaling=getattr(self, 'use_scaling', True),  # Pass use_scaling flag
+            known_context=known_context
         )
         
         # Transfer mechanism performance scores for LLM mechanisms only
@@ -2765,7 +3125,8 @@ class TrainableMAICL:
               k_shot: int = 0, X_test: Optional[np.ndarray] = None, y_test: Optional[np.ndarray] = None,
               acceptance_set: Optional[str] = None, X_train_original: Optional[List[Dict]] = None,
               X_val_original: Optional[List[Dict]] = None, X_test_original: Optional[List[Dict]] = None,
-              output_dir: Optional[str] = None, use_test_for_acceptance: Optional[bool] = None, **kwargs):
+              output_dir: Optional[str] = None, use_test_for_acceptance: Optional[bool] = None,
+              use_maicl_residuals_after_iteration: Optional[int] = None, **kwargs):
         """Train the MA-ICL system
         
         Args:
@@ -2789,6 +3150,16 @@ class TrainableMAICL:
         # Default to validation if neither is provided
         if acceptance_set is None:
             acceptance_set = "validation"
+        
+        # Set residual switching threshold (use parameter or config default)
+        if use_maicl_residuals_after_iteration is None:
+            from maicl_config import USE_MAICL_RESIDUALS_AFTER_ITERATION
+            use_maicl_residuals_after_iteration = USE_MAICL_RESIDUALS_AFTER_ITERATION
+        
+        if use_maicl_residuals_after_iteration is not None:
+            logger.info(f"  [Residual Switching] Will switch from ML residuals to MA-ICL residuals after iteration {use_maicl_residuals_after_iteration}")
+            logger.info(f"     Iterations 0-{use_maicl_residuals_after_iteration}: Using ML residuals")
+            logger.info(f"     Iterations {use_maicl_residuals_after_iteration+1}+: Using MA-ICL residuals on acceptance set")
         
         logger.info(f"\n[Training] Starting {iterations} iterations...")
         
@@ -3019,7 +3390,9 @@ class TrainableMAICL:
             "mechanism_metrics": copy.deepcopy(getattr(self, 'mechanism_metrics_snapshot', {})),
             "few_shot_examples": copy.deepcopy(few_shot_examples_from_initial) if few_shot_examples_from_initial is not None else [],  # Always save list (empty if k_shot=0)
             "k_shot": self.k_shot,  # CRITICAL: Save k_shot value to ensure final evaluation uses same value
-            "routing_config": routing_config  # Store routing config for exact restoration
+            "routing_config": routing_config,  # Store routing config for exact restoration
+            "learned_ml_weight": getattr(self, 'learned_ml_weight', 0.5),  # Store learned routing weights
+            "learned_llm_weight": getattr(self, 'learned_llm_weight', 0.5)
         }
         logger.info(f"  [Initial Checkpoint] Saved pre-training state with {len(self.mechanisms)} mechanisms")
         if self.task_type == "classification":
@@ -3042,19 +3415,130 @@ class TrainableMAICL:
             mechanisms_rejected_at_generation = False
             new_mechanisms_generated_and_accepted = False  # Track if new mechanisms were generated and accepted
             
+            # Determine which residuals to use for this iteration
+            # FIXED: Changed from i > to i >= so iteration 0 also uses MA-ICL residuals when set to 0
+            use_maicl_residuals = (use_maicl_residuals_after_iteration is not None and 
+                                  i >= use_maicl_residuals_after_iteration)
+            
+            # Compute residuals for this iteration
+            current_residuals = None
+            current_prediction_errors = None
+            
+            if use_maicl_residuals:
+                # Use MA-ICL residuals on acceptance set
+                logger.info(f"  [Residual Switching] Iteration {i+1} > {use_maicl_residuals_after_iteration}: Using MA-ICL residuals on acceptance set")
+                try:
+                    # Evaluate MA-ICL on acceptance set to get predictions
+                    routing_kwargs = {}
+                    if hasattr(self, 'attention_temp'):
+                        routing_kwargs['attention_temp'] = self.attention_temp
+                    if hasattr(self, 'min_ml_weight'):
+                        routing_kwargs['min_ml_weight'] = self.min_ml_weight
+                    if hasattr(self, 'max_ml_weight'):
+                        routing_kwargs['max_ml_weight'] = self.max_ml_weight
+                    if hasattr(self, 'hard_ml_gate_threshold'):
+                        routing_kwargs['hard_ml_gate_threshold'] = self.hard_ml_gate_threshold
+                    
+                    # Determine X_original for acceptance set
+                    eval_kwargs = dict(routing_kwargs)
+                    if acceptance_set == "test" and hasattr(self, 'X_test_original') and self.X_test_original is not None:
+                        if len(accept_idx) == len(X_accept):
+                            eval_kwargs['X_original'] = self.X_test_original
+                        else:
+                            eval_kwargs['X_original'] = [self.X_test_original[j] for j in accept_idx] if len(accept_idx) <= len(self.X_test_original) else None
+                    elif acceptance_set == "validation" and hasattr(self, 'X_val_original') and self.X_val_original is not None:
+                        if len(accept_idx) == len(X_accept):
+                            eval_kwargs['X_original'] = self.X_val_original
+                        else:
+                            eval_kwargs['X_original'] = [self.X_val_original[j] for j in accept_idx] if len(accept_idx) <= len(self.X_val_original) else None
+                    elif acceptance_set == "train" and hasattr(self, 'X_train_original') and self.X_train_original is not None:
+                        if len(accept_idx) == len(X_accept):
+                            eval_kwargs['X_original'] = self.X_train_original
+                        else:
+                            eval_kwargs['X_original'] = [self.X_train_original[j] for j in accept_idx] if len(accept_idx) <= len(self.X_train_original) else None
+                    
+                    maicl_eval = self.evaluate(
+                        X_accept_consistent, y_accept_consistent, X_train, y_train,
+                        relax_routing=True, k_shot=self.k_shot, **eval_kwargs
+                    )
+                    
+                    # Extract predictions
+                    maicl_predictions = np.array(maicl_eval.get('predictions', []))
+                    
+                    if len(maicl_predictions) == len(y_accept_consistent):
+                        # Compute residuals
+                        if self.task_type == "classification":
+                            y_accept_int = y_accept_consistent.astype(int)
+                            maicl_pred_int = maicl_predictions.astype(int)
+                            # Residual = 1.0 if wrong, 0.0 if correct
+                            current_residuals = (y_accept_int != maicl_pred_int).astype(float)
+                        else:
+                            # Regression: signed residuals
+                            current_residuals = y_accept_consistent - maicl_predictions
+                        
+                        # Map acceptance set residuals back to training set indices
+                        # For mechanism generation, we need residuals aligned with X_train
+                        # Strategy: Use acceptance set residuals, but we need to map them to training samples
+                        # Since we're using acceptance set for residuals, we'll use the acceptance set samples directly
+                        # for mechanism generation (this is a design choice - using acceptance set samples)
+                        logger.info(f"  [MA-ICL Residuals] Computed {len(current_residuals)} residuals from MA-ICL predictions on acceptance set")
+                        logger.info(f"     Mean absolute residual: {np.mean(np.abs(current_residuals)):.4f}")
+                        
+                        # For mechanism generation, we'll use X_accept_consistent and y_accept_consistent
+                        # with these residuals (mapped to training set if needed)
+                        # But for now, we'll align residuals with X_train by using acceptance set samples
+                        # This means mechanism generation will use acceptance set samples when MA-ICL residuals are active
+                        current_prediction_errors = np.abs(current_residuals)
+                    else:
+                        logger.warning(f"  [MA-ICL Residuals] Prediction length mismatch: {len(maicl_predictions)} vs {len(y_accept_consistent)}. Falling back to ML residuals.")
+                        use_maicl_residuals = False
+                except Exception as e:
+                    logger.warning(f"  [MA-ICL Residuals] Failed to compute MA-ICL residuals: {e}. Falling back to ML residuals.")
+                    import traceback
+                    traceback.print_exc()
+                    use_maicl_residuals = False
+            
+            if not use_maicl_residuals:
+                # Use ML residuals (original behavior)
+                if ml_residuals is not None and len(ml_residuals) == len(X_train):
+                    current_residuals = ml_residuals
+                    current_prediction_errors = np.abs(ml_residuals)
+                else:
+                    current_residuals = None
+                    current_prediction_errors = np.abs(y_train - np.mean(y_train))  # Simple baseline
+            
             # Generate new mechanisms if needed
             if len(self.mech_generator.unknown_mechanisms) == 0:
                 logger.info("  [Mechanism Generation] Generating unknown mechanisms...")
-                # Use ML residuals if available, otherwise fall back to simple baseline
-                if ml_residuals is not None and len(ml_residuals) == len(X_train):
-                    prediction_errors = np.abs(ml_residuals)
+                # Use computed residuals for this iteration
+                if use_maicl_residuals and current_residuals is not None:
+                    # Use acceptance set samples with MA-ICL residuals
+                    logger.info(f"  [Mechanism Generation] Using MA-ICL residuals on acceptance set samples")
+                    prediction_errors = current_prediction_errors
+                    residuals_for_generation = current_residuals
+                    X_for_generation = X_accept_consistent
+                    y_for_generation = y_accept_consistent
                 else:
-                    prediction_errors = np.abs(y_train - np.mean(y_train))  # Simple baseline
+                    # Use ML residuals on training set (original behavior)
+                    prediction_errors = current_prediction_errors
+                    residuals_for_generation = current_residuals
+                    X_for_generation = X_train
+                    y_for_generation = y_train
+                # Pass both prediction_errors and residuals to mechanism generation
+                # generate_unknown_mechanisms will use these to guide mechanism discovery
+                # Store residual source for logging
+                residual_source = "MA-ICL Ensemble" if use_maicl_residuals else "ML Model"
+                self.mech_generator._last_residual_source = residual_source
+                
                 new_mechanisms = self.mech_generator.generate_unknown_mechanisms(
-                    X_train, y_train, prediction_errors, ml_residuals=ml_residuals
+                    X_for_generation, y_for_generation, prediction_errors, ml_residuals=residuals_for_generation
                 )
                 # Store mechanism count before adding new ones
                 num_mechanisms_before = len(self.mechanisms)
+                
+                # Log all latent_zs for this iteration (after generation, before assignment)
+                # The latent_zs are stored in mech_generator._all_latent_zs during generate_unknown_mechanisms
+                self._log_latent_zs(iteration=i+1, output_dir=self.output_dir, residual_source=residual_source)
                 
                 self.mech_generator.unknown_mechanisms = new_mechanisms
                 self.mechanisms = self.mech_generator.get_all_mechanisms()
@@ -3081,7 +3565,7 @@ class TrainableMAICL:
                     logger.info(f"  [New Mechanism Init] Evaluating {len(new_llm_indices)} new LLM mechanism(s) in isolation to get initial performance scores...")
                     # Evaluate new mechanisms in isolation (LLM-only) on a small sample
                     # Use a subset for faster evaluation
-                    eval_sample_size = min(50, len(X_accept_consistent))
+                    eval_sample_size =  len(X_accept_consistent)
                     if eval_sample_size > 0:
                         sample_indices = np.random.choice(len(X_accept_consistent), eval_sample_size, replace=False)
                         X_sample = X_accept_consistent[sample_indices]
@@ -3100,7 +3584,8 @@ class TrainableMAICL:
                             task_type=self.task_type, class_names=self.class_names,
                             hard_ml_gate_threshold=0.0,
                             min_ml_weight=0.0, max_ml_weight=0.0,
-                            use_scaling=getattr(self, 'use_scaling', True)  # Pass use_scaling flag
+                            use_scaling=getattr(self, 'use_scaling', True),  # Pass use_scaling flag
+                            known_context="\n\n---\n\n".join([str(x) for x in (self.mech_generator.known_mechanisms or [])]) if hasattr(self, "mech_generator") and self.mech_generator is not None else ""
                         )
                         
                         # Get predictions from new mechanisms
@@ -3262,6 +3747,45 @@ class TrainableMAICL:
                 else:
                     logger.info(f"  ✓ New mechanisms accepted - will allow TextGrad to optimize them using stricter acceptance criteria for optimized versions")
                     new_mechanisms_generated_and_accepted = True  # Mark that new mechanisms were accepted
+            else:
+                # Mechanisms already exist - generate latent_zs for this iteration to track error pattern evolution
+                # This allows us to see how residual patterns change across iterations
+                if use_maicl_residuals and current_residuals is not None:
+                    logger.info("  [Latent Z Generation] Generating latent_zs using MA-ICL residuals on acceptance set...")
+                    prediction_errors = current_prediction_errors
+                    residuals_for_latent = current_residuals
+                    X_for_latent = X_accept_consistent
+                    y_for_latent = y_accept_consistent
+                else:
+                    logger.info("  [Latent Z Generation] Generating latent_zs using ML residuals...")
+                    prediction_errors = current_prediction_errors
+                    residuals_for_latent = current_residuals
+                    X_for_latent = X_train
+                    y_for_latent = y_train
+                
+                # Generate latent_zs for each existing mechanism (to track how error patterns evolve)
+                all_latent_zs_for_iteration = []
+                for mech_idx in range(len(self.mech_generator.unknown_mechanisms)):
+                    latent_z = self.mech_generator.encode_latent_space(X_for_latent, y_for_latent, prediction_errors, residuals_for_latent)
+                    
+                    # Store latent_zs from this encoding
+                    if hasattr(self.mech_generator, '_current_latent_zs') and self.mech_generator._current_latent_zs:
+                        all_latent_zs_for_iteration.append({
+                            'mechanism_index': mech_idx,
+                            'latent_zs': self.mech_generator._current_latent_zs.copy()
+                        })
+                
+                # Store for logging
+                if all_latent_zs_for_iteration:
+                    self.mech_generator._all_latent_zs = all_latent_zs_for_iteration
+                    logger.info(f"  [Latent Z] Generated {len(all_latent_zs_for_iteration)} mechanism(s) with latent_zs for iteration {i+1}")
+                    # Determine residual source for logging
+                    residual_source = "MA-ICL Ensemble" if use_maicl_residuals else "ML Model"
+                    self.mech_generator._last_residual_source = residual_source
+                    # Log latent_zs for this iteration
+                    self._log_latent_zs(iteration=i+1, output_dir=self.output_dir, residual_source=residual_source)
+                else:
+                    logger.warning(f"  [Latent Z] No latent_zs generated for iteration {i+1}")
             
             # CRITICAL: Ensure mechanisms are synced with generator before evaluation
             # This ensures current_loss is computed on the correct state
@@ -3362,6 +3886,26 @@ class TrainableMAICL:
             if mechanisms_rejected_at_generation:
                 rejected = 1
             
+            # Optimize routing weights using TextGrad (simple approach)
+            if self.use_ml_mechanism and len([t for t in self.mechanism_types if t == "ml"]) > 0 and len([t for t in self.mechanism_types if t == "llm"]) > 0:
+                # Get mechanism performance scores if available
+                ml_performance = None
+                llm_performance = None
+                if hasattr(self, 'mechanism_performance_snapshot') and self.mechanism_performance_snapshot:
+                    ml_indices = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "ml"]
+                    llm_indices = [i for i, mtype in enumerate(self.mechanism_types) if mtype == "llm"]
+                    if ml_indices:
+                        ml_perfs = [self.mechanism_performance_snapshot.get(i, 0.5) for i in ml_indices]
+                        ml_performance = max(ml_perfs) if ml_perfs else None
+                    if llm_indices:
+                        llm_perfs = [self.mechanism_performance_snapshot.get(i, 0.5) for i in llm_indices]
+                        llm_performance = max(llm_perfs) if llm_perfs else None
+                
+                # Optimize weights
+                self.learned_ml_weight, self.learned_llm_weight = self.textgrad.optimize_routing_weights(
+                    self.learned_ml_weight, self.learned_llm_weight, metrics, ml_performance, llm_performance
+                )
+            
             # Apply TextGrad optimization
             llm_mechanisms = [m for i, m in enumerate(self.mechanisms) if self.mechanism_types[i] == "llm"]
             if len(llm_mechanisms) > 0:
@@ -3369,10 +3913,22 @@ class TrainableMAICL:
                 
                 # Build enhanced error feedback using TextGrad's diagnostic methods
                 try:
-                    # Use provided ml_residuals if available (already filtered to top_k if from train_on_residuals)
-                    # Otherwise, recompute from full training set
-                    ml_residuals_for_feedback = ml_residuals
-                    ml_predictions_for_display = None
+                    # Use computed residuals for this iteration (MA-ICL or ML)
+                    if use_maicl_residuals and current_residuals is not None:
+                        # Use MA-ICL residuals on acceptance set for feedback
+                        # Note: For TextGrad feedback, we use acceptance set residuals
+                        # The feedback will show MA-ICL errors, not ML errors
+                        ml_residuals_for_feedback = current_residuals
+                        ml_predictions_for_display = None
+                        # Note: X_train will be used for feedback, but residuals are from acceptance set
+                        # This is intentional - we want to show MA-ICL errors for optimization
+                    else:
+                        # Use ML residuals (original behavior)
+                        # ml_residuals may be:
+                        #   - Full residuals from compute_ml_residuals (aligned with X_train)
+                        #   - Filtered residuals from train_on_residuals (aligned with top-K samples)
+                        ml_residuals_for_feedback = ml_residuals
+                        ml_predictions_for_display = None
                     
                     if ml_residuals_for_feedback is None:
                         # Only recompute if not provided (fallback case)
@@ -3411,12 +3967,40 @@ class TrainableMAICL:
                             y_pred_train_ml = ml_model.predict(X_train).astype(int)
                             ml_predictions_for_display = y_pred_train_ml
                     
-                    # Use TextGrad's enhanced error feedback builder with current metrics
-                    error_feedback_full = self.textgrad._build_enhanced_error_feedback(
-                        X_train, y_train, ml_residuals_for_feedback, current_loss, self.dataset_name,
-                        current_metrics=metrics,  # Pass current metrics (R2, MAE, etc.)
-                        X_train_original=self.X_train_original  # Pass SMILES strings for DeepChem datasets
-                    )
+                    # Extract latent_zs for each mechanism if available
+                    # Structure: _all_latent_zs is a list of dicts with 'mechanism_index' and 'latent_zs'
+                    # Each 'latent_zs' contains tuples like ('batch_1', z1), ..., ('concatenated', z_final)
+                    latent_zs_for_mechanisms = [None] * len(llm_mechanisms)
+                    if hasattr(self.mech_generator, '_all_latent_zs') and self.mech_generator._all_latent_zs:
+                        for mech_data in self.mech_generator._all_latent_zs:
+                            mech_idx = mech_data.get('mechanism_index', None)
+                            latent_zs_list = mech_data.get('latent_zs', [])
+                            # Extract the concatenated latent_z (the final one that contains all batch insights)
+                            concatenated_z = None
+                            for batch_type, z in latent_zs_list:
+                                if batch_type == 'concatenated':
+                                    concatenated_z = z
+                                    break
+                            # If no concatenated found, use the last one (should be concatenated)
+                            if concatenated_z is None and len(latent_zs_list) > 0:
+                                _, concatenated_z = latent_zs_list[-1]
+                            
+                            # Map mechanism index to LLM mechanism index
+                            if mech_idx is not None and 0 <= mech_idx < len(llm_mechanisms):
+                                latent_zs_for_mechanisms[mech_idx] = concatenated_z
+                                logger.debug(f"  [TextGrad] Extracted latent_z for mechanism {mech_idx + 1}")
+                    
+                    # Build error feedback per mechanism with their corresponding latent_z
+                    error_feedbacks = []
+                    for mech_idx, _ in enumerate(llm_mechanisms):
+                        latent_z_for_mech = latent_zs_for_mechanisms[mech_idx] if mech_idx < len(latent_zs_for_mechanisms) else None
+                        error_feedback = self.textgrad._build_enhanced_error_feedback(
+                            X_train, y_train, ml_residuals_for_feedback, current_loss, self.dataset_name,
+                            current_metrics=metrics,  # Pass current metrics (R2, MAE, etc.)
+                            X_train_original=self.X_train_original,  # Pass SMILES strings for DeepChem datasets
+                            latent_z=latent_z_for_mech  # Pass pre-computed latent_z if available
+                        )
+                        error_feedbacks.append(error_feedback)
                     
                     # Always log sample residuals for transparency (shows what the LLM sees)
                     if ml_residuals_for_feedback is not None and len(ml_residuals_for_feedback) > 0:
@@ -3424,34 +4008,18 @@ class TrainableMAICL:
                         # For classification, show worst errors (residual=1.0), for regression show highest absolute residuals
                         if self.task_type == "classification":
                             # For classification: show samples where residual=1.0 (mismatched)
-                            worst_idx = np.where(ml_residuals_for_feedback > 0.5)[0][:MAX_WORST_RESIDUAL_SAMPLES]  # Show mismatched samples
+                            worst_idx = np.where(ml_residuals_for_feedback > 0.5)[0]  # Show all mismatched samples (no limit)
                             if len(worst_idx) == 0:
-                                # If all correct, show any samples
-                                worst_idx = np.arange(min(MAX_WORST_RESIDUAL_SAMPLES, len(ml_residuals_for_feedback)))
+                                # If all correct, show all samples
+                                worst_idx = np.arange(len(ml_residuals_for_feedback))
                         else:
-                            # Diversify residual samples: show top worst + some from different quantiles
-                            # This prevents bias from always showing the same samples
+                            # Show all residual samples (no limit)
+                            # Re-rank residuals for logging: sort by absolute value descending (worst first)
                             abs_residuals = np.abs(ml_residuals_for_feedback)
                             sorted_indices = np.argsort(abs_residuals)[::-1]
                             
-                            # Top 5 worst (increased from 3 for better error pattern coverage)
-                            worst_idx = sorted_indices[:MAX_WORST_RESIDUAL_SAMPLES].tolist()
-                            
-                            # Add samples from different quantiles to show diverse error patterns
-                            n_samples = len(ml_residuals_for_feedback)
-                            if n_samples > 10:
-                                # 75th percentile
-                                q75_idx = sorted_indices[max(0, int(0.25 * n_samples)):int(0.35 * n_samples)]
-                                if len(q75_idx) > 0:
-                                    worst_idx.append(np.random.choice(q75_idx))
-                                # 50th percentile (median)
-                                q50_idx = sorted_indices[max(0, int(0.45 * n_samples)):int(0.55 * n_samples)]
-                                if len(q50_idx) > 0:
-                                    worst_idx.append(np.random.choice(q50_idx))
-                            
-                            # Re-sort by residual magnitude (descending) to ensure proper ordering
-                            worst_idx = np.array(worst_idx)
-                            worst_idx = worst_idx[np.argsort(abs_residuals[worst_idx])[::-1]][:MAX_WORST_RESIDUAL_SAMPLES].tolist()
+                            # All worst samples (no limit)
+                            worst_idx = sorted_indices.tolist()
                         
                         # Check if this is a DeepChem dataset and we have SMILES strings
                         is_deepchem = (self.feature_cols and len(self.feature_cols) > 0 and 
@@ -3466,31 +4034,36 @@ class TrainableMAICL:
                                                 isinstance(self.X_train_original[0], dict))
                         
                         feature_names = self.feature_cols if self.feature_cols else [f"x{j}" for j in range(X_train.shape[1])]
-                        logger.info(f"  [Residual Samples] Showing top {min(MAX_WORST_RESIDUAL_SAMPLES, len(worst_idx))} worst ML residuals (what LLM sees):")
-                        for rank, idx in enumerate(worst_idx[:MAX_WORST_RESIDUAL_SAMPLES], 1):
-                            # Use X_train_original if available (includes RDKit features for enzyme datasets, SMILES for DeepChem)
+                        logger.info(f"  [Residual Samples] Showing {len(worst_idx)} worst ML residuals (what LLM sees):")
+                        for rank, idx in enumerate(worst_idx, 1):
+                            # Use X_train values as-is (scaled if use_scaling=True, raw if use_scaling=False)
+                            # Only use X_train_original for non-numerical features like SMILES strings
                             if use_original_features and idx < len(self.X_train_original):
                                 original_feat = self.X_train_original[idx]
                                 if isinstance(original_feat, dict):
                                     if use_smiles and 'SMILES' in original_feat:
-                                        # DeepChem: show SMILES
+                                        # DeepChem: show SMILES (non-numerical, can't be scaled)
                                         key_feats = f"SMILES={original_feat['SMILES']}"
                                     else:
-                                        # Enzyme datasets: show all features including RDKit
-                                        # Filter out text fields (SEQ, SUBSTRATES) and show numerical features
-                                        num_feats = {k: v for k, v in original_feat.items() 
-                                                   if k not in ['SEQ', 'SUBSTRATES', 'SMILES'] and isinstance(v, (int, float))}
-                                        # Show top features (prioritize RDKit features if present)
-                                        rdkit_feats = {k: v for k, v in num_feats.items() if k.startswith('rdkit_')}
-                                        other_feats = {k: v for k, v in num_feats.items() if not k.startswith('rdkit_')}
+                                        # For enzyme datasets with RDKit features, use values from X_train (scaled if use_scaling=True, raw if use_scaling=False)
+                                        # Map feature names to their indices in X_train
+                                        feat_vals = {}
+                                        for j, feat_name in enumerate(feature_names):
+                                            if j < X_train.shape[1]:
+                                                # Use scaled value from X_train (what LLM sees)
+                                                feat_vals[feat_name] = float(X_train[idx, j])
+                                        # Filter to show top features (prioritize non-RDKit features for readability)
+                                        non_rdkit_feats = {k: v for k, v in feat_vals.items() if not k.startswith('rdkit_')}
+                                        rdkit_feats = {k: v for k, v in feat_vals.items() if k.startswith('rdkit_')}
                                         # Combine: show some regular features + RDKit features
-                                        all_feats = dict(list(other_feats.items())[:MAX_FEATURES_IN_EXAMPLE-3] + list(rdkit_feats.items())[:3])
+                                        all_feats = dict(list(non_rdkit_feats.items())[:MAX_FEATURES_IN_EXAMPLE-3] + list(rdkit_feats.items())[:3])
                                         key_feats = ', '.join([f"{k}={v:.2f}" for k, v in all_feats.items()])
                                 else:
-                                    # Fallback to feature values
+                                    # Fallback: use values from X_train (scaled if use_scaling=True, raw if use_scaling=False)
                                     feat_vals = {feature_names[j]: float(X_train[idx, j]) for j in range(min(len(feature_names), X_train.shape[1]))}
                                     key_feats = ', '.join([f"{k}={v:.2f}" for k, v in list(feat_vals.items())[:MAX_FEATURES_IN_EXAMPLE]])
                             else:
+                                # Use values from X_train as-is (scaled if use_scaling=True, raw if use_scaling=False)
                                 feat_vals = {feature_names[j]: float(X_train[idx, j]) for j in range(min(len(feature_names), X_train.shape[1]))}
                                 key_feats = ', '.join([f"{k}={v:.2f}" for k, v in list(feat_vals.items())[:MAX_FEATURES_IN_EXAMPLE]])
                             
@@ -3524,17 +4097,8 @@ class TrainableMAICL:
                         if n_samples > 0:
                             # Select samples from different parts of the dataset for diversity
                             sample_indices = []
-                            if n_samples <= MAX_WORST_RESIDUAL_SAMPLES:
-                                sample_indices = list(range(n_samples))
-                            else:
-                                # Select from beginning, middle, and end
-                                sample_indices = (
-                                    list(range(min(3, n_samples))) +  # First few
-                                    list(range(n_samples // 2, n_samples // 2 + min(3, n_samples // 2))) +  # Middle
-                                    list(range(max(0, n_samples - 3), n_samples))  # Last few
-                                )
-                                # Remove duplicates and limit to MAX_WORST_RESIDUAL_SAMPLES
-                                sample_indices = list(dict.fromkeys(sample_indices))[:MAX_WORST_RESIDUAL_SAMPLES]
+
+                            sample_indices = list(range(n_samples))
                             
                             # Check if this is a DeepChem dataset and we have SMILES strings
                             is_deepchem = (self.feature_cols and len(self.feature_cols) > 0 and 
@@ -3624,11 +4188,11 @@ class TrainableMAICL:
                         llm_only_info += f"While you should complement the ML model, also aim to improve your independent performance. "
                         llm_only_info += f"Current ensemble performance: ACC={metrics.get('accuracy', 0.0):.4f}, F1={metrics.get('f1', 0.0):.4f}."
                     
-                    error_feedback_full = error_feedback_full + llm_only_info
+                    # Add LLM-only info to all error_feedbacks
+                    for idx in range(len(error_feedbacks)):
+                        error_feedbacks[idx] = error_feedbacks[idx] + llm_only_info
                 except Exception as e:
                     logger.debug(f"Failed to add LLM-only performance to feedback: {e}")
-                
-                error_feedbacks = [error_feedback_full] * len(llm_mechanisms)
                 # Use single-call optimization per mechanism
                 # Two-step optimization (gradients + apply) for higher-quality updates
                 # Pass ML context for enhanced feedback
@@ -3663,13 +4227,18 @@ class TrainableMAICL:
                 # Will be filled after TextGrad returns updated mechanisms (so we can store proposals even if rejected)
                 proposed_after_by_full_idx = {}
 
+                # Pass latent_zs to optimize_batch (for potential future use or logging)
                 updated_mechanisms = self.textgrad.optimize_batch(
                     llm_mechanisms, error_feedbacks, ml_residuals=ml_residuals,
                     X_train=X_train, y_train=y_train,
                     ml_mechanism=ml_mechanism_for_textgrad,
                     mechanism_performance=mechanism_performance_for_textgrad,
                     mechanism_metrics=mechanism_metrics_for_textgrad,
-                    iteration_history=iteration_history_for_textgrad
+                    iteration_history=iteration_history_for_textgrad,
+                    X_train_original=self.X_train_original,
+                    output_dir=self.output_dir,
+                    iteration=i+1,
+                    latent_zs=latent_zs_for_mechanisms  # Pass latent_zs (already used in error_feedbacks)
                 )
                 
                 # Capture proposed updates so we can store them in history even if rejected
@@ -3756,47 +4325,21 @@ class TrainableMAICL:
                     mae_improved_vs_current = (new_mae is not None and current_mae is not None and new_mae < current_mae)
                     
                     # Accept if metrics improve significantly (primary criterion)
-                    # Make threshold more lenient to allow exploration and learning
-                    # Lower threshold from 0.005 to 0.001 to allow smaller improvements
-                    try:
-                        from maicl_config import get_metric_improvement_threshold
-                        metric_improvement_threshold_r2 = get_metric_improvement_threshold('regression', 'r2', level='primary')
-                        metric_improvement_threshold_mae = get_metric_improvement_threshold('regression', 'mae', level='primary')
-                        # Override with more lenient threshold for exploration
-                        metric_improvement_threshold_r2 = min(metric_improvement_threshold_r2, 0.001)  # More lenient: max 0.001
-                        metric_improvement_threshold_mae = min(metric_improvement_threshold_mae, 0.001)  # More lenient: max 0.001
-                    except:
-                        metric_improvement_threshold_r2 = 0.001  # More lenient: 0.001 instead of 0.005
-                        metric_improvement_threshold_mae = 0.001  # More lenient: 0.001 instead of 0.005
+                    metric_improvement_threshold_r2 = 0.005  # Require at least 0.005 improvement in R2
+                    metric_improvement_threshold_mae = 0.005  # Require at least 0.005 improvement in MAE
                     
                     r2_improvement_vs_best_val = (new_r2 - best_r2) if (new_r2 is not None and best_r2 is not None) else 0.0
                     mae_improvement_vs_best_val = (best_mae - new_mae) if (best_mae is not None and new_mae is not None) else 0.0
                     
-                    # Also allow small degradations for exploration (up to 0.01 degradation)
-                    # This helps the LLM learn from mistakes and explore different mechanisms
-                    max_r2_degradation = 0.01  # Allow up to 0.01 degradation for exploration
-                    max_mae_degradation = 0.01  # Allow up to 0.01 degradation for exploration
-                    
-                    # Accept if metrics improve vs best-seen OR if degradation is small (exploration)
-                    r2_degradation = -r2_improvement_vs_best_val if r2_improvement_vs_best_val < 0 else 0.0
-                    mae_degradation = -mae_improvement_vs_best_val if mae_improvement_vs_best_val < 0 else 0.0
-                    
-                    # Primary: accept if metrics improve
-                    # Secondary: accept if degradation is small (allows exploration)
-                    if (r2_improvement_vs_best_val >= metric_improvement_threshold_r2 or mae_improvement_vs_best_val >= metric_improvement_threshold_mae) or \
-                       (r2_degradation <= max_r2_degradation and mae_degradation <= max_mae_degradation and 
-                        (r2_improvement_vs_best_val > -0.02 or mae_improvement_vs_best_val > -0.02)):  # Allow small exploration
+                    # Accept ONLY if metrics improve vs best-seen
+                    if r2_improvement_vs_best_val >= metric_improvement_threshold_r2 or mae_improvement_vs_best_val >= metric_improvement_threshold_mae:
                         accept = True
                         if r2_improvement_vs_best_val >= metric_improvement_threshold_r2 and mae_improvement_vs_best_val >= metric_improvement_threshold_mae:
                             reason = f"Metrics improved vs best (R2: {best_r2:.4f} → {new_r2:.4f} (+{r2_improvement_vs_best_val:.4f}), MAE: {best_mae:.4f} → {new_mae:.4f} (-{mae_improvement_vs_best_val:.4f}))"
                         elif r2_improvement_vs_best_val >= metric_improvement_threshold_r2:
                             reason = f"R2 improved vs best (R2: {best_r2:.4f} → {new_r2:.4f} (+{r2_improvement_vs_best_val:.4f}))"
-                        elif mae_improvement_vs_best_val >= metric_improvement_threshold_mae:
-                            reason = f"MAE improved vs best (MAE: {best_mae:.4f} → {new_mae:.4f} (-{mae_improvement_vs_best_val:.4f}))"
-                        elif r2_degradation <= max_r2_degradation and mae_degradation <= max_mae_degradation:
-                            reason = f"Accepted for exploration (small degradation: R2 {best_r2:.4f} → {new_r2:.4f} ({r2_improvement_vs_best_val:+.4f}), MAE {best_mae:.4f} → {new_mae:.4f} ({mae_improvement_vs_best_val:+.4f}))"
                         else:
-                            reason = f"Accepted (R2: {best_r2:.4f} → {new_r2:.4f} ({r2_improvement_vs_best_val:+.4f}), MAE: {best_mae:.4f} → {new_mae:.4f} ({mae_improvement_vs_best_val:+.4f}))"
+                            reason = f"MAE improved vs best (MAE: {best_mae:.4f} → {new_mae:.4f} (-{mae_improvement_vs_best_val:.4f}))"
                     else:
                         accept = False
                         reason = f"Rejected: no metric improvement vs best (R2: {best_r2:.4f} → {new_r2:.4f} ({r2_improvement_vs_best_val:+.4f}), MAE: {best_mae:.4f} → {new_mae:.4f} ({mae_improvement_vs_best_val:+.4f}))"
@@ -4017,7 +4560,9 @@ class TrainableMAICL:
                             "mechanism_metrics": metrics_snapshot,
                             "few_shot_examples": copy.deepcopy(few_shot_examples_from_eval) if few_shot_examples_from_eval is not None else [],  # Always save list (empty if k_shot=0)
                             "k_shot": self.k_shot,  # CRITICAL: Save k_shot value to ensure final evaluation uses same value
-                            "routing_config": routing_config  # Store routing config for exact restoration
+                            "routing_config": routing_config,  # Store routing config for exact restoration
+                            "learned_ml_weight": getattr(self, 'learned_ml_weight', 0.5),  # Store learned routing weights
+                            "learned_llm_weight": getattr(self, 'learned_llm_weight', 0.5)
                         }
                         if self.task_type == "classification":
                             logger.info(f"  [Best Snapshot] Updated best-performing model: ACC={best_acc:.4f}, F1={best_f1:.4f}")
@@ -4232,7 +4777,9 @@ class TrainableMAICL:
                             "mechanism_performance": perf_snapshot,
                             "mechanism_metrics": metrics_snapshot,
                             "few_shot_examples": copy.deepcopy(few_shot_examples_from_metrics) if few_shot_examples_from_metrics is not None else None,
-                            "routing_config": routing_config  # Store routing config for exact restoration
+                            "routing_config": routing_config,  # Store routing config for exact restoration
+                            "learned_ml_weight": getattr(self, 'learned_ml_weight', 0.5),  # Store learned routing weights
+                            "learned_llm_weight": getattr(self, 'learned_llm_weight', 0.5)
                         }
                         if self.task_type == "classification":
                             logger.info(f"  [Best Checkpoint] Updated best-performing model at iteration {i+1} after rejection: ACC={current_acc:.4f}, F1={current_f1:.4f}")
@@ -4343,7 +4890,9 @@ class TrainableMAICL:
                         "mechanism_performance": perf_snapshot,
                         "mechanism_metrics": metrics_snapshot,
                         "few_shot_examples": copy.deepcopy(few_shot_examples_from_metrics) if few_shot_examples_from_metrics is not None else None,
-                        "routing_config": routing_config  # Store routing config for exact restoration
+                        "routing_config": routing_config,  # Store routing config for exact restoration
+                        "learned_ml_weight": getattr(self, 'learned_ml_weight', 0.5),  # Store learned routing weights
+                        "learned_llm_weight": getattr(self, 'learned_llm_weight', 0.5)
                     }
                     if self.task_type == "classification":
                         logger.info(f"  [Best Checkpoint] Updated best-performing model at iteration {i+1}: ACC={current_acc:.4f}, F1={current_f1:.4f}")
@@ -4717,6 +5266,12 @@ class TrainableMAICL:
                     if filtered_metrics:
                         logger.info(f"  [Restoration] Restored mechanism metrics: {filtered_metrics}")
                     
+                    # Restore learned routing weights
+                    if "learned_ml_weight" in best_snapshot and "learned_llm_weight" in best_snapshot:
+                        self.learned_ml_weight = best_snapshot["learned_ml_weight"]
+                        self.learned_llm_weight = best_snapshot["learned_llm_weight"]
+                        logger.info(f"  [Restoration] Restored learned routing weights: ML={self.learned_ml_weight:.4f}, LLM={self.learned_llm_weight:.4f}")
+                    
                     # Store best iteration number for logging in evaluate()
                     self._best_iteration = best_snapshot['iteration']
                     
@@ -4864,6 +5419,10 @@ class TrainableMAICL:
             raise RuntimeError("ML mechanism is not trained. Call train_ml_mechanism(...) first or disable use_ml_mechanism.")
         
         class_names = self.class_names if self.task_type == "classification" else None
+        # Step 1: Compute residuals and get ranking
+        # Returns: (sorted_idx, residuals, ml_preds, probas)
+        # sorted_idx: indices sorted DESCENDING by residual (worst predictions first)
+        # residuals: array of residual values aligned with X_full/y_full
         sorted_idx, residuals, ml_preds, _ = compute_ml_residuals(
             self.mech_generator.ml_mechanism if self.use_ml_mechanism else self,  # fallback won't be used
             X_full, y_full, self.feature_cols, class_names, task_type=self.task_type
@@ -4872,9 +5431,11 @@ class TrainableMAICL:
             X_sel, y_sel, top_indices = X_full, y_full, np.arange(len(X_full))
             residual_sel = residuals
         else:
+            # Step 2: Select top-K samples based on residual ranking
             # For classification: residuals are 1.0 (mismatched) or 0.0 (matched)
             # Sorting by residual descending naturally puts mismatched first - no strategy needed
             # For regression: uses residual ranking (absolute errors)
+            # get_top_k_residual_samples uses sorted_idx (already ranked) to select worst predictions
             X_sel, y_sel, top_indices = get_top_k_residual_samples(
                 sorted_idx, residuals, X_full, y_full, top_k, ml_predictions=ml_preds, task_type=self.task_type
             )
@@ -4883,8 +5444,11 @@ class TrainableMAICL:
                 X_sel, y_sel, top_indices = X_full, y_full, np.arange(len(X_full))
                 residual_sel = residuals
             else:
-                # Select residuals corresponding to the top-K samples
+                # Step 3: Extract residuals for the selected top-K samples
+                # top_indices contains indices of worst predictions, so we index residuals accordingly
                 residual_sel = residuals[top_indices]
+        # Step 4: Pass ranked residuals to train() method
+        # residual_sel is now aligned with X_sel/y_sel (top-K worst predictions)
         self.train(X_sel, y_sel, X_full, y_full, iterations=iterations, ml_residuals=residual_sel,
                    X_test=X_test, y_test=y_test, acceptance_set=acceptance_set)
         return {

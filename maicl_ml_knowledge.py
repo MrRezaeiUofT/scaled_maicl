@@ -17,6 +17,92 @@ from maicl_config import (
 logger = logging.getLogger(__name__)
 
 
+def generate_ml_prediction_approximation(ml_mechanism, X_train: np.ndarray, y_train: np.ndarray, 
+                                         feature_cols: List[str], ml_knowledge: Dict[str, Any],
+                                         n_samples: int = 10) -> str:
+    """
+    Generate a simple formula approximation that mimics ML predictions.
+    This provides a starting point for LLM mechanisms to be closer to ML performance.
+    
+    Args:
+        ml_mechanism: Trained ML mechanism
+        X_train: Training features (scaled)
+        y_train: Training targets (scaled)
+        feature_cols: Feature column names
+        ml_knowledge: ML knowledge dict from extract_ml_knowledge
+        n_samples: Number of samples to use for approximation
+    
+    Returns:
+        String describing a simple starting formula
+    """
+    if ml_mechanism is None or not ml_mechanism.is_trained:
+        return ""
+    
+    try:
+        # Get ML predictions for a subset of samples
+        sample_indices = np.linspace(0, len(X_train)-1, min(n_samples, len(X_train)), dtype=int)
+        ml_preds = []
+        true_vals = []
+        feature_vals = []
+        
+        for idx in sample_indices:
+            if idx < len(X_train):
+                x_dict = {feature_cols[j]: float(X_train[idx, j]) 
+                         for j in range(min(len(feature_cols), X_train.shape[1]))}
+                try:
+                    ml_pred = ml_mechanism.predict(x_dict)
+                    ml_preds.append(float(ml_pred))
+                    true_vals.append(float(y_train[idx]))
+                    feature_vals.append(x_dict)
+                except:
+                    continue
+        
+        if len(ml_preds) < 3:
+            return ""
+        
+        # Analyze ML predictions to suggest a starting formula
+        top_features = ml_knowledge.get("top_features", feature_cols[:3])
+        feature_importance = ml_knowledge.get("feature_importance", {})
+        
+        # Create a simple linear approximation based on top features
+        # This is just a starting point - LLM should refine it
+        formula_parts = []
+        total_importance = sum(feature_importance.get(f, 0.5) for f in top_features[:3])
+        
+        if total_importance > 0:
+            for feat in top_features[:3]:
+                imp = feature_importance.get(feat, 0.5)
+                weight = imp / total_importance
+                # Normalize weight to reasonable coefficient range (0.1 to 1.0)
+                coeff = max(0.1, min(1.0, weight * 2.0))
+                formula_parts.append(f"{coeff:.2f}*\"{feat}\"")
+        else:
+            # Equal weights fallback
+            for feat in top_features[:3]:
+                formula_parts.append(f"0.33*\"{feat}\"")
+        
+        if len(formula_parts) > 0:
+            formula = " + ".join(formula_parts)
+            if len(formula_parts) > 1:
+                formula = f"({formula}) / {len(formula_parts)}"
+            
+            suggestion = f"\n\nSUGGESTED STARTING FORMULA (approximates ML predictions):\n"
+            suggestion += f"ŷ ≈ {formula}\n"
+            suggestion += f"This is a SIMPLE LINEAR approximation. You should:\n"
+            suggestion += f"1. Start with this structure but add nonlinear transformations\n"
+            suggestion += f"2. Add corrections for cases with large residuals\n"
+            suggestion += f"3. Use saturation effects, interactions, and intermediate variables\n"
+            suggestion += f"4. Optimize coefficients based on R² and MAE performance\n"
+            suggestion += f"5. The goal is to achieve R² > 0.3 and MAE < 0.25 when used alone\n"
+            
+            return suggestion
+        
+    except Exception as e:
+        logger.debug(f"Failed to generate ML prediction approximation: {e}")
+    
+    return ""
+
+
 def extract_ml_knowledge(ml_mechanism, feature_cols: List[str], task_type: str = "regression") -> Dict[str, Any]:
     """
     Extract interpretable knowledge from trained ML model.
@@ -132,10 +218,10 @@ def generate_ml_guided_mechanism(ml_knowledge: Dict[str, Any],
     
     top_features = ml_knowledge.get("top_features", [])
     if not top_features:
-        # Use up to 5 features as fallback (matching variant 0 usage)
+        # Use all features as fallback (no limit)
         # For DeepChem, don't use ECFP features - will use molecular properties instead
         if not is_deepchem:
-            top_features = feature_cols[:min(5, len(feature_cols))]
+            top_features = feature_cols
         else:
             # For DeepChem, use molecular properties instead
             top_features = ["molecular_weight(SMILES)", "num_rings(SMILES)", "num_hydroxyl_groups(SMILES)"]
@@ -193,15 +279,8 @@ KEY FEATURES (by ML relative importance - use as guide, NOT as coefficients):
                 # Fallback: equal weights
                 scaled_weights = [0.5] * len(top_features[:MAX_TOP_FEATURES])
             
-            mechanism += f"\nINITIAL FORMULA (starting point - optimize coefficients based on performance metrics R² and MAE):\n"
-            mechanism += f"ŷ = ("
-            terms = []
-            for i, feat in enumerate(top_features[:MAX_TOP_FEATURES]):
-                weight = scaled_weights[i] if i < len(scaled_weights) else 0.5
-                terms.append(f"{weight:.3f}*{feat}")
-            mechanism += " + ".join(terms)
-            mechanism += f") / {len(top_features[:MAX_TOP_FEATURES])}"
-            mechanism += f"\n\nCRITICAL: The coefficients above (e.g., {scaled_weights[0]:.3f}, {scaled_weights[1] if len(scaled_weights) > 1 else 0.5:.3f}) are normalized starting values, NOT feature importance values. Feature importance values (like 0.392, 0.150) are NOT coefficients - they only indicate which features are important. You MUST learn proper coefficients (typically 0.1-2.0 range) by optimizing based on R² and MAE performance metrics, not by copying importance values."
+            mechanism += f"\nINITIAL FORMULA: You must generate this formula yourself based on the residual samples and error patterns shown to you. Do NOT use a template - analyze the residual samples to understand where the ML model fails, then design a mechanism formula that addresses these failures. Use nonlinear transformations (saturation effects, interactions, intermediate variables) as described in the mechanism description above."
+            mechanism += f"\n\nCRITICAL: Generate your formula based on the residual analysis. The feature importance values (like {scaled_weights[0]:.3f}, {scaled_weights[1] if len(scaled_weights) > 1 else 0.5:.3f}) are NOT coefficients - they only indicate which features are important. You MUST learn proper coefficients (typically 0.1-2.0 range) by analyzing the residual patterns and optimizing based on R² and MAE performance metrics."
         
         if task_type == "classification":
             if class_names and len(class_names) > 0:

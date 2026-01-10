@@ -1335,6 +1335,10 @@ def run_fold_pipeline_classification(
                 X_topk, y_topk, top_indices = _select_topk_residual_balanced_classification(
                     X_train_s, y_train, residuals, args.top_k, class_names_list=class_names, ml_predictions=ml_preds
                 )
+            elif args.topk_strategy == "random":
+                X_topk, y_topk, top_indices = _select_topk_random_classification(
+                    X_train_s, y_train, residuals, args.top_k
+                )
             else:
                 X_topk, y_topk, top_indices = get_top_k_residual_samples(
                     sorted_idx, residuals, X_train_s, y_train, args.top_k,
@@ -1645,13 +1649,13 @@ def main():
     parser.add_argument("--max_samples", type=int, default=300)
     parser.add_argument("--top_k", type=int, default=100, help="-1 to use full dataset")
     parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--acceptance_set", type=str, default="test",
+    parser.add_argument("--acceptance_set", type=str, default="validation",
                         choices=["test", "validation", "train"],
                         help="Dataset to use for acceptance evaluation during training. "
                              "Options: 'test' (risks overfitting to test), 'validation' (default), "
                              "or 'train' (may overfit to training data).")
-    parser.add_argument("--topk_strategy", choices=["residual", "residual_balanced"], default="residual_balanced",
-                        help="Top-K selection: 'residual' = global highest | 'residual_balanced' = highest within class bins (default for classification)")
+    parser.add_argument("--topk_strategy", choices=["residual", "residual_balanced", "random"], default="residual_balanced",
+                        help="Top-K selection: 'residual' = global highest | 'residual_balanced' = highest within class bins (default for classification) | 'random' = random selection (no sorting)")
     parser.add_argument("--relax_eval", type=int, default=0, choices=[0,1],
                         help="Relax ML routing during evaluation to let LLM contribute (default: 1, recommended for classification)")
     parser.add_argument("--val_size", type=float, default=0.2,
@@ -1967,6 +1971,15 @@ def main():
         idxs = np.array(sorted(set(idxs)))
         return X_tr_s[idxs], y_tr_s[idxs], idxs
 
+    def _select_topk_random_classification(X_tr_s, y_tr_s, residual_vec, k):
+        """Select top-K samples randomly from residuals (no sorting)."""
+        if k <= 0 or k >= len(y_tr_s):
+            return X_tr_s, y_tr_s, np.arange(len(y_tr_s))
+        rng = np.random.RandomState(RANDOM_STATE)
+        idxs = rng.choice(len(y_tr_s), size=k, replace=False)
+        idxs = np.array(sorted(idxs))
+        return X_tr_s[idxs], y_tr_s[idxs], idxs
+
     # Select training subset for MA-ICL (top-K by residual magnitude)
     if args.top_k == -1:
         X_topk, y_topk, top_indices = X_train_s, y_train, np.arange(len(X_train_s))
@@ -1976,6 +1989,11 @@ def main():
             logger.info(f"Selecting top-K residuals with balanced class coverage (K={args.top_k}), prioritizing mismatched examples")
             X_topk, y_topk, top_indices = _select_topk_residual_balanced_classification(
                 X_train_s, y_train, residuals, args.top_k, class_names_list=class_names, ml_predictions=ml_preds
+            )
+        elif args.topk_strategy == "random":
+            logger.info(f"Selecting top-K residuals randomly (no sorting, K={args.top_k})")
+            X_topk, y_topk, top_indices = _select_topk_random_classification(
+                X_train_s, y_train, residuals, args.top_k
             )
         else:
             # Residuals are 1.0 (mismatched) or 0.0 (matched) - sorting by residual descending
