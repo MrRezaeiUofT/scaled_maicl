@@ -133,18 +133,14 @@ np.random.seed(RANDOM_STATE)
 
 
 def _load_env():
-    """Load environment variables from .env if available (no error if missing)."""
+    """Load environment variables from .env if available (simple version)."""
     try:
-        from dotenv import load_dotenv, find_dotenv
-        here = Path(__file__).resolve().parent
-        env_path = here / ".env"
-        if env_path.exists():
-            load_dotenv(env_path, override=False)
-        else:
-            found = find_dotenv(usecwd=True)
-            if found:
-                load_dotenv(found, override=False)
-    except Exception:
+        from dotenv import load_dotenv
+        from pathlib import Path
+        # Load from script directory
+        env_path = Path(__file__).parent / '.env'
+        load_dotenv(env_path)
+    except:
         pass
 
 
@@ -463,19 +459,34 @@ def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="re
             from sklearn.decomposition import PCA
             from sklearn.linear_model import LinearRegression
             
-            # Load environment variables
+            # Load environment variables first
             _load_env()
             
-            # Check for API key
-            api_key = os.getenv("OPENROUTER_API_KEY")
-            if not api_key:
-                raise RuntimeError("OPENROUTER_API_KEY not found in .env file")
+            # Check for API key - prioritize OPENAI_API_KEY from .env
+            api_key = os.getenv("OPENAI_API_KEY")
+            use_openrouter = False
             
-            # Create OpenAI client (matches llmlex documentation pattern)
-            client = openai.OpenAI(
-                base_url="https://openrouter.ai/api/v1",
-                api_key=api_key
-            )
+            # Only use OpenRouter if OPENAI_API_KEY is not found
+            if not api_key:
+                api_key = os.getenv("OPENROUTER_API_KEY")
+                use_openrouter = True
+            
+            if not api_key:
+                raise RuntimeError("OPENAI_API_KEY or OPENROUTER_API_KEY not found")
+            
+            # Use OpenRouter only if OPENROUTER_API_KEY is set, otherwise use OpenAI directly
+            if use_openrouter:
+                client = openai.OpenAI(
+                    base_url="https://openrouter.ai/api/v1",
+                    api_key=api_key
+                )
+                # Keep model name as-is for OpenRouter
+                model_name = "openai/gpt-4o"
+            else:
+                # Use OpenAI API directly (no base_url override)
+                client = openai.OpenAI(api_key=api_key)
+                # Remove "openai/" prefix from model name for OpenAI API
+                model_name = "gpt-4o"
             
             # Reduce to 1D for symbolic regression using PCA
             if X_train.shape[1] > 1:
@@ -505,7 +516,7 @@ def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="re
                     client, base64_img, x_train_1d, y_train,
                     population_size=5,
                     num_of_generations=3,
-                    model="openai/gpt-4o"
+                    model=model_name
                 )
                 
                 if populations and len(populations) > 0:
@@ -521,52 +532,130 @@ def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="re
             
             if best_result is None:
                 logger.info("  Running llmlex single_call...")
-                result = llmlex.single_call(client, base64_img, x_train_1d, y_train, model="openai/gpt-4o")
-                best_expression = result.get('ansatz', None)
-                best_params = result.get('params', {})
-                logger.info(f"  Expression: {best_expression}")
+                result = None
+                try:
+                    result = llmlex.single_call(client, base64_img, x_train_1d, y_train, model=model_name)
+                    best_expression = result.get('ansatz', None) if result else None
+                    best_params = result.get('params', {}) if result else {}
+                    logger.info(f"  Expression: {best_expression}")
+                except Exception as single_call_error:
+                    logger.warning(f"  single_call raised exception (may have partial result): {single_call_error}")
+                    # Try to extract any partial result
+                    if result:
+                        best_expression = result.get('ansatz', None)
+                        best_params = result.get('params', {})
+                        logger.info(f"  Using partial expression: {best_expression}")
+                    else:
+                        best_expression = None
+                        best_params = {}
             
-            # Try to evaluate the symbolic expression using sympy
+            # Try to evaluate the symbolic expression
             y_pred = None
-            try:
-                try:
-                    import sympy as sp
-                    from sympy.parsing.sympy_parser import parse_expr
-                except ImportError:
-                    raise ImportError("sympy not installed")
-                
-                expr_str = str(best_expression)
-                # Replace parameter placeholders with actual values
-                if best_params:
-                    for param_name, param_value in best_params.items():
-                        expr_str = expr_str.replace(param_name, str(param_value))
-                
-                # Create symbol for x
-                x_sym = sp.Symbol('x')
-                # Try to parse the expression
-                try:
-                    expr = parse_expr(expr_str.replace('x', 'x_sym'), transformations='all')
-                except:
-                    expr = parse_expr(expr_str, transformations='all')
-                
-                # Evaluate on test set
-                y_pred = np.array([float(expr.subs(x_sym, x_val)) for x_val in x_test_1d])
-                logger.info("  Successfully evaluated symbolic expression")
-            except Exception as eval_error:
-                logger.warning(f"  Failed to evaluate symbolic expression: {eval_error}")
-                logger.warning("  Falling back to linear fit on 1D projection")
-                # Fallback: use linear regression on 1D projection
+            if best_expression is None:
+                logger.warning("  No expression obtained from llmlex, using linear fit fallback")
                 simple_model = LinearRegression()
                 simple_model.fit(x_train_1d.reshape(-1, 1), y_train)
                 y_pred = simple_model.predict(x_test_1d.reshape(-1, 1))
+            else:
+                try:
+                    # Try to evaluate using numpy directly (safer than sympy for numpy expressions)
+                    expr_str = str(best_expression)
+                    
+                    # Replace parameter placeholders with actual values
+                    # Handle both dict-style and array-style params
+                    has_params = False
+                    if best_params is not None:
+                        if isinstance(best_params, dict):
+                            has_params = len(best_params) > 0
+                            if has_params:
+                                # Handle dict-style params
+                                for param_name, param_value in best_params.items():
+                                    expr_str = expr_str.replace(param_name, str(param_value))
+                        elif isinstance(best_params, (list, np.ndarray)):
+                            # Handle array-style params (e.g., [1. 1. 1. 1.])
+                            has_params = len(best_params) > 0
+                            if has_params:
+                                import re
+                                # Replace params[0], params[1], etc. with actual values from array
+                                def replace_param(match):
+                                    idx = int(match.group(1))
+                                    if 0 <= idx < len(best_params):
+                                        return str(float(best_params[idx]))
+                                    return '1.0'
+                                expr_str = re.sub(r'params\[(\d+)\]', replace_param, expr_str)
+                    
+                    if not has_params:
+                        # If no params, try to replace common parameter patterns with default values
+                        import re
+                        # Replace params[0], params[1], etc. with 1.0 as default
+                        expr_str = re.sub(r'params\[(\d+)\]', '1.0', expr_str)
+                        logger.warning("  No parameters from llmlex, using default values (1.0) for parameter placeholders")
+                    
+                    # Create a safe evaluation environment
+                    # Evaluate expression on test set
+                    x = x_test_1d
+                    safe_dict = {
+                        'np': np,
+                        'numpy': np,
+                        'sin': np.sin,
+                        'cos': np.cos,
+                        'exp': np.exp,
+                        'log': np.log,
+                        'sqrt': np.sqrt,
+                        'abs': np.abs,
+                        'max': np.maximum,
+                        'min': np.minimum,
+                        'clip': np.clip,
+                        'x': x,  # Add x to the evaluation environment
+                    }
+                    
+                    y_pred = eval(expr_str, {"__builtins__": {}}, safe_dict)
+                    
+                    # Ensure y_pred is a numpy array
+                    y_pred = np.asarray(y_pred)
+                    if y_pred.ndim == 0:
+                        y_pred = np.full_like(x_test_1d, float(y_pred))
+                    elif y_pred.shape != x_test_1d.shape:
+                        # If shape doesn't match, try to broadcast or use linear fallback
+                        raise ValueError(f"Shape mismatch: {y_pred.shape} vs {x_test_1d.shape}")
+                    
+                    logger.info("  Successfully evaluated symbolic expression")
+                except Exception as eval_error:
+                    logger.warning(f"  Failed to evaluate symbolic expression: {eval_error}")
+                    logger.warning("  Falling back to linear fit on 1D projection")
+                    # Fallback: use linear regression on 1D projection
+                    try:
+                        simple_model = LinearRegression()
+                        simple_model.fit(x_train_1d.reshape(-1, 1), y_train)
+                        y_pred = simple_model.predict(x_test_1d.reshape(-1, 1))
+                    except Exception as fallback_error:
+                        logger.warning(f"  Linear regression fallback also failed: {fallback_error}")
+                        # Last resort: use mean of training data
+                        y_pred = np.full_like(x_test_1d, np.mean(y_train))
+            
+            # Ensure we have predictions (fallback to mean if all else fails)
+            if y_pred is None:
+                logger.warning("  All evaluation methods failed, using mean of training data as fallback")
+                y_pred = np.full_like(x_test_1d, np.mean(y_train))
             
             # Clip if scaled
             if not no_scaling and y_scaler is not None:
                 y_pred = np.clip(y_pred, SCALE_MIN, SCALE_MAX)
             
+            # Compute metrics
             r2 = r2_score(y_test, y_pred)
             mae = mean_absolute_error(y_test, y_pred)
             mse = mean_squared_error(y_test, y_pred)
+            
+            # Convert best_params to a serializable format
+            params_serializable = None
+            if best_params is not None:
+                if isinstance(best_params, dict):
+                    params_serializable = best_params if len(best_params) > 0 else None
+                elif isinstance(best_params, (list, np.ndarray)):
+                    params_serializable = best_params.tolist() if len(best_params) > 0 else None
+                else:
+                    params_serializable = None
             
             baselines['llmlex'] = {
                 'r2': float(r2),
@@ -574,7 +663,7 @@ def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="re
                 'mse': float(mse),
                 'predictions': y_pred.tolist(),
                 'expression': str(best_expression) if best_expression else None,
-                'params': best_params if best_params else None
+                'params': params_serializable
             }
             logger.info(f"  LLM-LEx: R2={r2:.4f}, MAE={mae:.4f}, MSE={mse:.4f}")
         except Exception as e:
@@ -4357,6 +4446,11 @@ def main():
             shap_mae = additional_baselines['shap'].get('mae', 0.0)
             shap_mse = additional_baselines['shap'].get('mse', 0.0)
             logger.info(f"  SHAP Baseline:     R2={shap_r2:.4f}, MAE={shap_mae:.4f}, MSE={shap_mse:.4f}")
+        if 'llmlex' in additional_baselines:
+            llmlex_r2 = additional_baselines['llmlex'].get('r2', 0.0)
+            llmlex_mae = additional_baselines['llmlex'].get('mae', 0.0)
+            llmlex_mse = additional_baselines['llmlex'].get('mse', 0.0)
+            logger.info(f"  LLM-LEx Baseline:  R2={llmlex_r2:.4f}, MAE={llmlex_mae:.4f}, MSE={llmlex_mse:.4f}")
     
     logger.info(f"  Pre-training:       R2={pre_r2:.4f}, MAE={pre_mae:.4f}, MSE={pre_mse:.4f}")
     if llm_only_pre_metrics:
