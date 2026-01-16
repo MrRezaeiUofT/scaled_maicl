@@ -3069,9 +3069,9 @@ def main():
                         "Note: TabPFN may cause segmentation faults when used as ML mechanism. "
                         "Consider using TabPFN only as a baseline (it runs in isolated subprocess) "
                         "or use --ml_mech linear/xgboost for more stable ML mechanism.")
-    parser.add_argument("--baseline_models", type=str, nargs='+', default=None,
+    parser.add_argument("--baseline_models", type=str, nargs='+', default=['ebm'],
                         help="Select which baseline models to compute. Options: tabpfn, ebm, shap, llmlex. "
-                             "If not specified, all available baselines will be computed. "
+                             "If not specified, EBM baseline will be computed by default. "
                              "Example: --baseline_models tabpfn ebm llmlex")
     parser.add_argument("--tabicl_bins", type=int, default=20,
                         help="Number of bins for TabICL regression quantization (default: 20). "

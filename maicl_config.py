@@ -25,7 +25,7 @@ BATCH_TIMEOUT = 60
 LLM_GROUP_SIZE = 128  # group multiple inputs per LLM call for prediction
 LLM_COMBINE_MECHANISMS = True  # combine all LLM mechanisms per input group into one call
 K_SHOT_PER_TARGET = 10  # Default number of few-shot examples to include in prompts (set to 0 to disable)
-ENCODER_BATCH_SIZE = 2000  # Batch size for encoding residual samples (None = no batching, all samples in one prompt)
+ENCODER_BATCH_SIZE = 10  # Batch size for encoding residual samples (None = no batching, all samples in one prompt)
 
 # Residual switching configuration
 USE_MAICL_RESIDUALS_AFTER_ITERATION = 00  # If set to an integer N, use MA-ICL residuals on acceptance set from iteration N+1 onwards (0-indexed, so N=5 means iterations 6+)

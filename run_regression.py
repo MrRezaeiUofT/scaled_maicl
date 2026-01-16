@@ -27,7 +27,7 @@ import logging
 
 # Base command arguments (fixed for all runs)
 BASE_ARGS = {
-    'dataset': 'avila',
+    'dataset': 'protein_expression',
     'plate_index': 5,
     'iterations': 10,
     'regression_loss': 'r2',
@@ -39,10 +39,10 @@ BASE_ARGS = {
 
 # Parameter combinations to test
 PARAM_COMBINATIONS = {
-    'top_k': [100, 200, 300, 400],
+    'top_k': [30, 50],
     'ml_mech': ['linear', 'xgboost'],
     'scaling': ['scaling', 'no_scaling'],  # 'scaling' means default (scaled), 'no_scaling' means --no_scaling flag
-    'acceptance_set': ['test', 'validation'],
+    'acceptance_set': ['train', 'validation'],
     'num_mechanisms_unknown': [1, 2],
 }
 

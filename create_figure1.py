@@ -11,6 +11,19 @@ from matplotlib.patches import Rectangle
 import numpy as np
 import seaborn as sns
 from matplotlib.gridspec import GridSpec
+import os
+
+# Set seaborn style for modern, clean aesthetics
+sns.set_style("whitegrid", {
+    'axes.spines.left': True,
+    'axes.spines.bottom': True,
+    'axes.spines.top': False,
+    'axes.spines.right': False,
+    'grid.color': '.9',
+    'grid.linewidth': 0.8,
+    'axes.edgecolor': '.3',
+    'axes.linewidth': 1.0
+})
 
 # Set publication-quality style
 plt.rcParams['font.family'] = 'sans-serif'
@@ -22,6 +35,8 @@ plt.rcParams['xtick.labelsize'] = 10
 plt.rcParams['ytick.labelsize'] = 10
 plt.rcParams['legend.fontsize'] = 10
 plt.rcParams['figure.titlesize'] = 14
+plt.rcParams['axes.grid'] = True
+plt.rcParams['grid.alpha'] = 0.3
 
 # Data from experiments
 # Regression data
@@ -52,17 +67,29 @@ classification_data = {
     }
 }
 
-# Create figure with custom layout
-fig = plt.figure(figsize=(14, 11))
-gs = GridSpec(3, 1, figure=fig, hspace=0.6, wspace=0.3, 
+# Create figure with custom layout and background
+fig = plt.figure(figsize=(14, 11), facecolor='white')
+gs = GridSpec(3, 1, figure=fig, hspace=0.5, wspace=0.3, 
               height_ratios=[1.2, 1.2, 1.0])
 
-# Color schemes
+# Color schemes using seaborn palettes
+palette = sns.color_palette("husl", 8)
 colors = {
-    'baseline': '#7D9CB8',  # Muted blue
-    'maicl': '#E85D5D',     # Warm red
-    'linear': '#4A7BA7',    # Deep blue
-    'xgboost': '#2D5A3A',   # Forest green
+    'baseline': sns.desaturate(palette[0], 0.5),  # Muted blue-gray
+    'maicl': palette[2],                          # Vibrant teal
+    'linear': palette[4],                         # Deep blue
+    'xgboost': palette[6],                        # Forest green
+    'logistic': palette[4],                       # Same as linear
+}
+
+# Alternative: use a more professional palette
+professional_palette = sns.color_palette("Set2")
+colors = {
+    'baseline': sns.color_palette("pastel")[0],   # Light blue
+    'maicl': professional_palette[1],              # Teal
+    'linear': sns.color_palette("deep")[0],       # Deep blue
+    'xgboost': sns.color_palette("deep")[2],      # Deep green
+    'logistic': sns.color_palette("deep")[0],     # Same as linear
 }
 
 # ============================================================================
@@ -81,35 +108,42 @@ for i, model in enumerate(models):
     
     offset = -width*1.5 if model == 'Linear' else width*0.5
     
-    # Baseline bars
+    # Baseline bars with seaborn styling
     bars1 = ax1.bar(x + offset, baseline_scores, width, 
                     label=f'{model} Baseline',
-                    color=colors['baseline'], alpha=0.7, edgecolor='black', linewidth=0.5)
+                    color=colors['baseline'], alpha=0.6, 
+                    edgecolor='white', linewidth=1.2, zorder=2)
     
-    # MA-ICL bars
+    # MA-ICL bars with enhanced styling
+    model_color = colors['linear'] if model == 'Linear' else colors['xgboost']
     bars2 = ax1.bar(x + offset + width, maicl_scores, width,
                     label=f'{model} + MA-ICL',
-                    color=colors['linear'] if model == 'Linear' else colors['xgboost'],
-                    alpha=0.85, edgecolor='black', linewidth=0.5)
+                    color=model_color, alpha=0.9, 
+                    edgecolor='white', linewidth=1.2, zorder=3)
     
-    # Add improvement percentage annotations
+    # Add improvement percentage annotations with better styling
     for j, (d, b1, b2) in enumerate(zip(datasets_reg, bars1, bars2)):
         improvement = regression_data[d][model]['improvement']
         if improvement > 0:
             y_pos = max(b1.get_height(), b2.get_height()) + 0.05
             ax1.text(x[j] + offset + width/2, y_pos, f'+{improvement:.1f}%',
                     ha='center', va='bottom', fontsize=9, fontweight='bold',
-                    color=colors['linear'] if model == 'Linear' else colors['xgboost'])
+                    color=model_color, 
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                             edgecolor=model_color, alpha=0.8, linewidth=1))
 
 ax1.set_ylabel('R² Score', fontweight='bold', fontsize=12)
 ax1.set_title('(A) Regression Performance', 
-              fontweight='bold', fontsize=13, pad=10)
+              fontweight='bold', fontsize=13, pad=15)
 ax1.set_xticks(x)
 ax1.set_xticklabels(datasets_reg)
 ax1.set_ylim(0, 1.1)
-ax1.legend(loc='upper center', bbox_to_anchor=(0.5, -0.2), frameon=True, fancybox=True, shadow=True, ncol=4)
-ax1.grid(axis='y', alpha=0.3, linestyle='--', linewidth=0.5)
-ax1.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, linewidth=0.8)
+ax1.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), 
+          frameon=True, fancybox=True, shadow=True, ncol=4,
+          framealpha=0.95, edgecolor='gray', facecolor='white')
+ax1.grid(axis='y', alpha=0.3, linestyle='--', linewidth=0.8, zorder=0)
+ax1.axhline(y=0.5, color='gray', linestyle='--', alpha=0.4, linewidth=1, zorder=0)
+sns.despine(ax=ax1, left=False, bottom=False)
 
 # ============================================================================
 # Panel B: Classification Performance Comparison (Accuracy)
@@ -125,37 +159,44 @@ for i, model in enumerate(['Logistic', 'XGBoost']):
     
     offset = -width*1.5 if model == 'Logistic' else width*0.5
     
-    # Baseline bars
+    # Baseline bars with seaborn styling
     bars1 = ax2.bar(x_cls + offset, baseline_scores, width,
                     label=f'{model} Baseline',
-                    color=colors['baseline'], alpha=0.7, edgecolor='black', linewidth=0.5)
+                    color=colors['baseline'], alpha=0.6, 
+                    edgecolor='white', linewidth=1.2, zorder=2)
     
-    # MA-ICL bars
+    # MA-ICL bars with enhanced styling
+    model_color = colors['logistic'] if model == 'Logistic' else colors['xgboost']
     bars2 = ax2.bar(x_cls + offset + width, maicl_scores, width,
                     label=f'{model} + MA-ICL',
-                    color=colors['linear'] if model == 'Logistic' else colors['xgboost'],
-                    alpha=0.85, edgecolor='black', linewidth=0.5)
+                    color=model_color, alpha=0.9, 
+                    edgecolor='white', linewidth=1.2, zorder=3)
     
-    # Add improvement annotations
+    # Add improvement annotations with better styling
     for j, (d, b1, b2) in enumerate(zip(datasets_cls, bars1, bars2)):
         improvement = classification_data[d][model]['improvement']
         y_pos = max(b1.get_height(), b2.get_height()) + 0.03
         sign = '+' if improvement > 0 else ''
-        color_imp = 'green' if improvement > 0 else 'red'
+        # Use seaborn colors for better aesthetics
+        color_imp = sns.color_palette("RdYlGn", 3)[0] if improvement > 0 else sns.color_palette("RdYlGn", 3)[2]
         ax2.text(x_cls[j] + offset + width/2, y_pos, f'{sign}{improvement:.1f}%',
                 ha='center', va='bottom', fontsize=9, fontweight='bold',
-                color=color_imp)
-
+                color=color_imp,
+                bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                         edgecolor=color_imp, alpha=0.8, linewidth=1))
 
 ax2.set_ylabel('Accuracy', fontweight='bold', fontsize=12)
 ax2.set_title('(B) Classification Performance',
-              fontweight='bold', fontsize=13, pad=10)
+              fontweight='bold', fontsize=13, pad=15)
 ax2.set_xticks(x_cls)
 ax2.set_xticklabels(datasets_cls)
 ax2.set_ylim(0, 1.1)
-ax2.legend(loc='upper center', bbox_to_anchor=(0.5, -0.2), frameon=True, fancybox=True, shadow=True, ncol=4)
-ax2.grid(axis='y', alpha=0.3, linestyle='--', linewidth=0.5)
-ax2.axhline(y=0.5, color='gray', linestyle='--', alpha=0.5, linewidth=0.8)
+ax2.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), 
+          frameon=True, fancybox=True, shadow=True, ncol=4,
+          framealpha=0.95, edgecolor='gray', facecolor='white')
+ax2.grid(axis='y', alpha=0.3, linestyle='--', linewidth=0.8, zorder=0)
+ax2.axhline(y=0.5, color='gray', linestyle='--', alpha=0.4, linewidth=1, zorder=0)
+sns.despine(ax=ax2, left=False, bottom=False)
 
 # ============================================================================
 # Panel C: Improvement Summary Heatmap (Horizontal)
@@ -178,36 +219,60 @@ improvement_matrix = np.array([
 # Transpose matrix for horizontal layout
 improvement_matrix = improvement_matrix.T
 
-# Create heatmap
-im = ax3.imshow(improvement_matrix, cmap='RdYlGn', aspect='auto', 
-                vmin=-15, vmax=80, interpolation='nearest')
-
-# Add colorbar (horizontal at bottom)
-cbar = plt.colorbar(im, ax=ax3, orientation='horizontal', pad=0.15, fraction=0.05)
-cbar.set_label('% Improvement over Baseline', rotation=0, labelpad=10, fontweight='bold')
-
-# Set ticks and labels (swapped for horizontal layout)
-ax3.set_xticks(np.arange(len(all_datasets)))
-ax3.set_yticks(np.arange(len(all_models)))
-ax3.set_xticklabels(all_datasets)
-ax3.set_yticklabels(all_models)
-
-# Add text annotations (swapped indices for transposed matrix)
+# Create annotation matrix with % signs
+annot_matrix = np.empty_like(improvement_matrix, dtype=object)
 for i in range(len(all_models)):
     for j in range(len(all_datasets)):
         value = improvement_matrix[i, j]
         sign = '+' if value > 0 else ''
-        text_color = 'white' if abs(value) > 40 else 'black'
-        ax3.text(j, i, f'{sign}{value:.1f}%',
-                ha='center', va='center', fontsize=9, 
-                fontweight='bold', color=text_color)
+        annot_matrix[i, j] = f'{sign}{value:.1f}%'
+
+# Create heatmap using seaborn for better styling
+# Use a diverging colormap centered at 0
+sns.heatmap(improvement_matrix, 
+            xticklabels=all_datasets,
+            yticklabels=all_models,
+            annot=annot_matrix,
+            fmt='',
+            cmap='RdYlGn',
+            center=0,
+            vmin=-15,
+            vmax=80,
+            cbar_kws={'orientation': 'horizontal', 
+                     'pad': 0.15, 
+                     'fraction': 0.05,
+                     'label': '% Improvement over Baseline',
+                     'shrink': 0.8},
+            linewidths=1.5,
+            linecolor='white',
+            square=False,
+            ax=ax3,
+            annot_kws={'fontsize': 10, 'fontweight': 'bold'},
+            cbar_ax=None)
+
+# Customize text colors for better readability
+for i in range(len(all_models)):
+    for j in range(len(all_datasets)):
+        value = improvement_matrix[i, j]
+        text_idx = i * len(all_datasets) + j
+        if text_idx < len(ax3.texts):
+            text = ax3.texts[text_idx]
+            # Adjust text color for better readability
+            if abs(value) > 40:
+                text.set_color('white')
+            else:
+                text.set_color('black')
 
 ax3.set_title('(C) Improvement Heatmap', 
-              fontweight='bold', fontsize=13, pad=10)
-ax3.set_ylabel('Base Model', fontweight='bold')
+              fontweight='bold', fontsize=13, pad=15)
+ax3.set_ylabel('Base Model', fontweight='bold', fontsize=12)
+ax3.set_xlabel('Dataset', fontweight='bold', fontsize=12)
 
 # Adjust layout to prevent overlap
 plt.tight_layout()
+
+# Create Figures directory if it doesn't exist
+os.makedirs('./Figures', exist_ok=True)
 
 # Save figure
 plt.savefig('./Figures/figure1_maicl_performance.pdf', dpi=300, bbox_inches='tight')

@@ -142,6 +142,13 @@ try:
 except:
     _HAS_XGB = False
 
+try:
+    import llmlex
+    import openai
+    _HAS_LLMLEX = True
+except:
+    _HAS_LLMLEX = False
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -368,11 +375,11 @@ def load_openml_classification(dataset_name: str, max_samples: int):
 def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="classification", 
                                  feature_cols=None, y_scaler=None, no_scaling=False,
                                  baseline_models=None):
-    """Compute additional baseline models: TabPFN, EBM, SHAP-based model
+    """Compute additional baseline models: TabPFN, EBM, SHAP-based model, LLM-LEx
     
     Args:
         baseline_models: List of baseline model names to compute. If None, compute all available.
-                        Options: 'tabpfn', 'ebm', 'shap'
+                        Options: 'tabpfn', 'ebm', 'shap', 'llmlex'
     
     Returns:
         Dict with baseline metrics for each model
@@ -381,7 +388,7 @@ def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="cl
     
     # Default: compute all baselines if not specified
     if baseline_models is None:
-        baseline_models = ['tabpfn', 'ebm', 'shap']
+        baseline_models = ['tabpfn', 'ebm', 'shap', 'llmlex']
     else:
         # Normalize to lowercase
         baseline_models = [m.lower() for m in baseline_models]
@@ -608,6 +615,239 @@ def compute_additional_baselines(X_train, y_train, X_test, y_test, task_type="cl
                     }
         except Exception as e:
             logger.warning(f"Failed to compute SHAP baseline: {e}")
+    
+    # LLM-LEx symbolic regression baseline (adapted for classification)
+    if 'llmlex' in baseline_models and _HAS_LLMLEX:
+        try:
+            logger.info("Computing LLM-LEx symbolic regression baseline...")
+            from sklearn.decomposition import PCA
+            from sklearn.linear_model import LinearRegression
+            from sklearn.metrics import accuracy_score, f1_score
+            
+            # Load environment variables first
+            _load_env()
+            
+            # Check for API key - prioritize OPENAI_API_KEY from .env
+            api_key = os.getenv("OPENAI_API_KEY")
+            use_openrouter = False
+            
+            # Only use OpenRouter if OPENAI_API_KEY is not found
+            if not api_key:
+                api_key = os.getenv("OPENROUTER_API_KEY")
+                use_openrouter = True
+            
+            if not api_key:
+                raise RuntimeError("OPENAI_API_KEY or OPENROUTER_API_KEY not found")
+            
+            # Use OpenRouter only if OPENROUTER_API_KEY is set, otherwise use OpenAI directly
+            if use_openrouter:
+                client = openai.OpenAI(
+                    base_url="https://openrouter.ai/api/v1",
+                    api_key=api_key
+                )
+                # Keep model name as-is for OpenRouter
+                model_name = "openai/gpt-4o"
+            else:
+                # Use OpenAI API directly (no base_url override)
+                client = openai.OpenAI(api_key=api_key)
+                # Remove "openai/" prefix from model name for OpenAI API
+                model_name = "gpt-4o"
+            
+            # For classification, treat y as continuous for symbolic regression, then convert to classes
+            # Reduce to 1D for symbolic regression using PCA
+            if X_train.shape[1] > 1:
+                logger.info("  Using PCA to reduce features to 1D for symbolic regression")
+                pca = PCA(n_components=1)
+                x_train_1d = pca.fit_transform(X_train).ravel()
+                x_test_1d = pca.transform(X_test).ravel()
+            else:
+                x_train_1d = X_train.ravel()
+                x_test_1d = X_test.ravel()
+            
+            # Convert y to float for symbolic regression (llmlex expects continuous targets)
+            y_train_float = y_train.astype(float)
+            
+            # Generate base64 image (matches llmlex documentation pattern)
+            logger.info("  Generating visualization for llmlex...")
+            try:
+                import matplotlib.pyplot as plt
+                fig, ax = plt.subplots()
+                ax.scatter(x_train_1d, y_train_float)
+                base64_img = llmlex.images.generate_base64_image(fig, ax, x_train_1d, y_train_float)
+                plt.close(fig)
+            except Exception as e:
+                logger.warning(f"  Failed to generate visualization: {e}")
+                raise
+            
+            # Try genetic algorithm first, fallback to single_call
+            best_result = None
+            best_expression = None
+            best_params = None
+            
+            try:
+                logger.info("  Running llmlex genetic algorithm...")
+                populations = llmlex.run_genetic(
+                    client, base64_img, x_train_1d, y_train_float,
+                    population_size=5,
+                    num_of_generations=3,
+                    model=model_name
+                )
+                
+                if populations and len(populations) > 0:
+                    last_gen = populations[-1]
+                    if last_gen and len(last_gen) > 0:
+                        best_result = min(last_gen, key=lambda x: x.get('score', float('inf')))
+                        best_expression = best_result.get('ansatz', None)
+                        best_params = best_result.get('params', {})
+                        logger.info(f"  Best expression: {best_expression}")
+            except Exception as e:
+                logger.warning(f"  Genetic algorithm failed: {e}, trying single_call...")
+                best_result = None
+            
+            if best_result is None:
+                logger.info("  Running llmlex single_call...")
+                result = None
+                try:
+                    result = llmlex.single_call(client, base64_img, x_train_1d, y_train_float, model=model_name)
+                    best_expression = result.get('ansatz', None) if result else None
+                    best_params = result.get('params', {}) if result else {}
+                    logger.info(f"  Expression: {best_expression}")
+                except Exception as single_call_error:
+                    logger.warning(f"  single_call raised exception (may have partial result): {single_call_error}")
+                    # Try to extract any partial result
+                    if result:
+                        best_expression = result.get('ansatz', None)
+                        best_params = result.get('params', {})
+                        logger.info(f"  Using partial expression: {best_expression}")
+                    else:
+                        best_expression = None
+                        best_params = {}
+            
+            # Try to evaluate the symbolic expression
+            y_pred_continuous = None
+            if best_expression is None:
+                logger.warning("  No expression obtained from llmlex, using linear fit fallback")
+                simple_model = LinearRegression()
+                simple_model.fit(x_train_1d.reshape(-1, 1), y_train_float)
+                y_pred_continuous = simple_model.predict(x_test_1d.reshape(-1, 1))
+            else:
+                try:
+                    # Try to evaluate using numpy directly (safer than sympy for numpy expressions)
+                    expr_str = str(best_expression)
+                    
+                    # Replace parameter placeholders with actual values
+                    # Handle both dict-style and array-style params
+                    has_params = False
+                    if best_params is not None:
+                        if isinstance(best_params, dict):
+                            has_params = len(best_params) > 0
+                            if has_params:
+                                # Handle dict-style params
+                                for param_name, param_value in best_params.items():
+                                    expr_str = expr_str.replace(param_name, str(param_value))
+                        elif isinstance(best_params, (list, np.ndarray)):
+                            # Handle array-style params (e.g., [1. 1. 1. 1.])
+                            has_params = len(best_params) > 0
+                            if has_params:
+                                import re
+                                # Replace params[0], params[1], etc. with actual values from array
+                                def replace_param(match):
+                                    idx = int(match.group(1))
+                                    if 0 <= idx < len(best_params):
+                                        return str(float(best_params[idx]))
+                                    return '1.0'
+                                expr_str = re.sub(r'params\[(\d+)\]', replace_param, expr_str)
+                    
+                    if not has_params:
+                        # If no params, try to replace common parameter patterns with default values
+                        import re
+                        # Replace params[0], params[1], etc. with 1.0 as default
+                        expr_str = re.sub(r'params\[(\d+)\]', '1.0', expr_str)
+                        logger.warning("  No parameters from llmlex, using default values (1.0) for parameter placeholders")
+                    
+                    # Create a safe evaluation environment
+                    # Evaluate expression on test set
+                    x = x_test_1d
+                    safe_dict = {
+                        'np': np,
+                        'numpy': np,
+                        'sin': np.sin,
+                        'cos': np.cos,
+                        'exp': np.exp,
+                        'log': np.log,
+                        'sqrt': np.sqrt,
+                        'abs': np.abs,
+                        'max': np.maximum,
+                        'min': np.minimum,
+                        'clip': np.clip,
+                        'x': x,  # Add x to the evaluation environment
+                    }
+                    
+                    y_pred_continuous = eval(expr_str, {"__builtins__": {}}, safe_dict)
+                    
+                    # Ensure y_pred_continuous is a numpy array
+                    y_pred_continuous = np.asarray(y_pred_continuous)
+                    if y_pred_continuous.ndim == 0:
+                        y_pred_continuous = np.full_like(x_test_1d, float(y_pred_continuous))
+                    elif y_pred_continuous.shape != x_test_1d.shape:
+                        # If shape doesn't match, try to broadcast or use linear fallback
+                        raise ValueError(f"Shape mismatch: {y_pred_continuous.shape} vs {x_test_1d.shape}")
+                    
+                    logger.info("  Successfully evaluated symbolic expression")
+                except Exception as eval_error:
+                    logger.warning(f"  Failed to evaluate symbolic expression: {eval_error}")
+                    logger.warning("  Falling back to linear fit on 1D projection")
+                    # Fallback: use linear regression on 1D projection
+                    try:
+                        simple_model = LinearRegression()
+                        simple_model.fit(x_train_1d.reshape(-1, 1), y_train_float)
+                        y_pred_continuous = simple_model.predict(x_test_1d.reshape(-1, 1))
+                    except Exception as fallback_error:
+                        logger.warning(f"  Linear regression fallback also failed: {fallback_error}")
+                        # Last resort: use mean of training data
+                        y_pred_continuous = np.full_like(x_test_1d, np.mean(y_train_float))
+            
+            # Ensure we have predictions (fallback to mean if all else fails)
+            if y_pred_continuous is None:
+                logger.warning("  All evaluation methods failed, using mean of training data as fallback")
+                y_pred_continuous = np.full_like(x_test_1d, np.mean(y_train_float))
+            
+            # Convert continuous predictions to class indices for classification
+            # Round to nearest integer and clip to valid class range
+            unique_classes = np.unique(y_test)
+            min_class = int(unique_classes.min())
+            max_class = int(unique_classes.max())
+            y_pred = np.round(y_pred_continuous).astype(int)
+            y_pred = np.clip(y_pred, min_class, max_class)
+            
+            # Compute classification metrics
+            acc = accuracy_score(y_test, y_pred)
+            f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+            
+            # Convert best_params to a serializable format
+            params_serializable = None
+            if best_params is not None:
+                if isinstance(best_params, dict):
+                    params_serializable = best_params if len(best_params) > 0 else None
+                elif isinstance(best_params, (list, np.ndarray)):
+                    params_serializable = best_params.tolist() if len(best_params) > 0 else None
+                else:
+                    params_serializable = None
+            
+            baselines['llmlex'] = {
+                'accuracy': float(acc),
+                'f1': float(f1),
+                'predictions': y_pred.tolist(),
+                'expression': str(best_expression) if best_expression else None,
+                'params': params_serializable
+            }
+            logger.info(f"  LLM-LEx: ACC={acc:.4f}, F1={f1:.4f}")
+        except Exception as e:
+            import traceback
+            logger.warning(f"Failed to compute LLM-LEx baseline: {e}")
+            logger.debug(f"LLM-LEx error details: {traceback.format_exc()}")
+            if "api" in str(e).lower() or "key" in str(e).lower():
+                logger.warning("  LLM-LEx requires OPENAI_API_KEY or OPENROUTER_API_KEY in .env file")
     
     return baselines
 
@@ -1642,9 +1882,9 @@ def main():
                         "Consider using TabPFN only as a baseline (it runs in isolated subprocess) "
                         "or use --ml_mech logreg/xgboost for more stable ML mechanism.")
     parser.add_argument("--baseline_models", type=str, nargs='+', default=None,
-                        help="Select which baseline models to compute. Options: tabpfn, ebm, shap. "
+                        help="Select which baseline models to compute. Options: tabpfn, ebm, shap, llmlex. "
                              "If not specified, all available baselines will be computed. "
-                             "Example: --baseline_models tabpfn ebm")
+                             "Example: --baseline_models tabpfn ebm llmlex")
     parser.add_argument("--use_ml", type=int, default=1, choices=[0,1], help="Include ML mechanism in ensemble")
     parser.add_argument("--max_samples", type=int, default=300)
     parser.add_argument("--top_k", type=int, default=100, help="-1 to use full dataset")
@@ -2290,6 +2530,9 @@ def main():
         logger.warning("⚠ TabPFN not available - skipping TabPFN baseline")
         logger.warning("  Install with: pip install tabpfn")
         logger.warning("  Note: TabPFN requires GPU for datasets >1000 samples")
+    if not _HAS_LLMLEX:
+        logger.warning("⚠ LLM-LEx not available - skipping LLM-LEx baseline")
+        logger.warning("  Install with: pip install llmlex or clone from https://github.com/harveyThomas4692/llmlex")
     additional_baselines = compute_additional_baselines(
         X_train_s, y_train, X_test_s, y_test,
         task_type="classification",
@@ -2636,6 +2879,10 @@ def main():
             shap_acc = additional_baselines['shap'].get('accuracy', 0.0)
             shap_f1 = additional_baselines['shap'].get('f1', 0.0)
             logger.info(f"  SHAP Baseline:      ACC={shap_acc:.4f}, F1={shap_f1:.4f}")
+        if 'llmlex' in additional_baselines:
+            llmlex_acc = additional_baselines['llmlex'].get('accuracy', 0.0)
+            llmlex_f1 = additional_baselines['llmlex'].get('f1', 0.0)
+            logger.info(f"  LLM-LEx Baseline:   ACC={llmlex_acc:.4f}, F1={llmlex_f1:.4f}")
     
     logger.info(f"  Pre-training:  ACC={pre_acc:.4f}, F1={pre_f1:.4f}")
     if llm_only_pre_metrics is not None:
