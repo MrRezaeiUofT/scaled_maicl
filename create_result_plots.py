@@ -95,7 +95,7 @@ tabpfn_cls_acc = [0.9524, 0.5500, 0.8525]
 llmlex_acc = [0.2000, 0.5000, 0.6000]  # LLM-LEx baseline
 llm_icl_acc = [0.80, 0.45, 0.70]  # LLM normal ICL with top_k (below logistic, close to it)
 symbolic_acc = [0.87, 0.48, 0.75]  # Symbolic regression (slightly better than logistic)
-log_maricl_acc = [.975, 0.517, 0.813]
+log_maricl_acc = [.975, 0.521, 0.813]
 xgb_maricl_acc = [0.952, 0.5400, 0.8324]
 
 # F1 values from table
@@ -146,7 +146,7 @@ colors = [
     palette_baseline[4],  # Muted orange/brown for LLM-LEx
     palette_baseline[5],  # Muted teal/cyan for LLM ICL
     palette_baseline[6],  # Muted pink/salmon for Symbolic Regression
-    palette_maricl[0],    # Bright orange/red for Linear+MA-RICL
+    palette_maricl[0],    # Bright orange/red for Linear+MARICL
     palette_maricl[1],    # Bright yellow/gold for XGB+MA-RICL
 ]
 
@@ -196,7 +196,7 @@ def create_bars(ax, x, data_list, ci_list, labels, width, colors, hatch_patterns
 # TOP-LEFT: Regression R²
 # =============================================================================
 ax1 = axes[0, 0]
-labels = ['Linear', 'XGBoost', 'EBM', 'TabPFN', 'LLM-LEx', 'LLM ICL', 'Symbolic', 'Linear+MA-RICL', 'XGB+MA-RICL']
+labels = ['Linear', 'XGBoost', 'EBM', 'TabPFN', 'LLM-LEx', 'LLM ICL', 'Symbolic', 'Linear+MARICL', 'XGB+MARICL']
 r2_data = [linear_r2, xgboost_r2, ebm_r2, tabpfn_r2, llmlex_r2, llm_icl_r2, symbolic_r2, linear_maricl_r2, xgb_maricl_r2]
 r2_ci = [linear_r2_ci, xgboost_r2_ci, ebm_r2_ci, tabpfn_r2_ci, llmlex_r2_ci, llm_icl_r2_ci, symbolic_r2_ci,
          linear_maricl_r2_ci, xgb_maricl_r2_ci]

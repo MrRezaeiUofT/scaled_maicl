@@ -3069,7 +3069,7 @@ def main():
                         "Note: TabPFN may cause segmentation faults when used as ML mechanism. "
                         "Consider using TabPFN only as a baseline (it runs in isolated subprocess) "
                         "or use --ml_mech linear/xgboost for more stable ML mechanism.")
-    parser.add_argument("--baseline_models", type=str, nargs='+', default=['ebm'],
+    parser.add_argument("--baseline_models", type=str, nargs='+', default=['ebm','tabpfn','shap','llmlex'],
                         help="Select which baseline models to compute. Options: tabpfn, ebm, shap, llmlex. "
                              "If not specified, EBM baseline will be computed by default. "
                              "Example: --baseline_models tabpfn ebm llmlex")
@@ -3080,7 +3080,7 @@ def main():
     parser.add_argument("--max_samples", type=int, default=200)
     parser.add_argument("--top_k", type=int, default=1000, help="-1 to use full dataset")
     parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--acceptance_set", type=str, default="validation",
+    parser.add_argument("--acceptance_set", type=str, default="train",
                         choices=["test", "validation", "train"],
                         help="Dataset to use for acceptance evaluation during training. "
                              "Options: 'test' (risks overfitting to test), 'validation' (default), "

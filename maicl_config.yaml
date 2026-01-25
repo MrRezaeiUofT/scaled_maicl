@@ -767,13 +767,6 @@ prompts:
           
           Use actual feature names: "Temperature (deg C)", "Potassium concentration (mM)", "Magnesium concentration (mM)", "NTPs concentration (mM)", "DNA concentration (nM)"
           
-          CRITICAL SCALING REQUIREMENT:
-          - All feature values you see in examples (like Temperature=0.93, Potassium=0.60) are SCALED to [0, 1]
-          - ALL constants in your formula MUST also be in [0, 1] scaled range
-          - Example: If optimal temperature is 34°C and range is 22-37°C, use 0.8 (scaled) NOT 34 (unscaled)
-          - Example: If Km for Mg is 8-12 mM and range is 2.5-12.5 mM, use 0.55-0.76 (scaled) NOT 8-12 (unscaled)
-          - Base ALL constants on the SCALED sample values you see, not on raw physical units
-          
           Output a formula that captures these biochemical relationships with appropriate SCALED coefficients and saturation constants.
       
       protein_expression:
