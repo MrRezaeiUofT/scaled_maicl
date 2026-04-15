@@ -161,6 +161,59 @@ templates:
       Key mechanisms: Temperature (Gaussian), Mg/K/NTPs/DNA (Michaelis-Menten saturation), interactions
       {scale_info}
       FEATURES: {features}
+
+    # Cell-free batch CSVs (018): exact keys = lowercase dataset label + "_" + task (see textgrad.TextGrad._get_dataset_context)
+    gfp (cell-free yield)_regression: |
+      DATASET: {dataset_name}
+      DOMAIN: Cell-free protein synthesis — **GFP reporter** (NiCo21(DE3) lysate; CSV batch under MohammadFiles/April).
+      TASK: Predict **Yield** from reaction design: temperature, K+, Mg2+, NTPs, TCEP (reducing), DNA template.
+      PROTEIN-SPECIFIC CONTEXT (do not generalize to other constructs):
+      - GFP maturation needs folding plus chromophore oxidation; mechanisms should allow **nonlinear temperature** (optimum / cold stall / heat stress) and **redox–folding coupling** (TCEP vs disulfide needs).
+      - Treat **Mg2+ × K+** as ribosome/translation stability; **NTP × DNA** as transcription–translation resource coupling; watch for saturation and competition at high DNA.
+      OPTIMIZATION: Residuals often reflect missed **T×Mg**, **NTP saturation**, or **DNA-limited vs DNA-toxic** regimes—prefer interpretable biochemistry over generic polynomials.
+      {scale_info}
+      FEATURES: {features}
+
+    griffithsin (cell-free yield)_regression: |
+      DATASET: {dataset_name}
+      DOMAIN: Cell-free synthesis — **Griffithsin** lectin (engineered *E. coli* K12 Shuffle lysate).
+      TASK: Predict **Yield** from the same reaction-condition columns as other batch CSVs, but mechanisms must reflect **Griffithsin biology**:
+      - Dimeric antiviral lectin (~12.7 kDa monomer): **dimer assembly**, high solubility at moderate ionic strength, and **mannose-binding surface** chemistry can change how Mg2+/K+ and crowding affect solubility vs. a small barrel reporter.
+      - Ionic strength and reducing environment (TCEP) may dominate **aggregation vs. functional dimer** tradeoffs.
+      OPTIMIZATION: If errors cluster at extreme K/Mg or high DNA, model **solubility / assembly** not only transcription capacity.
+      {scale_info}
+      FEATURES: {features}
+
+    npm2e (cell-free yield)_regression: |
+      DATASET: {dataset_name}
+      DOMAIN: Cell-free synthesis — **NPM2e** (nucleophosmin-family; Shuffle K12 lysate).
+      TASK: Predict **Yield** from reaction conditions; emphasize **intrinsically disordered / acidic hub** behavior:
+      - Strong coupling to **NTP pools** and **Mg2+** (translation + RNA binding); phase-separation-like sensitivity can make yield sharply depend on **ionic composition** and template load (DNA).
+      - Crowding from high DNA or salt can help or hurt solubility—residuals may need **non-monotone** ion terms, not a single “more is better” trend.
+      OPTIMIZATION: Prefer mechanisms that separate **translation flux** from **soluble functional fraction** of NPM2e.
+      {scale_info}
+      FEATURES: {features}
+
+    scfvlr (cell-free yield)_regression: |
+      DATASET: {dataset_name}
+      DOMAIN: Cell-free synthesis — **scFvLR** single-chain Fv (Shuffle K12 lysate).
+      TASK: Predict **Yield**; scFv folding is not GFP-like:
+      - **VH–VL interface** and linker strain; **disulfide** formation vs. reduction (TCEP) can dominate—explicitly consider redox-dependent folding pathways.
+      - Mg2+/elongation and chaperone-like extract effects may show as **interaction with TCEP**, not just additive ions.
+      OPTIMIZATION: Systematic under/overprediction vs. TCEP or Mg often means the mechanism should encode **redox × folding**, not only Michaelis terms on NTP/DNA.
+      {scale_info}
+      FEATURES: {features}
+
+    ebola n-protein (cell-free yield)_regression: |
+      DATASET: {dataset_name}
+      DOMAIN: Cell-free synthesis — **Ebola virus nucleoprotein (N-protein)** (NiCo21(DE3) lysate).
+      TASK: Predict **Yield**; large viral protein + **RNA binding / oligomerization**:
+      - Resource competition: **NTP and ribosome usage** scales super-linearly with length/oligomerization; **DNA template** may show strong saturation then decline (runoff, aggregation, resource drain).
+      - Temperature and ionic conditions affect **soluble oligomer vs. aggregate**—different failure modes than GFP or scFv.
+      OPTIMIZATION: Prioritize **DNA × NTP** and **size/resource** narratives when residuals track high-DNA or high-expression conditions.
+      {scale_info}
+      FEATURES: {features}
+
     concrete: |
       DATASET: Concrete Strength
       DOMAIN: Materials Science / Civil Engineering

@@ -13,6 +13,93 @@ MAX_FEATURES_IN_DESCRIPTION = 5  # Maximum features in dataset descriptions
 MAX_FEATURES_IN_COMPONENT_LIST = 3  # Maximum features in component lists
 
 
+def _get_cellfree_yield_known_profile(dataset_name: str) -> Dict[str, Any]:
+    """
+    Known [LLM] mechanism context for each supported cell-free yield construct (018 / MohammadFiles/April).
+
+    Labels come from CELLFREE_YIELD_DATASETS['...']['label'] in 018_maicl_regression_biotech.py.
+    Each profile must stay in sync with those strings (substring match on lowercased label).
+    """
+    dn = dataset_name.lower()
+    t = dn.replace(" ", "")
+    if "cell-free yield" not in dn:
+        raise ValueError(f"Not a cell-free yield label: {dataset_name!r}")
+
+    # Order: most specific / non-overlapping branches first; GFP last (substring 'gfp' is common).
+    if "griffithsin" in dn:
+        return {
+            "construct_id": "cellfree_griffithsin",
+            "protein_title": "Griffithsin (GRFT)",
+            "biology": (
+                "Griffithsin is a dimeric lectin (~12.7 kDa monomer) that binds high-mannose glycans; "
+                "high solubility and folding demands can shift sensitivity to ionic strength, reducing "
+                "environment, and Mg2+-dependent translation fidelity versus typical globular reporters."
+            ),
+            "strain": "Engineered Escherichia coli K12 (Shuffle) cell-free lysate",
+            "formula_bias": "0.18",
+            "mix_w": "0.11",
+        }
+    if "npm2e" in t:
+        return {
+            "construct_id": "cellfree_npm2e",
+            "protein_title": "NPM2e (NPM2 variant)",
+            "biology": (
+                "Nucleophosmin family proteins are acidic, intrinsically disordered hubs that phase-separate "
+                "with RNA; NPM2e expression can be especially sensitive to NTP pools, Mg2+/K+ for "
+                "ribosome assembly, and redox/cofactor conditions that modulate solubility."
+            ),
+            "strain": "Engineered Escherichia coli K12 (Shuffle) cell-free lysate",
+            "formula_bias": "0.17",
+            "mix_w": "0.12",
+        }
+    if "scfvlr" in t:
+        return {
+            "construct_id": "cellfree_scfvlr",
+            "protein_title": "scFvLR (single-chain Fv)",
+            "biology": (
+                "Single-chain Fvs combine VH and VL with a linker; folding and disulfide chemistry in "
+                "cell-free systems often make yield more sensitive to redox (e.g., TCEP vs oxidized "
+                "disulfides), chaperone/cofactor balance, and Mg2+ for translation elongation."
+            ),
+            "strain": "Engineered Escherichia coli K12 (Shuffle) cell-free lysate",
+            "formula_bias": "0.19",
+            "mix_w": "0.10",
+        }
+    if "ebola" in dn and ("n-protein" in dn or "nprotein" in t or "n_protein" in dn):
+        return {
+            "construct_id": "cellfree_ebola_nprotein",
+            "protein_title": "Ebola virus nucleoprotein (N-protein)",
+            "biology": (
+                "Ebola N-protein encapsidates viral RNA and oligomerizes; larger viral proteins can "
+                "saturate transcription–translation resources sooner, making DNA template level and "
+                "NTP/Mg2+ supply stronger nonlinear controls on yield than for small reporters."
+            ),
+            "strain": "NiCo21(DE3) Escherichia coli cell-free lysate",
+            "formula_bias": "0.16",
+            "mix_w": "0.13",
+        }
+    if "gfp" in dn:
+        return {
+            "construct_id": "cellfree_gfp",
+            "protein_title": "GFP (green fluorescent protein reporter)",
+            "biology": (
+                "GFP is a ~27 kDa beta-barrel reporter whose maturation depends on chromophore "
+                "oxidation/folding after translation; yield tracks translation flux plus folding "
+                "environment (ionic composition, redox, temperature) in addition to template level."
+            ),
+            "strain": "NiCo21(DE3) Escherichia coli cell-free lysate",
+            "formula_bias": "0.20",
+            "mix_w": "0.11",
+        }
+
+    raise ValueError(
+        f"Unknown cell-free yield dataset label {dataset_name!r}. "
+        "Define a profile in _get_cellfree_yield_known_profile() for this construct, or fix the "
+        "dataset label in 018_maicl_regression_biotech.py CELLFREE_YIELD_DATASETS. "
+        "Supported substrings: griffithsin, npm2e, scfvlr/scFvLR, ebola n-protein, gfp."
+    )
+
+
 # =========================
 # DATASET DESCRIPTIONS
 # =========================
@@ -904,6 +991,61 @@ This mechanism encodes fundamental enzyme biochemistry.
                 f"Material properties mechanism: This dataset predicts material properties from composition and processing conditions. Output depends on {feat_desc}, and crystal structure. COMPUTE prediction as: {formula}. All inputs/outputs in {scale_range_str}. Clip ŷ to {scale_range_str}."
             ]
         
+        elif "cell-free yield" in dataset_name.lower():
+            # MohammadFiles/April protein yield CSVs — one explicit profile per construct (see _get_cellfree_yield_known_profile)
+            # (must run before the generic "GFP" branch so cell-free GFP is not merged with legacy GFP yield)
+            profile = _get_cellfree_yield_known_profile(dataset_name)
+            construct_id = profile["construct_id"]
+            protein_title = profile["protein_title"]
+            biology = profile["biology"]
+            strain = profile["strain"]
+            formula_bias = profile["formula_bias"]
+            mix_w = profile["mix_w"]
+
+            if feature_cols and len(feature_cols) >= 2:
+                temp_feats = [f for f in feature_cols if any(x in f.lower() for x in ["temp", "temperature"])]
+                mg_feats = [f for f in feature_cols if "magnesium" in f.lower()]
+                k_feats = [f for f in feature_cols if "potassium" in f.lower()]
+                ntp_feats = [f for f in feature_cols if "ntp" in f.lower()]
+                dna_feats = [f for f in feature_cols if "dna" in f.lower()]
+                tcep_feats = [f for f in feature_cols if "tcep" in f.lower()]
+                tcol = temp_feats[0] if temp_feats else feature_cols[0]
+                mcol = mg_feats[0] if mg_feats else feature_cols[2] if len(feature_cols) > 2 else feature_cols[1]
+                kcol = k_feats[0] if k_feats else feature_cols[1]
+                ncol = ntp_feats[0] if ntp_feats else feature_cols[3] if len(feature_cols) > 3 else feature_cols[1]
+                dcol = dna_feats[0] if dna_feats else feature_cols[-1]
+                rcol = tcep_feats[0] if tcep_feats else feature_cols[4] if len(feature_cols) > 4 else feature_cols[-1]
+                formula = (
+                    f"ŷ = ({tcol} + {kcol} + {mcol} + {ncol} + {dcol} + {rcol}) / {len(feature_cols)} "
+                    f"+ {formula_bias} * {tcol} * {mcol} + {mix_w} * {ncol} * {dcol}"
+                )
+            else:
+                formula = "ŷ = (sum of all reaction-condition features) / (number of features)"
+
+            dataset_desc = f"""CELL-FREE PROTEIN YIELD — {protein_title}:
+{biology}
+Experimental system: {strain}.
+Design variables are shared reaction-condition columns (temperature, salts, NTPs, reductant TCEP, DNA template); the target is measured protein Yield for this construct only (CSV filename encodes batch/date)."""
+
+            mechanism_desc = f"""[KNOWN] CONSTRUCT_ID: {construct_id}
+[KNOWN] DATASET CONTEXT:
+{dataset_desc}
+
+TASK: Regression predicting **Yield** for **{protein_title}** only (construct_id={construct_id}). Same measured columns exist across sibling CSVs; this [KNOWN] mechanism must not be transferred to other constructs.
+
+{feature_info}
+
+MECHANISM FORMULA (toy prior — use actual feature names above):
+COMPUTE prediction as: {formula}
+
+CONSTRAINTS:
+{get_scaling_constraints_str()}
+- Use actual feature names from the dataset when referencing features
+- Do not reuse mechanisms from other proteins in this series; folding, size, and biology differ."""
+
+            mechanism_desc = _strip_scaling_language_if_unscaled(mechanism_desc)
+            return [mechanism_desc]
+
         elif "Biomarker" in dataset_name:
             if feature_cols and len(feature_cols) >= 5:
                 # Try to find clinical and lifestyle features
@@ -925,7 +1067,7 @@ This mechanism encodes fundamental enzyme biochemistry.
                 f"Biomarker prediction mechanism: This dataset predicts biomarker levels from clinical and lifestyle parameters. Output depends on {feat_desc}, and genetic predisposition. COMPUTE prediction as: {formula}. All inputs/outputs in {scale_range_str}. Clip ŷ to {scale_range_str}."
             ]
         
-        elif "GFP" in dataset_name:
+        elif "GFP" in dataset_name and "cell-free" not in dataset_name.lower():
             if feature_cols and len(feature_cols) >= 2:
                 # Try to find reaction condition features
                 temp_feats = [f for f in feature_cols if any(t in f.lower() for t in ['temp', 'temperature'])]

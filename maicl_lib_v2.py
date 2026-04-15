@@ -1019,6 +1019,20 @@ class VariationalMechanismGenerator:
         name = name.replace(" classification", "").replace(" regression", "")
         # Remove extra whitespace
         name = name.strip()
+
+        # Cell-free yield CSVs (MohammadFiles/April) — per-protein YAML keys
+        if "cell-free yield" in name:
+            compact = name.replace(" ", "")
+            if "ebola" in name and ("n-protein" in name or "nprotein" in compact):
+                return "cellfree_ebola_nprotein"
+            if "griffithsin" in name:
+                return "cellfree_griffithsin"
+            if "npm2e" in compact:
+                return "cellfree_npm2e"
+            if "scfvlr" in compact or "scfv" in name:
+                return "cellfree_scfvlr"
+            if "gfp" in name:
+                return "cellfree_gfp"
         
         # Strip common enzyme dataset suffixes used by loaders/runners
         # e.g. "aminotransferase_binary" -> "aminotransferase"

@@ -10,6 +10,7 @@ MA-ICL Regression Runner (Biotech/Biological Datasets)
 
 Available Datasets:
 - Experimental: gfp_yield, protein_expression, protein_expression_all, dataset_102
+- Cell-free protein yield CSVs (MohammadFiles/April): cellfree_gfp, cellfree_griffithsin, cellfree_npm2e, cellfree_scfvlr, cellfree_ebola_nprotein
 - InaData (SU/EC): pfas_su, ec_fertility, ec_climbing
 
 Usage examples:
@@ -811,6 +812,62 @@ def load_gfp_yield_dataset(max_samples: int):
     X_original = [X_df.iloc[i].astype(float).to_dict() for i in range(len(X_df))]
     feature_encoders: Dict[str, Any] = {}
     return X_encoded, y_values, X_original, feature_cols, feature_encoders, "GFP Yield Prediction"
+
+
+# Cell-free yield CSVs under MohammadFiles/April (2026_04_13_*_Results.csv) — one protein per file, no Experiment-no aggregation
+CELLFREE_YIELD_DATASETS = {
+    "cellfree_gfp": {
+        "csv": "2026_04_13_GFP_Results.csv",
+        "label": "GFP (cell-free yield)",
+    },
+    "cellfree_griffithsin": {
+        "csv": "2026_04_13_Griffithsin_Results.csv",
+        "label": "Griffithsin (cell-free yield)",
+    },
+    "cellfree_npm2e": {
+        "csv": "2026_04_13_NPM2e_Results.csv",
+        "label": "NPM2e (cell-free yield)",
+    },
+    "cellfree_scfvlr": {
+        "csv": "2026_04_13_scFvLR_Results.csv",
+        "label": "scFvLR (cell-free yield)",
+    },
+    "cellfree_ebola_nprotein": {
+        "csv": "2026_04_13_Ebola_Nprotein_Results.csv",
+        "label": "Ebola N-protein (cell-free yield)",
+    },
+}
+
+
+def load_cellfree_yield_dataset(dataset_key: str, max_samples: int):
+    """Load a protein cell-free yield CSV from MohammadFiles/April (numeric reaction conditions + Yield)."""
+    if not _HAS_PANDAS:
+        raise RuntimeError("pandas not installed. pip install pandas")
+    key = dataset_key.lower().strip()
+    if key not in CELLFREE_YIELD_DATASETS:
+        valid = ", ".join(sorted(CELLFREE_YIELD_DATASETS))
+        raise ValueError(f"Unknown cell-free yield dataset key '{dataset_key}'. Use one of: {valid}")
+    meta = CELLFREE_YIELD_DATASETS[key]
+    csv_rel = os.path.join("MohammadFiles", "April", meta["csv"])
+    csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), csv_rel)
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"Cell-free yield CSV not found: {csv_path}")
+    df = pd.read_csv(csv_path)
+    df = df.select_dtypes(include=[np.number]).dropna()
+    if "Yield" not in df.columns:
+        raise ValueError(f"'Yield' column missing in {csv_path}; columns={list(df.columns)}")
+    feature_cols = [c for c in df.columns if c != "Yield"]
+    if not feature_cols:
+        raise ValueError(f"No feature columns after dropping Yield in {csv_path}")
+    X_df = df[feature_cols].astype(float)
+    y_series = df["Yield"].astype(float)
+    logger.info(f"Raw dataset ({meta['label']}) shape: {df.shape}, columns: {list(df.columns)}")
+    X_df, y_series = _subsample_if_needed(X_df, y_series, max_samples)
+    X_encoded = X_df.values
+    y_values = y_series.values
+    X_original = [X_df.iloc[i].astype(float).to_dict() for i in range(len(X_df))]
+    feature_encoders: Dict[str, Any] = {}
+    return X_encoded, y_values, X_original, feature_cols, feature_encoders, meta["label"]
 
 
 def get_available_protein_plates():
@@ -3023,9 +3080,10 @@ def main():
     global json
     
     parser = argparse.ArgumentParser(description="MA-ICL regression on biotech/experimental datasets with top-K residuals")
-    parser.add_argument("--dataset", type=str, required=True,
+    parser.add_argument("--dataset", type=str, default=None,
                         help="Dataset name. Options:\n"
                              "  Built-in: gfp_yield, protein_expression, protein_expression_all, dataset_102\n"
+                             "  Cell-free yield (MohammadFiles/April CSVs): cellfree_gfp, cellfree_griffithsin, cellfree_npm2e, cellfree_scfvlr, cellfree_ebola_nprotein\n"
                              "  InaData (SU/EC):\n"
                              "    - pfas_su (PFAS developmental assay; pupation/eclosure)\n"
                              "    - ec_fertility (fertility/eclosion counts)\n"
@@ -3061,6 +3119,8 @@ def main():
                         help="Plate index (0-based) for protein_expression dataset. Use --list_plates to see available indices.")
     parser.add_argument("--list_plates", action="store_true",
                         help="List all available protein expression plate files and exit")
+    parser.add_argument("--list_cellfree_yield", action="store_true",
+                        help="List MohammadFiles/April cell-free yield datasets (--dataset keys) and exit")
     parser.add_argument("--list_enzyme_datasets", action="store_true",
                         help="List all available enzyme datasets and exit")
     parser.add_argument("--model_name", default=os.environ.get("MAICL_MODEL_NAME", "gemini-2.0-flash"),
@@ -3109,6 +3169,9 @@ def main():
                              "Example: --cv_folds 5 for 5-fold CV.")
     args = parser.parse_args()
 
+    if not args.dataset and not (args.list_plates or args.list_cellfree_yield or args.list_enzyme_datasets):
+        parser.error("--dataset is required unless using --list_plates, --list_cellfree_yield, or --list_enzyme_datasets")
+
     # Handle --list_plates option
     if args.list_plates:
         plates = get_available_protein_plates()
@@ -3126,6 +3189,16 @@ def main():
             print(f"  python {os.path.basename(__file__)} --dataset protein_expression --plate_file {plates[0]}")
         else:
             print("No protein expression plates found.")
+        return
+
+    if args.list_cellfree_yield:
+        print("\nCell-free protein yield datasets (MohammadFiles/April):")
+        print("=" * 60)
+        for k in sorted(CELLFREE_YIELD_DATASETS):
+            print(f"  --dataset {k}")
+            print(f"      → {CELLFREE_YIELD_DATASETS[k]['label']} ({CELLFREE_YIELD_DATASETS[k]['csv']})")
+        print("=" * 60)
+        print(f"\nTotal: {len(CELLFREE_YIELD_DATASETS)} dataset(s)")
         return
     
     # Handle --list_enzyme_datasets option
@@ -3320,6 +3393,10 @@ def main():
 
     if dataset_name_lower == "gfp_yield":
         X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_gfp_yield_dataset(args.max_samples)
+    elif dataset_name_lower in CELLFREE_YIELD_DATASETS:
+        X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_cellfree_yield_dataset(
+            dataset_name_lower, args.max_samples
+        )
     elif dataset_name_lower == "protein_expression":
         X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_protein_expression_dataset(
             args.max_samples, plate_file=args.plate_file, plate_index=args.plate_index)
@@ -3364,7 +3441,8 @@ def main():
             X_all, y_all, X_original_all, feature_cols, feature_encoders, ds_label = load_enzyme_dataset(dataset_name_original, args.max_samples)
         except Exception as e:
             raise SystemExit(f"Unknown dataset {args.dataset}. Error: {e}\n"
-                           f"Available options: gfp_yield, protein_expression, protein_expression_all, dataset_102, "
+                           f"Available options: gfp_yield, cellfree_gfp, cellfree_griffithsin, cellfree_npm2e, cellfree_scfvlr, cellfree_ebola_nprotein, "
+                           f"protein_expression, protein_expression_all, dataset_102, "
                            f"TabArena (diabetes), "
                            f"DeepChem (any molnet dataset, e.g., esol, delaney, lipo, lipophilicity), "
                            f"or enzyme dataset names (e.g., halogenase_NaBr, aminotransferase, olea, phosphatase_achiral)")

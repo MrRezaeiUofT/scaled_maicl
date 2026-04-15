@@ -768,6 +768,52 @@ prompts:
           Use actual feature names: "Temperature (deg C)", "Potassium concentration (mM)", "Magnesium concentration (mM)", "NTPs concentration (mM)", "DNA concentration (nM)"
           
           Output a formula that captures these biochemical relationships with appropriate SCALED coefficients and saturation constants.
+
+      cellfree_gfp:
+        encoder: |
+          You are a mechanism encoder for **GFP** cell-free yield (NiCo21(DE3) E. coli lysate; see CSV under MohammadFiles/April).
+          Features: "Temperature (deg C)", "Potassium concentration (mM)", "Magnesium concentration (mM)",
+          "NTPs concentration (mM)", "TCEP concentration (mM)", "DNA concentration (nM)"; target is **Yield** for GFP only.
+          Emphasize chromophore maturation/folding after translation, temperature optima, Mg2+/K+ for ribosome stability,
+          NTP saturation, DNA template level, and how TCEP (reducing) shifts thiol/disulfide equilibria relevant to GFP folding.
+        decoder: |
+          You are a mechanism decoder for **GFP** cell-free yield only (not other proteins in this batch).
+          Use the exact feature names from the CSV. Model transcription–translation flux plus folding/maturation (nonlinear in T, Mg, redox).
+          Output: MECHANISM DESCRIPTION, INTERMEDIATE CONCEPTS, then a single line "Formula: ŷ = ..." using those feature names.
+
+      cellfree_griffithsin:
+        encoder: |
+          You are a mechanism encoder for **Griffithsin** cell-free yield (engineered E. coli K12 Shuffle lysate).
+          Same reaction-condition columns as sibling CSVs, but **Griffithsin** is a dimeric antiviral lectin—yield may track
+          solubility, dimer assembly, and ionic strength differently than a small reporter. Stress Mg2+/K+, NTP/DNA balance, TCEP level.
+        decoder: |
+          You are a mechanism decoder for **Griffithsin** cell-free yield only. Encode lectin folding/dimerization and ion-mediated solubility
+          as distinct from GFP or scFv. Use only the provided feature names; end with "Formula: ŷ = ...".
+
+      cellfree_npm2e:
+        encoder: |
+          You are a mechanism encoder for **NPM2e** cell-free yield (Shuffle K12 lysate). NPM2-family proteins are acidic and
+          intrinsically disordered with strong RNA/chaperone context—yield may hinge on NTP pools, Mg2+ for ribosomes, and crowding-like
+          effects from DNA template load. Same numeric columns as sibling files; task is NPM2e **Yield** only.
+        decoder: |
+          You are a mechanism decoder for **NPM2e** cell-free yield only. Highlight IDP-like sensitivity to ionic composition and resource saturation.
+          Use actual column names; "Formula: ŷ = ..." must reference those names explicitly.
+
+      cellfree_scfvlr:
+        encoder: |
+          You are a mechanism encoder for **scFvLR** cell-free yield (Shuffle K12 lysate). Single-chain Fvs need correct VH–VL pairing
+          via linker; disulfide/redox (TCEP) and chaperone-like conditions in cell-free extracts can dominate yield vs. a cytosolic reporter.
+        decoder: |
+          You are a mechanism decoder for **scFvLR** cell-free yield only. Treat folding, disulfide chemistry, and translation elongation limits as first-class.
+          Feature names must match the dataset; finish with "Formula: ŷ = ...".
+
+      cellfree_ebola_nprotein:
+        encoder: |
+          You are a mechanism encoder for **Ebola virus N-protein** cell-free yield (NiCo21(DE3) lysate). N-protein is large and oligomerizes
+          on RNA—resource competition (NTPs, ribosomes) and DNA template copy number often show stronger nonlinearities than for small proteins.
+        decoder: |
+          You are a mechanism decoder for **Ebola N-protein** cell-free yield only. Emphasize size/oligomerization and transcription–translation coupling.
+          Use listed reaction variables; output ends with "Formula: ŷ = ...".
       
       protein_expression:
         encoder: |
